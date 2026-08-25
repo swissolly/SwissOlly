@@ -32,6 +32,8 @@ public sealed class VaktrConfig
 
     public List<string> PanelOrder { get; set; } = [];
 
+    public OverlayConfig? Overlay { get; set; }
+
     [JsonIgnore]
     public static int DefaultScrapeIntervalSeconds => DefaultScrapeIntervalSecondsValue;
 
@@ -161,6 +163,8 @@ public sealed class VaktrConfig
             .Where(key => !string.IsNullOrWhiteSpace(key))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
+
+        Overlay = (Overlay ?? new OverlayConfig()).Normalize();
 
         return this;
     }

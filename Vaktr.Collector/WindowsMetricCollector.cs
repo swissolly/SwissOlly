@@ -36,6 +36,11 @@ public sealed class WindowsMetricCollector : IMetricCollector
     private readonly List<ProcessActivitySample> _cachedProcessActivity = [];
     private readonly HashSet<int> _activeProcessIds = [];
     private readonly List<int> _staleProcessIds = [];
+    // Reused per-counter scratch buffers for TryGetArrayValues — avoids allocating a fresh
+    // dictionary up to 7x every scrape. Keyed by counter handle since some callers (disk,
+    // network) need two of these arrays alive at once, so a single shared scratch dict isn't safe.
+    private readonly Dictionary<nint, Dictionary<string, double>> _arrayValueScratch = [];
+    private readonly List<(int Index, double Value)> _coreListScratch = [];
     private LiveBoardDetails? _cachedLiveBoardDetails;
     private readonly TemperatureSensorReader _temperatureReader = new();
     private nint _pdhArrayBuffer;
@@ -163,17 +168,17 @@ public sealed class WindowsMetricCollector : IMetricCollector
         }
 
         var coreValues = TryGetArrayValues(_cpuPerCoreCounter);
-        var coreList = new List<(int Index, double Value)>(coreValues.Count);
+        _coreListScratch.Clear();
         foreach (var (key, val) in coreValues)
         {
             if (int.TryParse(key, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var coreIndex))
             {
-                coreList.Add((coreIndex, val));
+                _coreListScratch.Add((coreIndex, val));
             }
         }
-        coreList.Sort((a, b) => a.Index.CompareTo(b.Index));
+        _coreListScratch.Sort((a, b) => a.Index.CompareTo(b.Index));
 
-        foreach (var (coreIdx, value) in coreList)
+        foreach (var (coreIdx, value) in _coreListScratch)
         {
             samples.Add(new MetricSample(
                 "cpu-cores",
@@ -762,7 +767,16 @@ public sealed class WindowsMetricCollector : IMetricCollector
 
     private Dictionary<string, double> TryGetArrayValues(nint counter)
     {
-        var values = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+        if (!_arrayValueScratch.TryGetValue(counter, out var values))
+        {
+            values = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+            _arrayValueScratch[counter] = values;
+        }
+        else
+        {
+            values.Clear();
+        }
+
         if (counter == nint.Zero)
         {
             return values;

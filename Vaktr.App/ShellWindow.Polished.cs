@@ -19,12 +19,14 @@ using Vaktr.App.ViewModels;
 using Vaktr.Collector;
 using Vaktr.Core.Interfaces;
 using Vaktr.Core.Models;
+using Vaktr.Overlay;
 
 namespace Vaktr.App;
 
 public sealed partial class ShellWindow : Window
 {
     private static readonly int[] ScrapeIntervalPresets = [1, 2, 5, 10, 15, 30, 60];
+    private static readonly string[] OverlayColorPresets = ["#66E7FF", "#7CE38B", "#F5B54A", "#FF6B6B", "#FFFFFF"];
     private static readonly int[] RetentionHourPresets = [1, 6, 12, 24, 48, 72, 168, 336, 720, 2160, 8760];
     private static BitmapImage? s_brandBitmap;
     private static string? s_brandBitmapPath;
@@ -66,6 +68,7 @@ public sealed partial class ShellWindow : Window
 
     private CollectorService? _collectorService;
     private Task? _pendingHistoryLoad;
+    private OverlayController? _overlayController;
     private nint _windowIconHandle;
     private bool _controlDeckEditableActive;
     private bool _dashboardRefreshQueued;
@@ -84,6 +87,14 @@ public sealed partial class ShellWindow : Window
     private string _draftRetentionInput = string.Empty;
     private string _draftStorageDirectory = string.Empty;
     private ThemeMode _draftThemeMode;
+    private bool _draftOverlayEnabled;
+    private Vaktr.Core.Models.OverlayMode _draftOverlayMode = Vaktr.Core.Models.OverlayMode.Advanced;
+    private Vaktr.Core.Models.OverlayCorner _draftOverlayCorner = Vaktr.Core.Models.OverlayCorner.TopRight;
+    private string _draftOverlayColor = "#66E7FF";
+    private string _draftOverlayFontSize = "14";
+    private string _draftOverlayOpacity = "90";
+    private string _draftOverlayHotkey = "Ctrl+Shift+F11";
+    private List<string> _draftOverlayCustomMetrics = ["fps", "cpu", "gpu", "gpu-temp", "memory"];
     private DateTimeOffset? _globalAbsoluteStartUtc;
     private DateTimeOffset? _globalAbsoluteEndUtc;
     private MetricSnapshot? _pendingSnapshot;
@@ -248,7 +259,7 @@ public sealed partial class ShellWindow : Window
 
     private void RefreshThemeVisuals()
     {
-        _gradientCache.Clear();
+        ThemeVisuals.InvalidateGradientCache();
 
         // All brush updates run synchronously so the user never sees a half-themed state.
         // Chart redraws are already deferred inside each card's RefreshThemeResources.
@@ -573,6 +584,7 @@ public sealed partial class ShellWindow : Window
             _autoLaunchService.SetEnabled(config.LaunchOnStartup);
             App.CurrentApp.MarkStartupSettled();
             _ = StartTelemetryAsync(config);
+            StartOverlay(config);
             _ = DispatcherQueue.TryEnqueue(() =>
             {
                 TryApplyWindowIcon();
@@ -625,6 +637,9 @@ public sealed partial class ShellWindow : Window
 
     private void OnWindowClosed(object sender, WindowEventArgs args)
     {
+        _overlayController?.Dispose();
+        _overlayController = null;
+
         _viewModel.PropertyChanged -= OnViewModelPropertyChanged;
         _viewModel.DashboardPanels.CollectionChanged -= OnDashboardPanelsChanged;
         _viewModel.PanelToggles.CollectionChanged -= OnPanelTogglesChanged;
@@ -732,6 +747,9 @@ public sealed partial class ShellWindow : Window
                 ? string.Empty
                 : _draftStorageDirectory.Trim();
             _viewModel.SelectedTheme = _draftThemeMode;
+
+            // Build and validate overlay config from drafts
+            _viewModel.OverlayConfig = BuildOverlayConfigFromDrafts();
 
             _viewModel.ApplyPanelVisibility();
             var config = _viewModel.BuildConfig();
@@ -922,6 +940,8 @@ public sealed partial class ShellWindow : Window
 
     private void OnSnapshotCollected(object? sender, MetricSnapshot snapshot)
     {
+        _overlayController?.OnSnapshot(snapshot);
+
         _pendingSnapshot = snapshot;
         if (_snapshotApplyQueued)
         {
@@ -1111,6 +1131,44 @@ public sealed partial class ShellWindow : Window
 
     private bool _isWindowResizing;
     private Border? _shellBorderRef;
+
+    private void StartOverlay(VaktrConfig config)
+    {
+        try
+        {
+            var controller = new OverlayController();
+            controller.StatusMessage += msg =>
+            {
+                if (msg == "__reregister_hotkey__")
+                {
+                    var hwnd = WindowNative.GetWindowHandle(this);
+                    controller.RegisterHotkey(hwnd);
+                    return;
+                }
+                _ = DispatcherQueue.TryEnqueue(DispatcherQueuePriority.Low, () =>
+                {
+                    _viewModel.StatusText = msg;
+                    UpdateStatusText();
+                });
+            };
+
+            var shellHwnd = WindowNative.GetWindowHandle(this);
+            HotkeyInterop.Install(shellHwnd, id => controller.OnWmHotkey(id));
+
+            _overlayController = controller;
+            _overlayController.Start();
+
+            if (config.Overlay != null)
+            {
+                _overlayController.ApplyConfig(config.Overlay);
+                _overlayController.RegisterHotkey(shellHwnd);
+            }
+        }
+        catch (Exception ex)
+        {
+            StartupTrace.WriteException("StartOverlay", ex);
+        }
+    }
 
     private void InstallResizeHook()
     {
@@ -1361,6 +1419,36 @@ public sealed partial class ShellWindow : Window
         _draftRetentionInput = _viewModel.RetentionHoursInput;
         _draftStorageDirectory = _viewModel.StorageDirectory;
         _draftThemeMode = _viewModel.SelectedTheme;
+
+        var ov = _viewModel.OverlayConfig;
+        _draftOverlayEnabled = ov.Enabled;
+        _draftOverlayMode = ov.Mode;
+        _draftOverlayCorner = ov.Corner;
+        _draftOverlayColor = ov.TextColor;
+        _draftOverlayFontSize = ov.FontSizePx.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        _draftOverlayOpacity = ((int)Math.Round(ov.Opacity * 100)).ToString(System.Globalization.CultureInfo.InvariantCulture);
+        _draftOverlayHotkey = ov.HotkeyGesture;
+        _draftOverlayCustomMetrics = [.. ov.CustomMetrics];
+    }
+
+    private Vaktr.Core.Models.OverlayConfig BuildOverlayConfigFromDrafts()
+    {
+        int.TryParse(_draftOverlayFontSize?.Trim(), System.Globalization.NumberStyles.None,
+            System.Globalization.CultureInfo.InvariantCulture, out var fontSize);
+        int.TryParse(_draftOverlayOpacity?.Trim(), System.Globalization.NumberStyles.None,
+            System.Globalization.CultureInfo.InvariantCulture, out var opacityPct);
+
+        return new Vaktr.Core.Models.OverlayConfig
+        {
+            Enabled = _draftOverlayEnabled,
+            Mode = _draftOverlayMode,
+            Corner = _draftOverlayCorner,
+            TextColor = _draftOverlayColor,
+            FontSizePx = fontSize,
+            Opacity = opacityPct / 100.0,
+            HotkeyGesture = _draftOverlayHotkey,
+            CustomMetrics = [.. _draftOverlayCustomMetrics],
+        }.Normalize();
     }
 
     private int GetDraftScrapeIntervalSeconds() =>
@@ -1513,6 +1601,12 @@ public sealed partial class ShellWindow : Window
                 ? "Streaming local telemetry"
                 : "Waiting for first sample";
             UpdateStatusText();
+
+            if (_overlayController != null && config.Overlay != null)
+            {
+                _overlayController.ApplyConfig(config.Overlay);
+                // Re-register hotkey if gesture changed (controller signals via StatusMessage)
+            }
         }
         catch (Exception ex)
         {
@@ -2167,6 +2261,39 @@ internal sealed record SummaryCardVisual(
     Border GaugeTrack,
     Border GaugeFill,
     SummaryCardViewModel ViewModel);
+
+internal static class HotkeyInterop
+{
+    private const uint WM_HOTKEY = 0x0312;
+    private const nint SubclassId = 1002;
+
+    private static Action<int>? s_onHotkey;
+    private static SubclassProc? s_procDelegate;
+
+    private delegate nint SubclassProc(nint hWnd, uint uMsg, nint wParam, nint lParam, nint uIdSubclass, nint dwRefData);
+
+    public static void Install(nint hwnd, Action<int> onHotkey)
+    {
+        s_onHotkey = onHotkey;
+        s_procDelegate = SubclassCallback;
+        SetWindowSubclass(hwnd, s_procDelegate, SubclassId, 0);
+    }
+
+    private static nint SubclassCallback(nint hWnd, uint uMsg, nint wParam, nint lParam, nint uIdSubclass, nint dwRefData)
+    {
+        if (uMsg == WM_HOTKEY)
+            s_onHotkey?.Invoke((int)wParam);
+
+        return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+    }
+
+    [DllImport("comctl32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetWindowSubclass(nint hWnd, SubclassProc pfnSubclass, nint uIdSubclass, nint dwRefData);
+
+    [DllImport("comctl32.dll")]
+    private static extern nint DefSubclassProc(nint hWnd, uint uMsg, nint wParam, nint lParam);
+}
 
 internal static class ResizeInterop
 {

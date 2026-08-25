@@ -34,11 +34,25 @@ Chart interactions:
 - Double-click resets zoom and clears pinned tooltips
 - Panels are drag-reorderable
 
+## Overlay
+
+An in-game telemetry overlay that paints on top of running games. Owned by the main Vaktr process — no second window, no taskbar entry, no Alt+Tab entry. Configure from the control deck.
+
+- Three modes: Simple (FPS only), Advanced (FPS + CPU + GPU + GPU temp + memory), Custom (pick your own)
+- Corner positioning (top-left, top-right, bottom-left, bottom-right)
+- Configurable text color (color picker with quick presets, or a custom hex value), font size, opacity, and toggle hotkey
+- Outlined text with no background box, for a clean HUD look over any game
+- Auto-shows when a game has focus; hides on Alt+Tab back to desktop
+- FPS measured via DWM flush timing — no DLL injection, no anti-cheat conflicts, no admin rights or elevated group membership required
+- NVIDIA, AMD, and Intel GPU support
+
+Targets borderless and windowed-fullscreen games. True exclusive fullscreen isn't supported — by design, so Vaktr never needs code-signing or elevated UIAccess to draw the overlay.
+
 ## Control Deck
 
 ![Control Deck](Vaktr.App/Assets/control-deck.png)
 
-Scrape cadence (1-60s), retention (30 minutes to 90 days), storage path, theme.
+Scrape cadence (1-60s), retention (30 minutes to 90 days), storage path, theme, overlay.
 
 ## Install
 

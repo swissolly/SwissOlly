@@ -44,6 +44,7 @@
     <ProjectReference Include="..\Vaktr.Core\Vaktr.Core.csproj" />
     <ProjectReference Include="..\Vaktr.Collector\Vaktr.Collector.csproj" />
     <ProjectReference Include="..\Vaktr.Store\Vaktr.Store.csproj" />
+    <ProjectReference Include="..\Vaktr.Overlay\Vaktr.Overlay.csproj" />
   </ItemGroup>
 
 </Project>

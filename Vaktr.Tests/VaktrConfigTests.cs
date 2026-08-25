@@ -1,3 +1,6 @@
+using System.Text.Json;
+using Vaktr.Core.Models;
+
 namespace Vaktr.Tests;
 
 public sealed class VaktrConfigTests
@@ -144,5 +147,83 @@ public sealed class VaktrConfigTests
         config.Normalize();
         Assert.NotNull(config.PanelVisibility);
         Assert.NotNull(config.PanelOrder);
+    }
+
+    // ── OverlayConfig tests ────────────────────────────────────────────────
+
+    [Theory]
+    [InlineData(9)]
+    [InlineData(33)]
+    [InlineData(-1)]
+    [InlineData(0)]
+    public void OverlayConfig_Normalize_Clamps_FontSize(int fontSize)
+    {
+        var cfg = new OverlayConfig { FontSizePx = fontSize };
+        cfg.Normalize();
+        Assert.Equal(14, cfg.FontSizePx);
+    }
+
+    [Theory]
+    [InlineData("notacolor")]
+    [InlineData("#GGGGGG")]
+    [InlineData("#12345")]
+    [InlineData("")]
+    [InlineData(null)]
+    public void OverlayConfig_Normalize_Rejects_Malformed_Hex(string? hex)
+    {
+        var cfg = new OverlayConfig { TextColor = hex! };
+        cfg.Normalize();
+        Assert.Equal("#66E7FF", cfg.TextColor);
+    }
+
+    [Theory]
+    [InlineData("NotAHotkey")]
+    [InlineData("Ctrl")]
+    [InlineData("F11")]
+    [InlineData("")]
+    [InlineData(null)]
+    public void OverlayConfig_Normalize_Rejects_Invalid_Hotkey(string? gesture)
+    {
+        var cfg = new OverlayConfig { HotkeyGesture = gesture! };
+        cfg.Normalize();
+        Assert.Equal("Ctrl+Shift+F11", cfg.HotkeyGesture);
+    }
+
+    [Fact]
+    public void OverlayConfig_JsonRoundTrip_Preserves_All_Properties()
+    {
+        var original = new OverlayConfig
+        {
+            Enabled = true,
+            Mode = OverlayMode.Custom,
+            Corner = OverlayCorner.BottomLeft,
+            TextColor = "#FF0000",
+            FontSizePx = 18,
+            Opacity = 0.75,
+            HotkeyGesture = "Ctrl+Alt+F9",
+            CustomMetrics = ["fps", "cpu"],
+        };
+
+        var json = JsonSerializer.Serialize(original);
+        var restored = JsonSerializer.Deserialize<OverlayConfig>(json)!;
+
+        Assert.True(restored.Enabled);
+        Assert.Equal(OverlayMode.Custom, restored.Mode);
+        Assert.Equal(OverlayCorner.BottomLeft, restored.Corner);
+        Assert.Equal("#FF0000", restored.TextColor);
+        Assert.Equal(18, restored.FontSizePx);
+        Assert.Equal(0.75, restored.Opacity);
+        Assert.Equal("Ctrl+Alt+F9", restored.HotkeyGesture);
+        Assert.Equal(["fps", "cpu"], restored.CustomMetrics);
+    }
+
+    [Fact]
+    public void VaktrConfig_Normalize_Reconstructs_Null_Overlay()
+    {
+        var config = new VaktrConfig { Overlay = null };
+        config.Normalize();
+        Assert.NotNull(config.Overlay);
+        Assert.Equal("Ctrl+Shift+F11", config.Overlay.HotkeyGesture);
+        Assert.Equal("#66E7FF", config.Overlay.TextColor);
     }
 }

@@ -1853,111 +1853,14 @@ public sealed class TelemetryPanelCard : UserControl
             Text = text,
         };
 
-    private static Brush ResolveBrush(string key, string fallbackHex)
-    {
-        if (Application.Current.Resources.TryGetValue(key, out var value) && value is Brush brush)
-        {
-            return brush;
-        }
+    private static Brush ResolveBrush(string key, string fallbackHex) => ThemeVisuals.ResolveBrush(key, fallbackHex);
 
-        return BrushFactory.CreateBrush(fallbackHex);
-    }
+    private static Brush CreateSurfaceGradient(string startHex, string endHex) => ThemeVisuals.CreateSurfaceLiftGradient(startHex, endHex);
 
-    private static readonly Dictionary<string, LinearGradientBrush> s_gradientCache = new(StringComparer.Ordinal);
-    private static bool s_lastCachedLightMode;
+    private static bool IsLightPaletteActive() => ThemeVisuals.IsLightPaletteActive();
 
-    private static Brush CreateSurfaceGradient(string startHex, string endHex)
-    {
-        var isLight = IsLightPaletteActive();
-        if (isLight != s_lastCachedLightMode)
-        {
-            s_gradientCache.Clear();
-            s_lastCachedLightMode = isLight;
-        }
+    private static Windows.UI.Color ResolveColor(string key, string fallbackHex) => ThemeVisuals.ResolveColor(key, fallbackHex);
 
-        var cacheKey = string.Concat(startHex, "|", endHex);
-        if (s_gradientCache.TryGetValue(cacheKey, out var cached))
-        {
-            return cached;
-        }
-
-        LinearGradientBrush brush;
-        if (isLight)
-        {
-            var lightStart = LiftToLight(startHex);
-            var lightEnd = LiftToLight(endHex);
-            brush = new LinearGradientBrush
-            {
-                StartPoint = new Windows.Foundation.Point(0, 0),
-                EndPoint = new Windows.Foundation.Point(1, 1),
-                GradientStops = new GradientStopCollection
-                {
-                    new GradientStop { Color = lightStart, Offset = 0d },
-                    new GradientStop { Color = lightEnd, Offset = 1d },
-                },
-            };
-        }
-        else
-        {
-            brush = new LinearGradientBrush
-            {
-                StartPoint = new Windows.Foundation.Point(0, 0),
-                EndPoint = new Windows.Foundation.Point(1, 1),
-                GradientStops = new GradientStopCollection
-                {
-                    new GradientStop { Color = BrushFactory.ParseColor(startHex), Offset = 0d },
-                    new GradientStop { Color = BrushFactory.ParseColor(endHex), Offset = 1d },
-                },
-            };
-        }
-
-        s_gradientCache[cacheKey] = brush;
-        return brush;
-    }
-
-    private static Color LiftToLight(string darkHex)
-    {
-        return darkHex.TrimStart('#').ToUpperInvariant() switch
-        {
-            // Card surface — pure white
-            "0E1B2C" or "0E1A2C" or "101B2D" => BrushFactory.ParseColor("#FFFFFF"),
-            "13253A" or "142436" or "16273D" => BrushFactory.ParseColor("#F8FAFD"),
-            // Badge — tinted
-            "102131" or "17304A" => BrushFactory.ParseColor("#E0EAF4"),
-            // Chart frame — gray inset
-            "0C1824" or "111F30" => BrushFactory.ParseColor("#EDF1F7"),
-            // Process section — gray inset
-            "0D1824" or "12202F" => BrushFactory.ParseColor("#EBF0F6"),
-            // Legend row idle
-            "101C2D" or "132438" => BrushFactory.ParseColor("#F0F4F9"),
-            // Legend row hover
-            "162A3E" or "1C3350" => BrushFactory.ParseColor("#E0E8F2"),
-            // Range shell
-            "102031" or "15283E" => BrushFactory.ParseColor("#ECF0F6"),
-            // Scale pill
-            "101D2E" or "152840" => BrushFactory.ParseColor("#E6ECF4"),
-            // Card hover
-            "102133" or "162A40" or "122034" or "1A2C46" => BrushFactory.ParseColor("#E4ECF4"),
-            _ => BrushFactory.ParseColor("#F2F6FB"),
-        };
-    }
-
-    private static bool IsLightPaletteActive()
-    {
-        var color = ResolveColor("AppBackdropBrush", "#030812");
-        var luminance = (0.2126 * color.R) + (0.7152 * color.G) + (0.0722 * color.B);
-        return luminance >= 170d;
-    }
-
-    private static Windows.UI.Color ResolveColor(string key, string fallbackHex)
-    {
-        if (Application.Current.Resources.TryGetValue(key, out var value) && value is SolidColorBrush brush)
-        {
-            return brush.Color;
-        }
-
-        return BrushFactory.ParseColor(fallbackHex);
-    }
     private static string FormatValue(double value, MetricUnit unit) => unit switch
     {
         MetricUnit.Percent => $"{value:0.#}%",

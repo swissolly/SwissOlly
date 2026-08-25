@@ -459,8 +459,7 @@ public sealed class TelemetryChart : UserControl
                 {
                     rawProjected[pi] = Project(segment[pi], LeftPadding, TopPadding, plotWidth, plotHeight, start, end, maxValue);
                 }
-                var projected = NormalizeProjectedPoints(rawProjected);
-                var strokeProjected = ResolveStrokePoints(projected);
+                var strokeProjected = NormalizeProjectedPoints(rawProjected);
 
                 if (strokeProjected.Count == 0)
                 {
@@ -475,7 +474,7 @@ public sealed class TelemetryChart : UserControl
 
                 if (drawFilledArea)
                 {
-                    var fillProjected = ResolveFillPoints(strokeProjected);
+                    var fillProjected = strokeProjected;
                     if (fillProjected.Count >= 2)
                     {
                         _dataCanvas.Children.Add(new Path
@@ -919,16 +918,6 @@ public sealed class TelemetryChart : UserControl
         return normalized;
     }
 
-    private static IReadOnlyList<Windows.Foundation.Point> ResolveStrokePoints(IReadOnlyList<Windows.Foundation.Point> points)
-    {
-        return points;
-    }
-
-    private static IReadOnlyList<Windows.Foundation.Point> ResolveFillPoints(IReadOnlyList<Windows.Foundation.Point> points)
-    {
-        return points;
-    }
-
     private static bool TryGetPointBounds(
         IReadOnlyList<ChartSeriesViewModel> series,
         out DateTimeOffset minTimestamp,
@@ -1112,15 +1101,7 @@ public sealed class TelemetryChart : UserControl
         };
     }
 
-    private static Brush ResolveBrush(string key, string fallbackHex)
-    {
-        if (Application.Current.Resources.TryGetValue(key, out var value) && value is Brush brush)
-        {
-            return brush;
-        }
-
-        return BrushFactory.CreateBrush(fallbackHex);
-    }
+    private static Brush ResolveBrush(string key, string fallbackHex) => ThemeVisuals.ResolveBrush(key, fallbackHex);
 
     private static Brush CreateEdgeFadeBrush(bool isLeadingEdge)
     {
@@ -1148,82 +1129,11 @@ public sealed class TelemetryChart : UserControl
         };
     }
 
-    private static Color LiftToLight(string darkHex)
-    {
-        return darkHex.TrimStart('#').ToUpperInvariant() switch
-        {
-            "0A141F" or "0F1E2E" => BrushFactory.ParseColor("#EEF2F8"), // plot background — gray inset
-            "15283B" or "203851" => BrushFactory.ParseColor("#FFFFFF"), // tooltip — white
-            _ => BrushFactory.ParseColor("#F2F6FB"),
-        };
-    }
+    private static Brush CreateSurfaceGradient(string startHex, string endHex) => ThemeVisuals.CreateSurfaceLiftGradient(startHex, endHex);
 
-    private static readonly Dictionary<string, LinearGradientBrush> s_gradientCache = new(StringComparer.Ordinal);
-    private static bool s_lastCachedLightMode;
+    private static bool IsLightPaletteActive() => ThemeVisuals.IsLightPaletteActive();
 
-    private static Brush CreateSurfaceGradient(string startHex, string endHex)
-    {
-        var isLight = IsLightPaletteActive();
-        if (isLight != s_lastCachedLightMode)
-        {
-            s_gradientCache.Clear();
-            s_lastCachedLightMode = isLight;
-        }
-
-        var cacheKey = string.Concat(startHex, "|", endHex);
-        if (s_gradientCache.TryGetValue(cacheKey, out var cached))
-        {
-            return cached;
-        }
-
-        LinearGradientBrush brush;
-        if (isLight)
-        {
-            brush = new LinearGradientBrush
-            {
-                StartPoint = new Windows.Foundation.Point(0, 0),
-                EndPoint = new Windows.Foundation.Point(1, 1),
-                GradientStops = new GradientStopCollection
-                {
-                    new GradientStop { Color = LiftToLight(startHex), Offset = 0d },
-                    new GradientStop { Color = LiftToLight(endHex), Offset = 1d },
-                },
-            };
-        }
-        else
-        {
-            brush = new LinearGradientBrush
-            {
-                StartPoint = new Windows.Foundation.Point(0, 0),
-                EndPoint = new Windows.Foundation.Point(1, 1),
-                GradientStops = new GradientStopCollection
-                {
-                    new GradientStop { Color = BrushFactory.ParseColor(startHex), Offset = 0d },
-                    new GradientStop { Color = BrushFactory.ParseColor(endHex), Offset = 1d },
-                },
-            };
-        }
-
-        s_gradientCache[cacheKey] = brush;
-        return brush;
-    }
-
-    private static bool IsLightPaletteActive()
-    {
-        var color = ResolveColor("AppBackdropBrush", "#030812");
-        var luminance = (0.2126 * color.R) + (0.7152 * color.G) + (0.0722 * color.B);
-        return luminance >= 170d;
-    }
-
-    private static Windows.UI.Color ResolveColor(string key, string fallbackHex)
-    {
-        if (Application.Current.Resources.TryGetValue(key, out var value) && value is SolidColorBrush brush)
-        {
-            return brush.Color;
-        }
-
-        return BrushFactory.ParseColor(fallbackHex);
-    }
+    private static Windows.UI.Color ResolveColor(string key, string fallbackHex) => ThemeVisuals.ResolveColor(key, fallbackHex);
 
     private static string FormatTimeLabel(DateTimeOffset timestamp, TimeSpan window)
     {

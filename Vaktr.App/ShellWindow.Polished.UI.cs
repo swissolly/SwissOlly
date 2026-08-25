@@ -233,6 +233,10 @@ public sealed partial class ShellWindow
         AddStatusField(settingsGrid, 0, 1, "Retention", GetRetentionFieldValue(), "History window");
         AddStatusField(settingsGrid, 0, 2, "Storage", GetStorageFieldTitle(), GetStorageFieldCaption());
 
+        var ov = _viewModel.OverlayConfig;
+        var overlaySummary = BuildOverlaySummaryCard(ov);
+        AddCardToGrid(settingsGrid, 1, 0, overlaySummary, columnSpan: 3);
+
         var actionRow = new Grid
         {
             ColumnSpacing = 14,
@@ -376,6 +380,9 @@ public sealed partial class ShellWindow
                         CreateActionChip("Use default", (_, _) => ResetStorageDirectory())),
                 },
             }));
+
+        // ── Row 1: full-width overlay card ────────────────────────────────
+        AddCardToGrid(fieldGrid, 1, 0, BuildOverlayEditorCard(), columnSpan: 3);
 
         var actionRow = new Grid
         {
@@ -1171,157 +1178,325 @@ public sealed partial class ShellWindow
         return label;
     }
 
-    private static Brush ResolveBrush(string key, string fallbackHex)
+    private static Brush ResolveBrush(string key, string fallbackHex) => ThemeVisuals.ResolveBrush(key, fallbackHex);
+
+    private static Brush CreateSurfaceGradient(string startHex, string endHex) => ThemeVisuals.CreateSurfaceLiftGradient(startHex, endHex);
+
+    private static bool IsLightPaletteActive() => ThemeVisuals.IsLightPaletteActive();
+
+    private static Color ResolveColor(string key, string fallbackHex) => ThemeVisuals.ResolveColor(key, fallbackHex);
+
+    private static Color ParseColor(string hex) => ThemeVisuals.ParseColor(hex);
+
+    // ── Overlay card helpers ───────────────────────────────────────────────
+
+    private Border BuildOverlayEditorCard()
     {
-        if (Application.Current.Resources.TryGetValue(key, out var value) && value is Brush brush)
+        // Row 1: enable toggle + mode segmented chips
+        var enableChips = CreateChipWrapRow(
+            CreatePresetChip("Off", !_draftOverlayEnabled,
+                (_, _) => { _draftOverlayEnabled = false; QueueEditableControlDeckRender(); }),
+            CreatePresetChip("On", _draftOverlayEnabled,
+                (_, _) => { _draftOverlayEnabled = true; QueueEditableControlDeckRender(); }));
+
+        var modeChips = CreateChipWrapRow(
+            CreatePresetChip("Simple", _draftOverlayMode == OverlayMode.Simple,
+                (_, _) => { _draftOverlayMode = OverlayMode.Simple; QueueEditableControlDeckRender(); }),
+            CreatePresetChip("Advanced", _draftOverlayMode == OverlayMode.Advanced,
+                (_, _) => { _draftOverlayMode = OverlayMode.Advanced; QueueEditableControlDeckRender(); }),
+            CreatePresetChip("Custom", _draftOverlayMode == OverlayMode.Custom,
+                (_, _) => { _draftOverlayMode = OverlayMode.Custom; QueueEditableControlDeckRender(); }));
+
+        var row1 = new StackPanel
         {
-            return brush;
+            Spacing = 10,
+            Children =
+            {
+                new StackPanel
+                {
+                    Orientation = Orientation.Horizontal,
+                    Spacing = 16,
+                    Children = { enableChips, modeChips },
+                },
+                CreateMutedText("Simple: FPS only  ·  Advanced: all five metrics  ·  Custom: pick your own", 11),
+            },
+        };
+
+        // Row 2: custom metric picker (only when mode = Custom)
+        var contentStack = new StackPanel { Spacing = 14, Children = { row1 } };
+
+        if (_draftOverlayMode == OverlayMode.Custom)
+        {
+            var allMetrics = new[] { ("fps", "FPS"), ("cpu", "CPU%"), ("gpu", "GPU%"), ("gpu-temp", "GPU temp"), ("memory", "Memory%") };
+            var metricChips = allMetrics.Select(kv =>
+            {
+                var key = kv.Item1;
+                var isActive = _draftOverlayCustomMetrics.Contains(key, StringComparer.OrdinalIgnoreCase);
+                return CreatePresetChip(kv.Item2, isActive, (_, _) =>
+                {
+                    if (_draftOverlayCustomMetrics.Contains(key, StringComparer.OrdinalIgnoreCase))
+                        _draftOverlayCustomMetrics.Remove(key);
+                    else
+                        _draftOverlayCustomMetrics.Add(key);
+                    QueueEditableControlDeckRender();
+                });
+            }).ToArray();
+
+            contentStack.Children.Add(new StackPanel
+            {
+                Spacing = 8,
+                Children =
+                {
+                    CreateChipWrapRow(metricChips),
+                    CreateMutedText("Pick at least one. Order in overlay matches order shown here.", 11),
+                },
+            });
         }
 
-        return BrushFactory.CreateBrush(fallbackHex);
+        // Row 3: corner + color
+        var swatchFill = new Border
+        {
+            Width = 20,
+            Height = 20,
+            CornerRadius = new CornerRadius(10),
+            Background = new SolidColorBrush(ParseColor(_draftOverlayColor)),
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        var hexLabel = new TextBlock
+        {
+            Text = _draftOverlayColor.ToUpperInvariant(),
+            FontSize = 12,
+            VerticalAlignment = VerticalAlignment.Center,
+            Foreground = ResolveBrush("TextSecondaryBrush", "#B7CCE1"),
+            FontFamily = new FontFamily("Cascadia Code, Consolas, Courier New"),
+        };
+        var colorPicker = new ColorPicker
+        {
+            ColorSpectrumShape = ColorSpectrumShape.Ring,
+            IsAlphaEnabled = false,
+            IsHexInputVisible = true,
+            IsColorPreviewVisible = true,
+            IsColorSliderVisible = true,
+            Color = ParseColor(_draftOverlayColor),
+        };
+        colorPicker.ColorChanged += (_, e) =>
+        {
+            _draftOverlayColor = $"#{e.NewColor.R:X2}{e.NewColor.G:X2}{e.NewColor.B:X2}";
+            swatchFill.Background = new SolidColorBrush(e.NewColor);
+            hexLabel.Text = _draftOverlayColor.ToUpperInvariant();
+        };
+        var swatchButton = new Button
+        {
+            Padding = new Thickness(8, 6, 8, 6),
+            CornerRadius = new CornerRadius(8),
+            Flyout = new Flyout { Content = colorPicker },
+            Content = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                Spacing = 8,
+                VerticalAlignment = VerticalAlignment.Center,
+                Children = { swatchFill, hexLabel },
+            },
+        };
+
+        var presetRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
+        foreach (var presetHex in OverlayColorPresets)
+        {
+            var presetColor = ParseColor(presetHex);
+            var presetButton = new Button
+            {
+                Width = 22,
+                Height = 22,
+                Padding = new Thickness(0),
+                CornerRadius = new CornerRadius(11),
+                Background = new SolidColorBrush(presetColor),
+                BorderThickness = new Thickness(1),
+                BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E"),
+            };
+            presetButton.Click += (_, _) =>
+            {
+                _draftOverlayColor = presetHex;
+                swatchFill.Background = new SolidColorBrush(presetColor);
+                hexLabel.Text = presetHex.ToUpperInvariant();
+                colorPicker.Color = presetColor;
+            };
+            presetRow.Children.Add(presetButton);
+        }
+
+        var cornerChips = CreateChipWrapRow(
+            CreatePresetChip("↖ TL", _draftOverlayCorner == OverlayCorner.TopLeft,
+                (_, _) => { _draftOverlayCorner = OverlayCorner.TopLeft; QueueEditableControlDeckRender(); }),
+            CreatePresetChip("↗ TR", _draftOverlayCorner == OverlayCorner.TopRight,
+                (_, _) => { _draftOverlayCorner = OverlayCorner.TopRight; QueueEditableControlDeckRender(); }),
+            CreatePresetChip("↙ BL", _draftOverlayCorner == OverlayCorner.BottomLeft,
+                (_, _) => { _draftOverlayCorner = OverlayCorner.BottomLeft; QueueEditableControlDeckRender(); }),
+            CreatePresetChip("↘ BR", _draftOverlayCorner == OverlayCorner.BottomRight,
+                (_, _) => { _draftOverlayCorner = OverlayCorner.BottomRight; QueueEditableControlDeckRender(); }));
+
+        var row3Grid = new Grid { ColumnSpacing = 16 };
+        row3Grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        row3Grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+        var cornerStack = new StackPanel { Spacing = 8, Children = { CreateFieldLabel("Position"), cornerChips } };
+        row3Grid.Children.Add(cornerStack);
+
+        var colorStack = new StackPanel { Spacing = 8, Children = { CreateFieldLabel("Text color"), swatchButton, presetRow } };
+        row3Grid.Children.Add(colorStack);
+        Grid.SetColumn(colorStack, 1);
+
+        contentStack.Children.Add(row3Grid);
+
+        // Row 4: font size + opacity
+        var fontBox = CreateDeckInlineEntry(_draftOverlayFontSize, "14");
+        fontBox.TextChanged += (_, _) => { _draftOverlayFontSize = fontBox.Text; };
+
+        var opacityBox = CreateDeckInlineEntry(_draftOverlayOpacity, "90");
+        opacityBox.TextChanged += (_, _) => { _draftOverlayOpacity = opacityBox.Text; };
+
+        var row4Grid = new Grid { ColumnSpacing = 16 };
+        row4Grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        row4Grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+        var fontStack = new StackPanel
+        {
+            Spacing = 8,
+            Children =
+            {
+                CreateFieldLabel("Font size (px)"),
+                fontBox,
+                CreateChipWrapRow(
+                    CreatePresetChip("12", _draftOverlayFontSize == "12", (_, _) => { _draftOverlayFontSize = "12"; QueueEditableControlDeckRender(); }),
+                    CreatePresetChip("14", _draftOverlayFontSize == "14", (_, _) => { _draftOverlayFontSize = "14"; QueueEditableControlDeckRender(); }),
+                    CreatePresetChip("16", _draftOverlayFontSize == "16", (_, _) => { _draftOverlayFontSize = "16"; QueueEditableControlDeckRender(); }),
+                    CreatePresetChip("20", _draftOverlayFontSize == "20", (_, _) => { _draftOverlayFontSize = "20"; QueueEditableControlDeckRender(); })),
+            },
+        };
+        row4Grid.Children.Add(fontStack);
+
+        var opacityStack = new StackPanel
+        {
+            Spacing = 8,
+            Children =
+            {
+                CreateFieldLabel("Opacity (%)"),
+                opacityBox,
+                CreateChipWrapRow(
+                    CreatePresetChip("60%", _draftOverlayOpacity == "60", (_, _) => { _draftOverlayOpacity = "60"; QueueEditableControlDeckRender(); }),
+                    CreatePresetChip("75%", _draftOverlayOpacity == "75", (_, _) => { _draftOverlayOpacity = "75"; QueueEditableControlDeckRender(); }),
+                    CreatePresetChip("90%", _draftOverlayOpacity == "90", (_, _) => { _draftOverlayOpacity = "90"; QueueEditableControlDeckRender(); }),
+                    CreatePresetChip("100%", _draftOverlayOpacity == "100", (_, _) => { _draftOverlayOpacity = "100"; QueueEditableControlDeckRender(); })),
+            },
+        };
+        row4Grid.Children.Add(opacityStack);
+        Grid.SetColumn(opacityStack, 1);
+
+        contentStack.Children.Add(row4Grid);
+
+        // Row 5: hotkey
+        var hotkeyBox = CreateDeckInlineEntry(_draftOverlayHotkey, "Ctrl+Shift+F11");
+        hotkeyBox.TextChanged += (_, _) => { _draftOverlayHotkey = hotkeyBox.Text; };
+
+        var hotkeyRow = new Grid { ColumnSpacing = 12 };
+        hotkeyRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        hotkeyRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+        var hotkeyStack = new StackPanel
+        {
+            Spacing = 8,
+            Children =
+            {
+                CreateFieldLabel("Toggle hotkey"),
+                hotkeyBox,
+                CreateMutedText("Modifiers: Ctrl, Alt, Shift, Win  ·  Key: letter, F1–F24. Default: Ctrl+Shift+F11", 11),
+            },
+        };
+        hotkeyRow.Children.Add(hotkeyStack);
+
+        var resetChip = CreateActionChip("Reset", (_, _) => { _draftOverlayHotkey = "Ctrl+Shift+F11"; QueueEditableControlDeckRender(); });
+        resetChip.VerticalAlignment = VerticalAlignment.Bottom;
+        hotkeyRow.Children.Add(resetChip);
+        Grid.SetColumn(resetChip, 1);
+
+        contentStack.Children.Add(hotkeyRow);
+
+        var summaryValue = _draftOverlayEnabled
+            ? _draftOverlayMode switch
+            {
+                OverlayMode.Simple => "FPS",
+                OverlayMode.Advanced => "FPS + 4 metrics",
+                OverlayMode.Custom => $"{_draftOverlayCustomMetrics.Count} of 5",
+                _ => "On",
+            }
+            : "Off";
+
+        var caption = _draftOverlayEnabled ? "Active when game has focus" : "In-game telemetry";
+
+        return CreateControlEditorCard("overlay", "OVERLAY", summaryValue, caption, "#7CE38B", contentStack);
     }
 
-    private static readonly Dictionary<string, LinearGradientBrush> _gradientCache = new(StringComparer.Ordinal);
-    private static bool _lastCachedLightMode;
-
-    private static Brush CreateSurfaceGradient(string startHex, string endHex)
+    private static Border BuildOverlaySummaryCard(OverlayConfig ov)
     {
-        var isLight = IsLightPaletteActive();
+        var statusLine = ov.Enabled
+            ? $"On — {ov.Mode} @ {ov.Corner switch { OverlayCorner.TopLeft => "Top Left", OverlayCorner.TopRight => "Top Right", OverlayCorner.BottomLeft => "Bottom Left", _ => "Bottom Right" }}"
+            : "Off";
 
-        // Invalidate cache on theme change
-        if (isLight != _lastCachedLightMode)
+        var accentBrush = BrushFactory.CreateBrush("#7CE38B");
+        var icon = IconFactory.CreateTile("overlay", accentBrush, 42, 16);
+
+        var colorSwatch = CreateColorSwatch(ov.TextColor);
+
+        var info = new StackPanel
         {
-            _gradientCache.Clear();
-            _lastCachedLightMode = isLight;
-        }
-
-        var cacheKey = string.Concat(startHex, "|", endHex);
-        if (_gradientCache.TryGetValue(cacheKey, out var cached))
-        {
-            return cached;
-        }
-
-        LinearGradientBrush brush;
-        if (isLight)
-        {
-            // Use varied light gradients based on dark surface depth for visual distinction
-            var startColor = LiftToLight(startHex);
-            var endColor = LiftToLight(endHex);
-
-            brush = new LinearGradientBrush
+            Spacing = 2,
+            VerticalAlignment = VerticalAlignment.Center,
+            Children =
             {
-                StartPoint = new Windows.Foundation.Point(0, 0),
-                EndPoint = new Windows.Foundation.Point(1, 1),
-                GradientStops = new GradientStopCollection
+                CreateMutedText("Overlay", 10),
+                CreatePrimaryText(statusLine, 16, true),
+                new StackPanel
                 {
-                    new GradientStop { Color = startColor, Offset = 0d },
-                    new GradientStop { Color = endColor, Offset = 1d },
+                    Orientation = Orientation.Horizontal,
+                    Spacing = 8,
+                    Children =
+                    {
+                        colorSwatch,
+                        CreateSecondaryText($"Toggle: {ov.HotkeyGesture}", 11),
+                    },
                 },
-            };
-        }
-        else
+            },
+        };
+
+        return new Border
         {
-            brush = new LinearGradientBrush
+            Background = CreateSurfaceGradient("#101C2E", "#15273D"),
+            BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E"),
+            BorderThickness = new Thickness(0.9),
+            CornerRadius = new CornerRadius(18),
+            Padding = new Thickness(16, 14, 16, 14),
+            MinHeight = 72,
+            Child = new StackPanel
             {
-                StartPoint = new Windows.Foundation.Point(0, 0),
-                EndPoint = new Windows.Foundation.Point(1, 1),
-                GradientStops = new GradientStopCollection
-                {
-                    new GradientStop { Color = ParseColor(startHex), Offset = 0d },
-                    new GradientStop { Color = ParseColor(endHex), Offset = 1d },
-                },
-            };
-        }
-
-        _gradientCache[cacheKey] = brush;
-        return brush;
-    }
-
-    private static Color LiftToLight(string darkHex)
-    {
-        // Map dark surface hex to distinct light equivalents — more contrast between layers
-        return darkHex.TrimStart('#').ToUpperInvariant() switch
-        {
-            // Shell surfaces
-            "08111C" => ParseColor("#F0F4F9"),
-            "0D1A29" => ParseColor("#E7EEF6"),
-
-            // Card surfaces — pure white, stands out from gray-blue backdrop
-            "0E1B2C" or "0E1A2C" or "101B2D" or "101C2E" => ParseColor("#FFFFFF"),
-            "13253A" or "142436" or "15273D" or "16273D" => ParseColor("#F8FAFD"),
-
-            // Summary/control card surfaces
-            "0F1C2D" => ParseColor("#FAFCFF"),
-            "15283F" or "14263A" => ParseColor("#F0F4FA"),
-
-            // Badge tile — slightly tinted so it's visible on white cards
-            "102131" or "17304A" => ParseColor("#E0EAF4"),
-
-            // Chart frame — light gray inset, clearly distinct from white card
-            "0E1A2B" or "13263B" or "0C1824" or "111F30" => ParseColor("#EDF1F7"),
-
-            // Legend row idle — subtle gray
-            "101C2D" or "132438" => ParseColor("#F0F4F9"),
-            // Legend row hover — noticeably darker
-            "162A3E" or "1C3350" => ParseColor("#E0E8F2"),
-
-            // Range shell
-            "102031" or "15283E" => ParseColor("#ECF0F6"),
-
-            // Chart plot background — light gray, not white (creates inset feel)
-            "0B1726" or "12243A" or "0A141F" or "0F1E2E" => ParseColor("#EEF2F8"),
-
-            // Card hover — visible shift from white
-            "102133" or "162A40" or "122034" or "1A2C46" => ParseColor("#E4ECF4"),
-
-            // Control editor cards
-            "0F1B2D" or "13243A" => ParseColor("#F4F7FC"),
-
-            // Process section — gray inset
-            "0D1824" or "12202F" => ParseColor("#EBF0F6"),
-
-            // Scale pill / misc
-            "101D2E" or "152840" => ParseColor("#E6ECF4"),
-
-            // Tooltip
-            "15283B" or "203851" => ParseColor("#FFFFFF"),
-
-            _ => ParseColor("#F2F6FB"),
+                Orientation = Orientation.Horizontal,
+                Spacing = 12,
+                VerticalAlignment = VerticalAlignment.Center,
+                Children = { icon, info },
+            },
         };
     }
 
-    private static bool IsLightPaletteActive()
+    private static Border CreateColorSwatch(string hex)
     {
-        var color = ResolveColor("AppBackdropBrush", "#030812");
-        var luminance = (0.2126 * color.R) + (0.7152 * color.G) + (0.0722 * color.B);
-        return luminance >= 170d;
-    }
+        Color swatchColor;
+        try { swatchColor = ParseColor(hex); }
+        catch { swatchColor = ParseColor("#66E7FF"); }
 
-    private static Color ResolveColor(string key, string fallbackHex)
-    {
-        if (Application.Current.Resources.TryGetValue(key, out var value) && value is SolidColorBrush brush)
+        return new Border
         {
-            return brush.Color;
-        }
-
-        return ParseColor(fallbackHex);
-    }
-
-    private static Color ParseColor(string hex)
-    {
-        var normalized = hex.Trim().TrimStart('#');
-        return normalized.Length switch
-        {
-            6 => Color.FromArgb(255,
-                Convert.ToByte(normalized[..2], 16),
-                Convert.ToByte(normalized.Substring(2, 2), 16),
-                Convert.ToByte(normalized.Substring(4, 2), 16)),
-            8 => Color.FromArgb(
-                Convert.ToByte(normalized[..2], 16),
-                Convert.ToByte(normalized.Substring(2, 2), 16),
-                Convert.ToByte(normalized.Substring(4, 2), 16),
-                Convert.ToByte(normalized.Substring(6, 2), 16)),
-            _ => Color.FromArgb(0, 0, 0, 0),
+            Width = 16,
+            Height = 16,
+            CornerRadius = new CornerRadius(8),
+            Background = new SolidColorBrush(swatchColor),
+            VerticalAlignment = VerticalAlignment.Center,
         };
     }
 

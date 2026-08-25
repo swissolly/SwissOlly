@@ -1,0 +1,312 @@
+using System.Drawing;
+using Vaktr.Core.Models;
+using Vaktr.Overlay.Detection;
+using Vaktr.Overlay.Fps;
+using Vaktr.Overlay.Hotkeys;
+using Vaktr.Overlay.Rendering;
+
+namespace Vaktr.Overlay;
+
+public sealed class OverlayController : IDisposable
+{
+    private enum State { Hidden, ShownByGame, ShownByHotkey, Suspended }
+
+    private readonly LayeredOverlayWindow _window;
+    private readonly OverlayBitmapRenderer _renderer;
+    private readonly GlobalHotkeyService _hotkey;
+    private readonly object _renderLock = new();
+    private System.Threading.Timer? _pollTimer;
+    private IFpsSource? _fps;
+
+    private State _state = State.Hidden;
+    private volatile OverlayConfig _config = new OverlayConfig().Normalize();
+
+    private IntPtr _lastForegroundHwnd;
+    private IntPtr _pendingHideHwnd = IntPtr.Zero;
+    private double _lastFps = double.NaN;
+    private string? _fpsError;
+    private double _lastCpu = double.NaN;
+    private double _lastGpu = double.NaN;
+    private double _lastGpuTemp = double.NaN;
+    private double _lastMemPct = double.NaN;
+
+    public event Action<string>? StatusMessage;
+
+    public OverlayController()
+    {
+        _window = new LayeredOverlayWindow();
+        _renderer = new OverlayBitmapRenderer();
+        _hotkey = new GlobalHotkeyService();
+        _hotkey.HotkeyPressed += OnHotkeyPressed;
+    }
+
+    public void Start()
+    {
+        _window.Start();
+        _pollTimer = new System.Threading.Timer(PollForeground, null, 500, 500);
+        OverlayLog.Write("OverlayController started  poll=500ms");
+    }
+
+    public void RegisterHotkey(IntPtr ownerHwnd)
+    {
+        if (!_hotkey.Register(ownerHwnd, _config.HotkeyGesture))
+            StatusMessage?.Invoke($"Could not register hotkey '{_config.HotkeyGesture}' — may already be in use.");
+    }
+
+    public void OnWmHotkey(int hotkeyId) => _hotkey.OnWmHotkey(hotkeyId);
+
+    public void ApplyConfig(OverlayConfig config)
+    {
+        bool gestureChanged = config.HotkeyGesture != _config.HotkeyGesture;
+        bool enabledChanged = config.Enabled != _config.Enabled;
+        _config = config;
+
+        lock (_renderLock)
+            _renderer.Invalidate();
+
+        if (gestureChanged)
+            StatusMessage?.Invoke("__reregister_hotkey__");
+
+        if (enabledChanged)
+        {
+            OverlayLog.Write($"Enabled changed → {config.Enabled}");
+            if (!config.Enabled)
+            {
+                StopFps();
+                TransitionTo(State.Hidden);
+            }
+            else
+            {
+                // Reset so the next poll immediately re-evaluates the current foreground window
+                _lastForegroundHwnd = IntPtr.Zero;
+            }
+        }
+
+        PushRender();
+    }
+
+    public void OnSnapshot(MetricSnapshot snapshot)
+    {
+        if (!_config.Enabled) return;
+
+        _lastCpu = ExtractSample(snapshot, "cpu-total", "usage") ?? _lastCpu;
+        _lastGpu = ExtractSample(snapshot, "gpu-total", "usage") ?? _lastGpu;
+        _lastGpuTemp = ExtractSample(snapshot, "gpu-temperature", "temperature") ?? _lastGpuTemp;
+
+        double? usedGb = ExtractSample(snapshot, "memory", "used-gb");
+        double? totalGb = ExtractSample(snapshot, "memory", "total-gb");
+        if (usedGb.HasValue && totalGb.HasValue && totalGb.Value > 0)
+            _lastMemPct = usedGb.Value / totalGb.Value * 100.0;
+
+        PushRender();
+    }
+
+    private void PollForeground(object? state)
+    {
+        try
+        {
+            if (!_config.Enabled) return;
+            if (_state == State.ShownByHotkey) return;
+
+            var hwnd = Win32Interop.GetForegroundWindow();
+            if (hwnd == _lastForegroundHwnd) return;
+
+            OverlayLog.Write($"Foreground changed → 0x{hwnd:X}");
+            _lastForegroundHwnd = hwnd;
+            OnForegroundChanged(hwnd);
+        }
+        catch (Exception ex)
+        {
+            OverlayLog.Write($"PollForeground error: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private void OnForegroundChanged(IntPtr hwnd)
+    {
+        if (!_config.Enabled) return;
+        if (_state == State.ShownByHotkey) return;
+
+        if (GameProcessClassifier.IsLikelyGame(hwnd))
+        {
+            _pendingHideHwnd = IntPtr.Zero;
+            uint pid = GameProcessClassifier.GetProcessId(hwnd);
+            string exeName = "?";
+            try { exeName = System.Diagnostics.Process.GetProcessById((int)pid).ProcessName; } catch { }
+            OverlayLog.Write($"Game detected pid={pid} exe={exeName} — transitioning to ShownByGame");
+            StartFps(pid);
+
+            // Log game window position for debugging
+            var gameRect = new Win32Interop.RECT();
+            Win32Interop.GetWindowRect(hwnd, ref gameRect);
+            OverlayLog.Write($"Game hwnd=0x{hwnd:X} rect=[{gameRect.Left},{gameRect.Top},{gameRect.Right},{gameRect.Bottom}]");
+
+            var monitor = Win32Interop.MonitorFromWindow(hwnd, Win32Interop.MONITOR_DEFAULTTONEAREST);
+
+            // In exclusive fullscreen, GetWindowRect may report (0,0)-relative coordinates even
+            // on a secondary monitor, causing MonitorFromWindow to return the wrong monitor.
+            // Cross-check with the cursor: when a game is active, the cursor is captured to the
+            // game's display — so a mismatch means we picked the wrong monitor.
+            var cursorPt = new Win32Interop.POINT();
+            Win32Interop.GetCursorPos(ref cursorPt);
+            var cursorMonitor = Win32Interop.MonitorFromPoint(cursorPt, Win32Interop.MONITOR_DEFAULTTONEAREST);
+            if (cursorMonitor != IntPtr.Zero && cursorMonitor != monitor)
+            {
+                OverlayLog.Write($"Monitor mismatch: window → 0x{monitor:X}, cursor @ ({cursorPt.X},{cursorPt.Y}) → 0x{cursorMonitor:X}. Using cursor monitor.");
+                monitor = cursorMonitor;
+            }
+
+            var monInfo = new Win32Interop.MONITORINFO { cbSize = (uint)System.Runtime.InteropServices.Marshal.SizeOf<Win32Interop.MONITORINFO>() };
+            Win32Interop.GetMonitorInfo(monitor, ref monInfo);
+            OverlayLog.Write($"Overlay monitor rect=[{monInfo.rcMonitor.Left},{monInfo.rcMonitor.Top},{monInfo.rcMonitor.Right},{monInfo.rcMonitor.Bottom}]");
+
+            _window.Reposition(_config.Corner, monitor, hwnd);
+            TransitionTo(State.ShownByGame);
+        }
+        else
+        {
+            if (_state == State.ShownByGame)
+            {
+                if (hwnd == _pendingHideHwnd)
+                {
+                    // Same non-game window seen twice in a row (~1 second) — truly left the game
+                    _pendingHideHwnd = IntPtr.Zero;
+                    StopFps();
+                    OverlayLog.Write($"No longer a game (confirmed) — hiding");
+                    TransitionTo(State.Hidden);
+                }
+                else
+                {
+                    // First non-game poll — could be a brief alt-tab; wait for next poll to confirm
+                    _pendingHideHwnd = hwnd;
+                    OverlayLog.Write($"Non-game foreground 0x{hwnd:X} — waiting for confirmation");
+                }
+            }
+        }
+    }
+
+    private void OnHotkeyPressed()
+    {
+        if (!_config.Enabled) return;
+        OverlayLog.Write($"Hotkey pressed, state={_state}");
+
+        if (_state == State.ShownByHotkey)
+            TransitionTo(State.Hidden);
+        else
+            TransitionTo(State.ShownByHotkey);
+    }
+
+    private void TransitionTo(State next)
+    {
+        OverlayLog.Write($"TransitionTo {next}");
+        _state = next;
+        if (next == State.Hidden)
+            _window.Hide();
+        else
+        {
+            // Force a fresh ULW call on every show — layered window content is lost on hide/re-show
+            lock (_renderLock)
+                _renderer.Invalidate();
+            PushRender();
+            _window.Show();
+        }
+    }
+
+    private void StartFps(uint pid)
+    {
+        StopFps();
+        var src = new DwmFpsSource();
+        src.ErrorOccurred += msg =>
+        {
+            OverlayLog.Write($"FPS error: {msg}");
+            _fpsError = msg == "exclusive-fullscreen" ? "exclusive" : "err";
+            PushRender();
+        };
+        src.FpsUpdated += fps =>
+        {
+            _lastFps = fps;
+            PushRender();
+        };
+        _fps = src;
+        _fps.StartTracking(pid);
+    }
+
+    private void StopFps()
+    {
+        _fps?.StopTracking();
+        _fps?.Dispose();
+        _fps = null;
+        _lastFps = double.NaN;
+        _fpsError = null;
+    }
+
+    private void PushRender()
+    {
+        if (_state == State.Hidden) return;
+
+        lock (_renderLock)
+        {
+            var lines = BuildLines();
+            var color = ParseColor(_config.TextColor);
+            var (bmp, changed) = _renderer.Render(lines, color, _config.FontSizePx, (float)_config.Opacity);
+            if (changed)
+            {
+                OverlayLog.Write($"PushRender: bitmap {bmp.Width}x{bmp.Height}, sending to window");
+                _window.UpdateBitmap(bmp);
+            }
+        }
+    }
+
+    private string[] BuildLines()
+    {
+        var metrics = _config.Mode switch
+        {
+            OverlayMode.Simple => ["fps"],
+            OverlayMode.Advanced => ["fps", "cpu", "gpu", "gpu-temp", "memory"],
+            OverlayMode.Custom => _config.CustomMetrics,
+            _ => ["fps"],
+        };
+
+        var lines = new List<string>(metrics.Count);
+        foreach (var m in metrics)
+        {
+            lines.Add(m switch
+            {
+                "fps" => _fpsError != null ? "FPS: --"
+                       : double.IsNaN(_lastFps) ? "FPS: --"
+                       : $"FPS: {_lastFps:F0}",
+                "cpu" => double.IsNaN(_lastCpu) ? "CPU: --" : $"CPU: {_lastCpu:F0}%",
+                "gpu" => double.IsNaN(_lastGpu) ? "GPU: --" : $"GPU: {_lastGpu:F0}%",
+                "gpu-temp" => double.IsNaN(_lastGpuTemp) ? "GPU Temp: --" : $"GPU Temp: {_lastGpuTemp:F0}°C",
+                "memory" => double.IsNaN(_lastMemPct) ? "MEM: --" : $"MEM: {_lastMemPct:F0}%",
+                _ => m,
+            });
+        }
+        return [.. lines];
+    }
+
+    private static double? ExtractSample(MetricSnapshot snapshot, string panelKey, string seriesKey)
+    {
+        foreach (var s in snapshot.Samples)
+        {
+            if (string.Equals(s.PanelKey, panelKey, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(s.SeriesKey, seriesKey, StringComparison.OrdinalIgnoreCase))
+                return s.Value;
+        }
+        return null;
+    }
+
+    private static Color ParseColor(string hex)
+    {
+        try { return ColorTranslator.FromHtml(hex); }
+        catch { return Color.FromArgb(0x66, 0xE7, 0xFF); }
+    }
+
+    public void Dispose()
+    {
+        _pollTimer?.Dispose();
+        StopFps();
+        _hotkey.Dispose();
+        _renderer.Dispose();
+        _window.Dispose();
+    }
+}

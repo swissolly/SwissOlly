@@ -35,6 +35,15 @@ public sealed class UsageGauge : UserControl
     private bool _redrawUpgradePending;
     private DispatcherQueuePriority _queuedRedrawPriority = DispatcherQueuePriority.Low;
 
+    // Dirty-check state — avoids rebuilding both arc Path/PathGeometry objects on every
+    // scrape tick when the value hasn't meaningfully moved (mirrors TelemetryChart's approach).
+    private double _lastRenderedValue = double.NaN;
+    private Brush? _lastRenderedAccentBrush;
+    private string? _lastRenderedCaption;
+    private double _lastRenderedWidth = -1;
+    private double _lastRenderedHeight = -1;
+    private bool _themeDirty;
+
     public UsageGauge()
     {
         _canvas = new Canvas();
@@ -125,6 +134,7 @@ public sealed class UsageGauge : UserControl
         _innerBorder.BorderBrush = ResolveBrush("SurfaceGridBrush", "#35587A");
         _valueText.Foreground = ResolveBrush("TextPrimaryBrush", "#F2F8FF");
         _captionText.Foreground = ResolveBrush("TextMutedBrush", "#7D9AB6");
+        _themeDirty = true; // theme-resource lookups (e.g. SurfaceStrokeBrush) live inside Redraw()
         Redraw();
     }
 
@@ -211,12 +221,27 @@ public sealed class UsageGauge : UserControl
             return;
         }
 
+        var clampedValue = Math.Clamp(Value, 0d, 100d);
+        var accentBrush = AccentBrush;
+        var caption = Caption;
+
+        if (!_themeDirty
+            && _canvas.Children.Count > 0
+            && Math.Abs(clampedValue - _lastRenderedValue) < 0.05
+            && ReferenceEquals(accentBrush, _lastRenderedAccentBrush)
+            && string.Equals(caption, _lastRenderedCaption, StringComparison.Ordinal)
+            && Math.Abs(width - _lastRenderedWidth) < 0.5
+            && Math.Abs(height - _lastRenderedHeight) < 0.5)
+        {
+            return;
+        }
+
         var centerX = width / 2d;
         var centerY = height / 2d;
         var radius = Math.Max(18, Math.Min(width, height) / 2d - 12);
         var startAngle = 135d;
         var totalSweep = 270d;
-        var sweep = Math.Clamp(Value, 0d, 100d) / 100d * totalSweep;
+        var sweep = clampedValue / 100d * totalSweep;
 
         _canvas.Children.Clear();
         _canvas.Children.Add(CreateArcPath(
@@ -235,12 +260,19 @@ public sealed class UsageGauge : UserControl
             radius,
             startAngle,
             sweep,
-            AccentBrush ?? ResolveBrush("AccentBrush", "#66E7FF"),
+            accentBrush ?? ResolveBrush("AccentBrush", "#66E7FF"),
             11,
             1));
 
-        _valueText.Text = $"{Math.Clamp(Value, 0d, 100d):0.#}%";
-        _captionText.Text = Caption;
+        _valueText.Text = $"{clampedValue:0.#}%";
+        _captionText.Text = caption;
+
+        _lastRenderedValue = clampedValue;
+        _lastRenderedAccentBrush = accentBrush;
+        _lastRenderedCaption = caption;
+        _lastRenderedWidth = width;
+        _lastRenderedHeight = height;
+        _themeDirty = false;
     }
 
     private static Path CreateArcPath(

@@ -18,6 +18,7 @@ public sealed class MainViewModel : ObservableObject
     private int _selectedIntervalSeconds = VaktrConfig.DefaultScrapeIntervalSeconds;
     private int _selectedWindowMinutes = 15;
     private ThemeMode _selectedTheme = ThemeMode.Dark;
+    private OverlayConfig _overlayConfig = new OverlayConfig().Normalize();
     private bool _launchOnStartup;
     private bool _minimizeToTray = true;
     private bool _isSettingsOpen;
@@ -87,6 +88,12 @@ public sealed class MainViewModel : ObservableObject
     public IReadOnlyList<SelectionOption> RetentionOptions { get; }
 
     public IReadOnlyList<ThemeSelectionOption> ThemeOptions { get; }
+
+    public OverlayConfig OverlayConfig
+    {
+        get => _overlayConfig;
+        set => SetProperty(ref _overlayConfig, value);
+    }
 
     public string StorageDirectory
     {
@@ -223,6 +230,7 @@ public sealed class MainViewModel : ObservableObject
             MinimizeToTray = MinimizeToTray,
             PanelVisibility = visibility,
             PanelOrder = BuildPersistedPanelOrder().ToList(),
+            Overlay = _overlayConfig,
         }.Normalize();
     }
 
@@ -265,6 +273,8 @@ public sealed class MainViewModel : ObservableObject
         _panelTogglesDirty = true;
         SyncDashboardPanels();
         SyncPanelToggles();
+
+        OverlayConfig = normalized.Overlay ?? new OverlayConfig().Normalize();
     }
 
     public void LoadHistory(IReadOnlyList<MetricSeriesHistory> history)

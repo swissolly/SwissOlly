@@ -103,37 +103,12 @@ internal static class IconFactory
             "gpu" => "\uE7F8", // Video
             "temperature" => "\uE9CA", // Thermometer
             "system" => "\uF182", // ScreenTime
+            "overlay" => "", // LayeredDisplay
             _ => "\uF182",
         };
     }
 
-    private static Brush CreateSurfaceGradient(string startHex, string endHex)
-    {
-        if (IsLightPaletteActive())
-        {
-            return new LinearGradientBrush
-            {
-                StartPoint = new Point(0, 0),
-                EndPoint = new Point(1, 1),
-                GradientStops = new GradientStopCollection
-                {
-                    new GradientStop { Color = ResolveColor("SurfaceElevatedBrush", "#F4F8FC"), Offset = 0d },
-                    new GradientStop { Color = ResolveColor("SurfaceStrongBrush", "#EDF4FB"), Offset = 1d },
-                },
-            };
-        }
-
-        return new LinearGradientBrush
-        {
-            StartPoint = new Point(0, 0),
-            EndPoint = new Point(1, 1),
-            GradientStops = new GradientStopCollection
-            {
-                new GradientStop { Color = BrushFactory.ParseColor(startHex), Offset = 0d },
-                new GradientStop { Color = BrushFactory.ParseColor(endHex), Offset = 1d },
-            },
-        };
-    }
+    private static Brush CreateSurfaceGradient(string startHex, string endHex) => ThemeVisuals.CreateThemeResourceGradient(startHex, endHex);
 
     private static Brush CreateInnerGlowBrush(Brush accentBrush)
     {
@@ -156,32 +131,11 @@ internal static class IconFactory
         return CreateSurfaceGradient("#143249", "#0C1622");
     }
 
-    private static bool IsLightPaletteActive()
-    {
-        var color = ResolveColor("AppBackdropBrush", "#030812");
-        var luminance = (0.2126 * color.R) + (0.7152 * color.G) + (0.0722 * color.B);
-        return luminance >= 170d;
-    }
+    private static bool IsLightPaletteActive() => ThemeVisuals.IsLightPaletteActive();
 
-    private static Windows.UI.Color ResolveColor(string key, string fallbackHex)
-    {
-        if (Microsoft.UI.Xaml.Application.Current.Resources.TryGetValue(key, out var value) && value is SolidColorBrush brush)
-        {
-            return brush.Color;
-        }
+    private static Windows.UI.Color ResolveColor(string key, string fallbackHex) => ThemeVisuals.ResolveColor(key, fallbackHex);
 
-        return BrushFactory.ParseColor(fallbackHex);
-    }
-
-    private static Brush ResolveBrush(string key, string fallbackHex)
-    {
-        if (Microsoft.UI.Xaml.Application.Current.Resources.TryGetValue(key, out var value) && value is Brush brush)
-        {
-            return brush;
-        }
-
-        return BrushFactory.CreateBrush(fallbackHex);
-    }
+    private static Brush ResolveBrush(string key, string fallbackHex) => ThemeVisuals.ResolveBrush(key, fallbackHex);
 
     private static Brush CreateOpacityBrush(Brush brush, double opacity)
     {

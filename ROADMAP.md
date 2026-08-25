@@ -31,16 +31,27 @@ Expose Vaktr's collected metrics via a local HTTP endpoint in Prometheus exposit
 
 **Status:** Planned.
 
-### In-Game Overlay
-A compact, always-on-top mini overlay that shows selected metrics (CPU, GPU, RAM, temps, FPS) while gaming — similar to the Nvidia/RTSS overlay experience but powered by Vaktr's existing data pipeline.
-
-The approach: a transparent, borderless WinUI window with configurable position, opacity, size, and metric selection. No process injection, no driver hooks, no anti-cheat conflicts. Works in borderless/windowed game modes (the standard for most modern games). Users can toggle it on/off, choose which metrics to display, and position it anywhere on screen.
-
-This avoids the complexity and anti-cheat risk of DirectX/Vulkan injection while staying true to Vaktr's zero-config, zero-dependency philosophy. The existing `CollectorService` and `MetricSnapshot` pipeline feeds the overlay directly — no new data collection needed.
-
-**Status:** Planned for v1.1.0+. Depends on v1.0.1 performance work to ensure the data pipeline is lightweight enough for in-game use.
-
 ## Shipped
+
+### v1.2.0 — In-Game Telemetry Overlay
+A compact, always-on-top overlay that renders FPS and selected system metrics on top of running games. Owned by the main Vaktr process — no second window, no taskbar entry, no Alt+Tab entry.
+
+- Three display modes: Simple (FPS only), Advanced (FPS + CPU + GPU + GPU temp + memory), Custom (pick your own)
+- FPS measured via DWM flush timing — no DLL injection, no ETW session, no anti-cheat conflicts (safe with Vanguard, EAC, BattlEye), no admin rights or elevated group membership required
+- Auto-shows when a game has focus; hides when focus returns to desktop
+- Corner positioning (top-left, top-right, bottom-left, bottom-right)
+- Outlined text with no background box — reads cleanly over any game background
+- Configurable text color via a color picker with quick presets (or a custom hex value), font size (10–32px), opacity (30–100%), and toggle hotkey
+- Configured entirely from the existing control deck — no second settings window
+- Click-through layered Win32 window: `WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE` — invisible to the shell, no code-signing or UIAccess required
+- Resource cost: ~0.4–0.6% CPU, ~12 MB memory added
+
+**Known limitations in v1.2.0:**
+- Exclusive fullscreen isn't supported — an intentional scope decision. Vaktr targets borderless and windowed-fullscreen games only, which avoids ever requiring code-signing or elevated UIAccess.
+- HDR games render dim (SDR overlay). Deferred to v1.3.0.
+
+**Follow-ups tracked for v1.3.0:**
+- HDR-aware overlay rendering
 
 ### v1 — Polished Local Telemetry Dashboard
 - Live time-series panels for CPU, GPU, memory, disk, network, system activity

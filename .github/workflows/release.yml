@@ -49,6 +49,19 @@ jobs:
       - name: Publish app (self-contained ${{ matrix.platform }})
         run: dotnet publish Vaktr.App/Vaktr.App.csproj -c Release -p:Platform=${{ matrix.platform }} -r ${{ matrix.runtime }} --self-contained -o publish/${{ matrix.platform }}
 
+      - name: Sign executable (uiAccess requires a signed binary)
+        if: ${{ secrets.CODE_SIGN_PFX != '' }}
+        shell: pwsh
+        env:
+          PFX_BASE64: ${{ secrets.CODE_SIGN_PFX }}
+          PFX_PASS:   ${{ secrets.CODE_SIGN_PFX_PASSWORD }}
+        run: |
+          $pfxPath = "$env:RUNNER_TEMP\vaktr-sign.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:PFX_BASE64))
+          $signtool = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\signtool.exe"
+          & $signtool sign /f $pfxPath /p $env:PFX_PASS /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 "publish/${{ matrix.platform }}/Vaktr.exe"
+          Remove-Item $pfxPath
+
       - name: Install Inno Setup
         run: choco install innosetup -y --no-progress
 
