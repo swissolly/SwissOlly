@@ -52,7 +52,7 @@ Full plan: `~/.claude/plans/adaptive-foraging-mist.md` (or read this file end-to
 
 ## Step 4 — Foreground detection and auto-show/hide
 
-- [x] `Vaktr.Overlay/Detection/ForegroundWatcher.cs` — `SetWinEventHook(EVENT_SYSTEM_FOREGROUND, ..., WINEVENT_OUTOFCONTEXT)`. Raises an event when the foreground HWND changes; debounces 250 ms (Alt-Tab fires multiple events).
+- [x] ~~`Vaktr.Overlay/Detection/ForegroundWatcher.cs` — `SetWinEventHook(EVENT_SYSTEM_FOREGROUND, ...)`~~ — superseded and deleted. Replaced by a 500 ms foreground poll in `OverlayController.PollForeground`, which needs no hook and gets the Alt-Tab debounce for free via its two-poll hide confirmation.
 - [x] `Vaktr.Overlay/Detection/GameProcessClassifier.cs` — combines: (a) foreground HWND covers an entire monitor (`GetWindowRect` vs `MonitorFromWindow` + `GetMonitorInfo`), (b) PID's main module is not in deny-list (`explorer.exe`, `dwm.exe`, `Vaktr.exe`, `ApplicationFrameHost.exe`, `SearchHost.exe`, `StartMenuExperienceHost.exe`, `ShellExperienceHost.exe`, `TextInputHost.exe`). Return `bool IsLikelyGame(IntPtr hwnd)`.
 - [x] `OverlayController` subscribes to `ForegroundWatcher`, calls classifier, transitions state. Stores currently-tracked PID for the FPS source (Step 6).
 - [ ] **Test**: verify overlay hides when Notepad maximized is foreground; appears when a borderless game is focused (or any non-deny-list fullscreen-sized exe for now).
@@ -67,17 +67,37 @@ Full plan: `~/.claude/plans/adaptive-foraging-mist.md` (or read this file end-to
 
 ## Step 6 — FPS source
 
-> **Superseded**: this step originally shipped an ETW DXGI-based FPS source (`DxgiEtwFpsSource`,
-> `Microsoft.Diagnostics.Tracing.TraceEvent`). It was later replaced by `DwmFpsSource`, which times
-> successive `DwmFlush()` calls instead — same accuracy for windowed/borderless games, no admin
-> rights or `Performance Log Users` membership required, and no ETW session/ARM64 binary dependency.
-> `DxgiEtwFpsSource.cs`, `ForegroundWatcher.cs` (superseded by a simple foreground-window poll in
-> `OverlayController`), and the `TraceEvent` package reference have been deleted as dead code.
+> **History**: this step first shipped an ETW DXGI source built on
+> `Microsoft.Diagnostics.Tracing.TraceEvent`, then swapped to `DwmFpsSource` to shed the admin
+> requirement and the package's native ARM64 dependency. That swap traded away correctness:
+> `DwmFlush` timing measures the **compositor's** cadence — the display refresh rate — and is
+> attributed to no process at all (its `pid` argument was unused). A game running 45 fps on a
+> 144 Hz panel reported 144. It only ever read correctly when the game happened to be v-synced
+> to the refresh rate.
+>
+> Resolved by returning to present-based measurement, but written against the raw Win32 ETW
+> APIs instead of the `TraceEvent` package — those are plain `advapi32` entry points, so the
+> ARM64 concern that motivated the original swap does not apply. The admin requirement is
+> handled at install time instead of runtime (Step 6b).
 
-- [x] `Vaktr.Overlay/Fps/IFpsSource.cs` — interface with `void StartTracking(uint pid)`, `void StopTracking()`, `event Action<double> FpsUpdated`.
-- [x] `Vaktr.Overlay/Fps/DwmFpsSource.cs` — times successive `DwmFlush()` calls on a dedicated background thread; computes FPS over a rolling ~1s window, fires `FpsUpdated` at ≤2Hz. Detects exclusive fullscreen (DWM bypassed, `DwmFlush` returns non-zero HRESULT immediately) and reports `--` instead of blocking or polling with an arbitrary timeout.
-- [x] **ARM64**: works natively — `DwmFlush` is a plain Win32 API call, no architecture-specific binary dependency.
-- [ ] **Test on a real game**: launch a game, verify FPS appears and updates smoothly.
+- [x] `Vaktr.Overlay/Fps/IFpsSource.cs` — `StartTracking(uint pid)`, `StopTracking()`, `FpsUpdated`, `ErrorOccurred`, and `FpsAccuracy Accuracy` so callers can tell an exact reading from an approximate one.
+- [x] `Vaktr.Overlay/Fps/EtwInterop.cs` — hand-rolled ETW consumer P/Invoke (`StartTrace`, `EnableTraceEx2`, `OpenTrace`, `ProcessTrace`, `ControlTrace`, `CloseTrace`) plus faithful `EVENT_TRACE_PROPERTIES` / `EVENT_TRACE_LOGFILE` / `EVENT_RECORD` layouts. No NuGet dependency, identical on x64 and ARM64.
+- [x] `Vaktr.Overlay/Fps/EtwPresentFpsSource.cs` — real-time session over `Microsoft-Windows-DXGI` (+ `Microsoft-Windows-D3D9` for older titles), counting present-start events attributed to the tracked PID. Rolling 1s window, emits at ≤2Hz, suppresses duplicate emits when ETW's ~1s buffer flush is slower than the emit timer, and reports a stall when a tracked game stops presenting.
+- [x] Recovers from a stale session left by a crashed process (`ERROR_ALREADY_EXISTS` → stop → retry once).
+- [x] `Vaktr.Overlay/Fps/AdaptiveFpsSource.cs` — probes ETW availability once, uses `EtwPresentFpsSource` when permitted and falls back to `DwmFpsSource` otherwise, raising `AccuracyChanged` so the UI can say which is live.
+- [x] `DwmFpsSource` retained as the documented fallback, with its comment corrected to state plainly that it measures refresh rate and not the game.
+- [x] **ARM64**: builds clean; no architecture-specific binary dependency.
+- [x] **Struct layout verified** against documented x64 offsets — all sizes and the fields ETW reads (`EVENT_TRACE_LOGFILE.EventRecordCallback` @ 424, `EVENT_HEADER.ProcessId` @ 12, etc.) confirmed correct.
+- [x] **Verified live**: two processes tracked simultaneously on one 144 Hz display reported genuinely different rates (VS Code GPU process steady at 144, Edge GPU process varying 43–100). The DWM source reports 144 for both, which is the bug this fixes.
+- [ ] **Test on a real game**: launch a game, verify FPS appears, matches an independent counter (Steam overlay / RTSS), and updates smoothly.
+
+## Step 6b — Install-time privilege grant
+
+- [x] `installer/vaktr-setup.iss` — at `ssPostInstall`, add the installing user to the built-in **Performance Log Users** group (by SID `S-1-5-32-559`, so it works on localised Windows). Setup already runs elevated, so this needs no extra prompt and Vaktr itself still runs unelevated.
+- [x] Non-fatal on failure: already-a-member and not-permitted both fall through to the approximate source rather than blocking install.
+- [x] `OverlayController` surfaces a one-time control-deck message when FPS is approximate, explaining that sign-out/sign-in is needed for the group to take effect.
+- [ ] **Test**: install on a machine whose user is not in the group → approximate FPS + status message; sign out and back in → exact FPS.
+- [ ] **Test**: portable/build-from-source run with no group membership → falls back cleanly, no crash, no elevation prompt.
 
 ## Step 7 — Settings UI (Control Deck expansion)
 
@@ -106,10 +126,10 @@ Full plan: `~/.claude/plans/adaptive-foraging-mist.md` (or read this file end-to
 
 ## Step 9 — Documentation + release prep
 
-- [x] `README.md` — add a short "Overlay" subsection under Features
-- [x] `ROADMAP.md` — move "in-game overlay" from Roadmap to Done; add follow-ups for v1.3.0 (HDR-aware rendering, color picker control, installer adds user to PLU group, PresentMonAPI2 swap)
+- [x] `README.md` — add a short "Overlay" subsection under Features; state plainly that FPS is present-counted and document the sign-out/sign-in step
+- [x] `ROADMAP.md` — move "in-game overlay" from Roadmap to Done; correct the FPS description; carry HDR rendering and the UI/UX polish pass into v1.3.0
 - [x] Verify `dotnet build Vaktr.sln -c Release -p:Platform=x64` clean
-- [x] Verify `dotnet build Vaktr.sln -c Release -p:Platform=ARM64` clean (FPS field shows `--` on ARM64 if PresentMon ARM64 unavailable)
+- [x] Verify `dotnet build Vaktr.sln -c Release -p:Platform=ARM64` clean
 - [x] All tests pass: `dotnet test Vaktr.Tests/Vaktr.Tests.csproj -c Release` (47/47)
 - [ ] Manual smoke matrix:
   - Borderless-fullscreen modern game (Steam, Unreal/Unity title)
@@ -118,6 +138,12 @@ Full plan: `~/.claude/plans/adaptive-foraging-mist.md` (or read this file end-to
   - Anti-cheat-protected (Valorant or CS2) — confirm game launches normally
   - HDR game (note: overlay renders dim — known v1.2.0 limitation)
   - Multi-monitor mixed-DPI: game on secondary monitor, overlay scales correctly
+  - **FPS cross-check**: run alongside the Steam overlay or RTSS and confirm the numbers agree within a frame or two
+  - **Uncapped frame rate**: confirm the reading tracks the game rather than pinning to the refresh rate — this is the specific failure the ETW source exists to fix
+  - **Frame-limited game** (cap set below refresh, e.g. 60 on a 144 Hz panel) → reads 60, not 144
+  - **D3D9-era title** → present events arrive on the D3D9 provider and FPS appears
+  - Alt-tab out and back repeatedly → FPS recovers each time, never sticks at `--`
+  - Two games running, focus switching between them → tracked PID follows focus
 - [ ] Resource budget: idle <250 MB / <2% CPU; gaming with overlay active <300 MB / <3% CPU
 - [ ] Tag `v1.2.0`, push, verify CI builds both x64 and ARM64 installers, draft GitHub Release populates with both `.exe` files
 
@@ -125,6 +151,150 @@ Full plan: `~/.claude/plans/adaptive-foraging-mist.md` (or read this file end-to
 
 - Exclusive fullscreen isn't supported — by design. Vaktr targets borderless and windowed-fullscreen games, which keeps the overlay from ever needing code-signing or elevated UIAccess.
 - HDR games render the overlay in SDR — appears dim. Defer HDR-aware rendering to v1.3.0.
-- ~~PresentMon requires admin or Performance Log Users membership for ETW~~ — resolved. `DwmFpsSource` needs neither elevation nor group membership.
+- Exact FPS needs Performance Log Users membership. The installer grants it, but Windows only picks up group changes in a freshly built logon token, so the **first session after install falls back to approximate FPS** until the user signs out and back in. The overlay says so in the control deck rather than showing a wrong number silently.
+- Portable / build-from-source runs get approximate FPS unless the user joins the group manually.
+- ETW real-time delivery is buffered, so the FPS reading trails live by roughly a second. Fine for a readout; not suitable for frame-time analysis. Injection-based overlays (RTSS) are lower latency by nature.
+- Present counting assumes one swapchain per frame. An application presenting multiple swapchains per frame would over-report; this is normal for browsers and compositors but rare for games.
+- ~~ARM64 FPS depends on PresentMon ARM64 build availability~~ — resolved. The hand-rolled ETW layer uses only `advapi32` entry points.
 - ~~No color picker control in v1.2.0 — hex input only~~ — resolved. Color picker with quick presets shipped.
-- ~~ARM64 FPS depends on PresentMon ARM64 build availability~~ — resolved. `DwmFpsSource` has no ARM64-specific dependency.
+- ~~FPS reads the refresh rate rather than the game's frame rate~~ — resolved in Step 6.
+- ~~Overlay latches to `FPS: --` after any transient FPS error and never recovers~~ — resolved; a live reading now clears the error state.
+
+---
+
+# Step 10 — UI/UX polish and smoothness pass
+
+The functional surface of v1.2.0 is complete. This step is about how the app *feels*: nothing
+should snap, stutter, jump, or leave the user guessing what a control does. Every task below is
+anchored to code that exists today.
+
+Ordering note: 10.1 and 10.2 are the two the user actually feels every session. Do those first.
+
+## 10.1 — Value motion (no more snapping)
+
+Numbers and gauges currently jump straight to their new value. `TelemetryPanelCard` already has a
+full easing vocabulary (28 `DoubleAnimation` uses); the gauges and readouts never got the same
+treatment.
+
+- [x] `Vaktr.App/Controls/Motion.cs` — shared motion primitives. `MotionTicker` holds exactly one
+  process-wide `CompositionTarget.Rendering` subscription, attaching on the first active animator
+  and detaching when the last one settles, so a static dashboard costs nothing. `AnimatedDouble`
+  eases toward a target and retargets mid-flight from its current value rather than restarting.
+- [x] `UsageGauge` — the value arc now eases over 300 ms with ease-out-cubic instead of snapping.
+- [x] `UsageGauge` — retained geometry. `Redraw` used to `Children.Clear()` and allocate a fresh
+  `Path` + `PathGeometry` + `PathFigure` + `ArcSegment` pair every call; the arcs are now built
+  once per size/theme change and the value arc mutates its existing `ArcSegment`. This is what
+  makes 60 fps animation affordable — the per-frame path is allocation-free.
+- [x] Animation duration (300 ms) stays well under the fastest scrape interval (1 s), so a gauge
+  is never permanently mid-flight.
+- [x] Numeric readout tweens with the arc, and the format moved from `0.#` to integer percent —
+  the old format alternated between `45%` and `45.3%` as the fraction crossed zero, which jittered
+  a centred readout and would have done so every frame once animated.
+- [x] Zero-value arcs collapse instead of painting a stray round-cap dot at the 135° origin.
+- [x] Respect the OS reduce-motion setting via `UISettings.AnimationsEnabled` — when off,
+  `AnimatedDouble` degrades to an immediate snap.
+- [x] `SetRenderingSuspended` and `Unloaded` stop the animator so a frozen or removed gauge can't
+  hold the render tick open.
+- [ ] Extend the same treatment to the panel-card current-value readouts.
+
+## 10.2 — Chart interaction smoothness
+
+> **Correction**: an earlier draft of this section claimed drag-zoom caused a full XAML teardown
+> per pointer move, and that hover used a linear point scan. Both were wrong — reading the code
+> showed the selection rectangle already lives on its own retained `_interactionCanvas` and never
+> triggers a chart redraw, and `FindNearestPoint` is already a binary search. The real cost was
+> event *frequency*, not per-event work.
+
+- [x] Coalesce pointer moves to one visual update per rendered frame. A 1000 Hz mouse raises
+  `PointerMoved` far more often than the compositor draws, and every hover update rebuilt the
+  tooltip string and ran a `Measure()` layout pass. Cheap state (`_selectionCurrentX`) is still
+  written synchronously so `CompleteSelection` always sees the true release position; only the
+  expensive visual work is deferred.
+- [x] Cancel the queued flush on `PointerExited`, `Unloaded`, and selection completion so a chart
+  can't leak a render-tick subscription.
+- [x] ~~Separate the interaction overlay onto its own canvas~~ — already the case.
+- [x] ~~Replace the linear hover scan~~ — already a binary search.
+- [ ] Profile a drag-zoom on a busy panel (per-core CPU, all series visible) and record before/after
+  frame times. The coalescing change is sound in principle but is currently unmeasured.
+- [ ] Retain and mutate the data-layer `Path`/`PathGeometry` objects across redraws instead of
+  clearing and reallocating. This is per *scrape*, not per pointer move, so it is a lower priority
+  than it first appeared — but it still allocates a full path set every 2 s per panel.
+- [ ] Animate zoom range changes (including preset-range clicks and double-click reset) so the
+  viewport eases rather than cutting.
+
+## 10.3 — Overlay HUD polish
+
+Grounded in `Vaktr.Overlay/Rendering/OverlayBitmapRenderer.cs` and `OverlayController.BuildLines`.
+
+- [x] **Column alignment**: `OverlayLine` (label / value / colour) replaces the pre-joined string,
+  and the renderer measures the widest label once per pass to fix the column every value starts at.
+  Values no longer sit ragged behind labels of wildly different widths.
+- [x] **Label / value hierarchy**: labels draw at 72 % alpha of the configured colour, values at
+  full strength, so the numbers read first.
+- [x] **Colour-coded thresholds**: CPU / GPU / memory use the dashboard's exact `WarningBrush`
+  (#F0C968, >75 %) and `CriticalBrush` (#FF9761, >90 %) values; GPU temperature uses 75 °C / 85 °C
+  bands. Verified by rendering the HUD over a mixed bright/dark backdrop.
+- [ ] **Fade in/out**: `LayeredOverlayWindow.Show()` / `Hide()` pop instantly. Ramp
+  `UpdateLayeredWindow`'s `SourceConstantAlpha` over ~150 ms so the HUD arrives and leaves softly.
+  Note `UpdateLayeredWindow` accepts a null source DC to change blend alone, so the fade does not
+  need a full DIB re-blit per step — this needs an interop overload that passes `IntPtr.Zero`.
+- [ ] **Metric cadence**: FPS refreshes at 2 Hz but CPU/GPU/memory come from `CollectorService` at
+  the scrape interval (2 s default), so half the HUD is visibly stale. Either give the overlay its
+  own lightweight faster sampler for the three cheap counters, or interpolate between snapshots.
+  Decide explicitly — do not leave the mismatch.
+- [ ] **Optional scrim**: outlined text is unreadable over high-contrast, high-detail scenes. Add
+  an opt-in subtle rounded background at low alpha; keep "none" the default so the current clean
+  look is preserved.
+- [ ] **Live preview in the control deck**: render the actual overlay bitmap into the OVERLAY card
+  so corner, colour, size, and opacity changes are visible without launching a game. The renderer
+  is already decoupled enough to call directly — the scratch harness used during this step rendered
+  it straight to a PNG.
+
+## 10.4 — Control deck intuitiveness
+
+- [ ] Settings currently apply only on Save. Live-preview colour, font size, and opacity as the
+  user edits them, reverting on Cancel — editing a HUD you cannot see is the least intuitive part
+  of the current flow.
+- [ ] Show the resolved FPS source state (`OverlayController.FpsAccuracy`) in the OVERLAY card, with
+  the sign-out/sign-in remedy inline when it reads Approximate. Today that only appears as a
+  transient status line.
+- [ ] Validation is currently pass/fail on Save. Show inline, per-field validation as the user
+  types, with the acceptable range stated next to the field rather than discovered by failing.
+- [ ] Hotkey capture: let the user press the combination to record it instead of typing
+  `"Ctrl+Shift+F11"` as free text, and flag conflicts at capture time rather than at registration.
+- [ ] Make the disabled state legible — when the overlay is off, visibly de-emphasise the rest of
+  the card instead of leaving live-looking controls that do nothing.
+
+## 10.5 — Window and layout transitions
+
+- [ ] Panel reflow between the 1/2/3-column breakpoints currently cuts. Animate position and size
+  through the reflow so a window resize reads as continuous.
+- [ ] Panel drag-reorder: add a clear drop-target indicator and animate the displaced panel into
+  its new slot rather than swapping instantly.
+- [ ] Theme switch is instant; cross-fade brush changes over ~200 ms.
+- [ ] Audit first-paint: confirm the loading sequence hands off to the dashboard without a flash of
+  unstyled or empty panels.
+
+## 10.6 — Accessibility and input
+
+- [ ] Keyboard-drive the whole control deck: tab order, visible focus rings on `ActionChip` and
+  `InlineTextEntry`, Enter/Escape to commit/cancel.
+- [ ] Chips currently read as generic elements to a screen reader — set `AutomationProperties.Name`
+  and a toggle-appropriate control pattern on `ActionChip`.
+- [ ] Verify WCAG AA contrast still holds for any new state colours added in 10.3/10.4, in both
+  themes. v1 claimed AA compliance; keep it true.
+- [ ] Charts convey series only by colour — add a non-colour affordance (dash pattern or marker)
+  for colour-blind users.
+
+## 10.7 — Perf guardrails
+
+- [ ] Measure idle and gaming CPU/memory after 10.1–10.3 and confirm the v1.2.0 budget still holds
+  (idle < 250 MB / < 2 %; gaming < 300 MB / < 3 %). Animation work cuts directly against this —
+  measure, don't assume. **Not yet measured.**
+- [x] Motion is architecturally guaranteed to settle: `MotionTicker` detaches its
+  `CompositionTarget.Rendering` handler when the last animator finishes, so a dashboard showing
+  static values has no render subscription at all. Still worth confirming empirically above.
+- [ ] Add the ETW struct-layout assertions to a real test project so the interop ABI is locked
+  down permanently. Requires bumping `Vaktr.Tests` to `net8.0-windows10.0.19041.0` and adding a
+  `Vaktr.Overlay` project reference (verified during Step 6 with a scratch harness, but not yet a
+  standing test).

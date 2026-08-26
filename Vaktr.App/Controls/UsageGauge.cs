@@ -44,6 +44,22 @@ public sealed class UsageGauge : UserControl
     private double _lastRenderedHeight = -1;
     private bool _themeDirty;
 
+    // Retained arc visuals. The value arc is re-shaped up to 60x/second while animating, so it
+    // mutates its existing ArcSegment rather than allocating a new Path/PathGeometry/PathFigure/
+    // ArcSegment set per frame the way the original clear-and-rebuild did.
+    private Path? _trackPath;
+    private Path? _valuePath;
+    private PathFigure? _valueFigure;
+    private ArcSegment? _valueSegment;
+    private double _centerX;
+    private double _centerY;
+    private double _radius;
+
+    private const double StartAngle = 135d;
+    private const double TotalSweep = 270d;
+
+    private readonly AnimatedDouble _animatedValue;
+
     public UsageGauge()
     {
         _canvas = new Canvas();
@@ -100,7 +116,10 @@ public sealed class UsageGauge : UserControl
             },
         };
 
+        _animatedValue = new AnimatedDouble(0d, ApplyValueVisual);
+
         Loaded += (_, _) => ScheduleRedraw();
+        Unloaded += (_, _) => _animatedValue.Stop();
         SizeChanged += OnGaugeSizeChanged;
     }
 
@@ -124,7 +143,20 @@ public sealed class UsageGauge : UserControl
 
     private static void OnGaugePropertyChanged(DependencyObject dependencyObject, DependencyPropertyChangedEventArgs args)
     {
-        ((UsageGauge)dependencyObject).ScheduleRedraw();
+        var gauge = (UsageGauge)dependencyObject;
+
+        if (args.Property == ValueProperty)
+        {
+            // Ease toward the new reading instead of snapping. Retargeting mid-flight picks up
+            // from wherever the arc currently sits, so back-to-back scrapes stay continuous.
+            if (gauge._renderingSuspended || gauge._trackPath == null)
+                gauge._animatedValue.SnapTo(Math.Clamp(gauge.Value, 0d, 100d));
+            else
+                gauge._animatedValue.AnimateTo(Math.Clamp(gauge.Value, 0d, 100d));
+            return;
+        }
+
+        gauge.ScheduleRedraw();
     }
 
     public void RefreshThemeResources()
@@ -174,7 +206,16 @@ public sealed class UsageGauge : UserControl
     public void SetRenderingSuspended(bool suspended)
     {
         _renderingSuspended = suspended;
-        if (!suspended) ScheduleRedraw();
+
+        if (suspended)
+        {
+            // Don't leave an off-screen or frozen gauge holding the render tick open.
+            _animatedValue.SnapTo(Math.Clamp(Value, 0d, 100d));
+            return;
+        }
+
+        _animatedValue.SnapTo(Math.Clamp(Value, 0d, 100d));
+        ScheduleRedraw();
     }
 
     private void ScheduleRedraw(DispatcherQueuePriority priority = DispatcherQueuePriority.Low)
@@ -221,58 +262,102 @@ public sealed class UsageGauge : UserControl
             return;
         }
 
-        var clampedValue = Math.Clamp(Value, 0d, 100d);
         var accentBrush = AccentBrush;
         var caption = Caption;
 
-        if (!_themeDirty
-            && _canvas.Children.Count > 0
-            && Math.Abs(clampedValue - _lastRenderedValue) < 0.05
-            && ReferenceEquals(accentBrush, _lastRenderedAccentBrush)
-            && string.Equals(caption, _lastRenderedCaption, StringComparison.Ordinal)
-            && Math.Abs(width - _lastRenderedWidth) < 0.5
-            && Math.Abs(height - _lastRenderedHeight) < 0.5)
+        var geometryDirty = _themeDirty
+            || _trackPath is null
+            || Math.Abs(width - _lastRenderedWidth) >= 0.5
+            || Math.Abs(height - _lastRenderedHeight) >= 0.5;
+        var brushDirty = _themeDirty || !ReferenceEquals(accentBrush, _lastRenderedAccentBrush);
+        var captionDirty = !string.Equals(caption, _lastRenderedCaption, StringComparison.Ordinal);
+
+        if (!geometryDirty
+            && !brushDirty
+            && !captionDirty
+            && Math.Abs(_animatedValue.Current - _lastRenderedValue) < 0.05)
         {
             return;
         }
 
-        var centerX = width / 2d;
-        var centerY = height / 2d;
-        var radius = Math.Max(18, Math.Min(width, height) / 2d - 12);
-        var startAngle = 135d;
-        var totalSweep = 270d;
-        var sweep = clampedValue / 100d * totalSweep;
+        if (geometryDirty)
+        {
+            BuildArcs(width, height);
+        }
 
-        _canvas.Children.Clear();
-        _canvas.Children.Add(CreateArcPath(
-            centerX,
-            centerY,
-            radius,
-            startAngle,
-            totalSweep,
-            ResolveBrush("SurfaceStrokeBrush", "#27425E"),
-            11,
-            0.32));
+        if (brushDirty && _valuePath is not null)
+        {
+            _valuePath.Stroke = accentBrush ?? ResolveBrush("AccentBrush", "#66E7FF");
+        }
 
-        _canvas.Children.Add(CreateArcPath(
-            centerX,
-            centerY,
-            radius,
-            startAngle,
-            sweep,
-            accentBrush ?? ResolveBrush("AccentBrush", "#66E7FF"),
-            11,
-            1));
+        if (captionDirty)
+        {
+            _captionText.Text = caption;
+        }
 
-        _valueText.Text = $"{clampedValue:0.#}%";
-        _captionText.Text = caption;
+        ApplyValueVisual();
 
-        _lastRenderedValue = clampedValue;
         _lastRenderedAccentBrush = accentBrush;
         _lastRenderedCaption = caption;
         _lastRenderedWidth = width;
         _lastRenderedHeight = height;
         _themeDirty = false;
+    }
+
+    // Creates the two arcs once per size/theme change. The track arc is fully static afterwards;
+    // the value arc keeps references to the figure and segment so ApplyValueVisual can re-shape
+    // it without touching the visual tree.
+    private void BuildArcs(double width, double height)
+    {
+        _centerX = width / 2d;
+        _centerY = height / 2d;
+        _radius = Math.Max(18, Math.Min(width, height) / 2d - 12);
+
+        _canvas.Children.Clear();
+
+        _trackPath = CreateArcPath(
+            _centerX, _centerY, _radius, StartAngle, TotalSweep,
+            ResolveBrush("SurfaceStrokeBrush", "#27425E"), 11, 0.32,
+            out _, out _);
+
+        _valuePath = CreateArcPath(
+            _centerX, _centerY, _radius, StartAngle, 0d,
+            AccentBrush ?? ResolveBrush("AccentBrush", "#66E7FF"), 11, 1,
+            out _valueFigure, out _valueSegment);
+
+        _canvas.Children.Add(_trackPath);
+        _canvas.Children.Add(_valuePath);
+    }
+
+    // Hot path: runs once per rendered frame while a gauge is animating. Allocation-free.
+    private void ApplyValueVisual()
+    {
+        if (_valuePath is null || _valueSegment is null || _valueFigure is null)
+        {
+            return;
+        }
+
+        var value = Math.Clamp(_animatedValue.Current, 0d, 100d);
+        var sweep = value / 100d * TotalSweep;
+
+        // A zero-length arc with round caps still paints a dot; collapse it so an idle gauge
+        // reads as genuinely empty rather than showing a stray pip at the 135° origin.
+        if (sweep < 0.5d)
+        {
+            _valuePath.Visibility = Visibility.Collapsed;
+        }
+        else
+        {
+            _valuePath.Visibility = Visibility.Visible;
+            _valueSegment.Point = ToPoint(_centerX, _centerY, _radius, StartAngle + sweep);
+            _valueSegment.IsLargeArc = sweep > 180d;
+        }
+
+        // Integer percent: the previous "0.#" format alternated between "45%" and "45.3%" as the
+        // fraction crossed zero, which visibly jittered a centred readout — and would now do so
+        // every frame of the animation.
+        _valueText.Text = $"{value:0}%";
+        _lastRenderedValue = value;
     }
 
     private static Path CreateArcPath(
@@ -283,25 +368,25 @@ public sealed class UsageGauge : UserControl
         double sweepAngle,
         Brush stroke,
         double thickness,
-        double opacity)
+        double opacity,
+        out PathFigure figure,
+        out ArcSegment segment)
     {
         var start = ToPoint(centerX, centerY, radius, startAngle);
         var end = ToPoint(centerX, centerY, radius, startAngle + sweepAngle);
-        var figure = new PathFigure
+        segment = new ArcSegment
+        {
+            Point = end,
+            Size = new Windows.Foundation.Size(radius, radius),
+            IsLargeArc = sweepAngle > 180,
+            SweepDirection = SweepDirection.Clockwise,
+        };
+        figure = new PathFigure
         {
             StartPoint = start,
             IsClosed = false,
             IsFilled = false,
-            Segments = new PathSegmentCollection
-            {
-                new ArcSegment
-                {
-                    Point = end,
-                    Size = new Windows.Foundation.Size(radius, radius),
-                    IsLargeArc = sweepAngle > 180,
-                    SweepDirection = SweepDirection.Clockwise,
-                },
-            },
+            Segments = new PathSegmentCollection { segment },
         };
 
         return new Path

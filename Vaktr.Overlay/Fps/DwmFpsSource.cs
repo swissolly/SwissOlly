@@ -5,11 +5,18 @@ using Vaktr.Overlay.Rendering;
 
 namespace Vaktr.Overlay.Fps;
 
-// DwmFlush() blocks the calling thread until DWM finishes its next composition frame.
-// Timing successive flushes gives the display-synchronized frame rate without any
-// struct layout, cbSize, or admin requirement. When the game is in exclusive fullscreen
-// DWM is bypassed; DwmFlush returns a non-zero HRESULT immediately, letting us detect
-// that case without blocking or polling with an arbitrary timeout.
+// Fallback FPS source, used only when no ETW session can be created (see EtwPresentFpsSource).
+//
+// DwmFlush() blocks until DWM finishes its next composition frame, so timing successive flushes
+// measures the *compositor's* cadence — effectively the display refresh rate. It is NOT the
+// game's frame rate and is not attributed to any process: the pid argument is deliberately
+// unused because this measurement cannot distinguish one application from another. It reads
+// correctly only while the game is v-synced to the refresh rate, and over-reports whenever the
+// game runs below it. Prefer EtwPresentFpsSource; this exists so the overlay degrades to a
+// plausible number instead of showing nothing.
+//
+// When the game is in exclusive fullscreen DWM is bypassed; DwmFlush returns a non-zero HRESULT
+// immediately, letting us detect that case without blocking or polling with an arbitrary timeout.
 public sealed class DwmFpsSource : IFpsSource
 {
     private volatile bool _running;
@@ -17,6 +24,8 @@ public sealed class DwmFpsSource : IFpsSource
 
     public event Action<double>? FpsUpdated;
     public event Action<string>? ErrorOccurred;
+
+    public FpsAccuracy Accuracy => FpsAccuracy.Approximate;
 
     public void StartTracking(uint pid)
     {

@@ -43,10 +43,12 @@ An in-game telemetry overlay that paints on top of running games. Owned by the m
 - Configurable text color (color picker with quick presets, or a custom hex value), font size, opacity, and toggle hotkey
 - Outlined text with no background box, for a clean HUD look over any game
 - Auto-shows when a game has focus; hides on Alt+Tab back to desktop
-- FPS measured via DWM flush timing — no DLL injection, no anti-cheat conflicts, no admin rights or elevated group membership required
+- FPS is the game's real frame rate, counted from its own present calls via an ETW trace — no DLL injection, no anti-cheat conflicts, and Vaktr never runs elevated
 - NVIDIA, AMD, and Intel GPU support
 
 Targets borderless and windowed-fullscreen games. True exclusive fullscreen isn't supported — by design, so Vaktr never needs code-signing or elevated UIAccess to draw the overlay.
+
+Reading per-process frame rate requires membership in the built-in **Performance Log Users** group. The installer adds you at install time, so Vaktr itself runs as a normal user process — but Windows only applies group changes to a new logon token, so **sign out and back in once after installing**. Until then (or in a portable run) the overlay falls back to an approximate refresh-rate-derived figure and tells you so in the control deck.
 
 ## Control Deck
 

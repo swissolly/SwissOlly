@@ -37,7 +37,7 @@ Expose Vaktr's collected metrics via a local HTTP endpoint in Prometheus exposit
 A compact, always-on-top overlay that renders FPS and selected system metrics on top of running games. Owned by the main Vaktr process — no second window, no taskbar entry, no Alt+Tab entry.
 
 - Three display modes: Simple (FPS only), Advanced (FPS + CPU + GPU + GPU temp + memory), Custom (pick your own)
-- FPS measured via DWM flush timing — no DLL injection, no ETW session, no anti-cheat conflicts (safe with Vanguard, EAC, BattlEye), no admin rights or elevated group membership required
+- True per-process FPS, counted from the game's own DXGI/D3D9 present calls via a read-only ETW trace — no DLL injection, no anti-cheat conflicts (safe with Vanguard, EAC, BattlEye), and Vaktr never runs elevated. The installer grants Performance Log Users membership so the app itself stays unprivileged; the overlay degrades to an approximate reading, clearly labelled, when that right is absent
 - Auto-shows when a game has focus; hides when focus returns to desktop
 - Corner positioning (top-left, top-right, bottom-left, bottom-right)
 - Outlined text with no background box — reads cleanly over any game background
@@ -49,9 +49,12 @@ A compact, always-on-top overlay that renders FPS and selected system metrics on
 **Known limitations in v1.2.0:**
 - Exclusive fullscreen isn't supported — an intentional scope decision. Vaktr targets borderless and windowed-fullscreen games only, which avoids ever requiring code-signing or elevated UIAccess.
 - HDR games render dim (SDR overlay). Deferred to v1.3.0.
+- Group membership only applies to a new logon token, so the first session after install shows approximate FPS until you sign out and back in.
+- ETW delivers events in buffers, so the reading trails live by about a second.
 
 **Follow-ups tracked for v1.3.0:**
 - HDR-aware overlay rendering
+- Overlay UI/UX polish pass — see `TASKS.md`
 
 ### v1 — Polished Local Telemetry Dashboard
 - Live time-series panels for CPU, GPU, memory, disk, network, system activity

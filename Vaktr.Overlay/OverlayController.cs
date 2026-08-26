@@ -16,7 +16,7 @@ public sealed class OverlayController : IDisposable
     private readonly GlobalHotkeyService _hotkey;
     private readonly object _renderLock = new();
     private System.Threading.Timer? _pollTimer;
-    private IFpsSource? _fps;
+    private readonly AdaptiveFpsSource _fps = new();
 
     private State _state = State.Hidden;
     private volatile OverlayConfig _config = new OverlayConfig().Normalize();
@@ -25,6 +25,8 @@ public sealed class OverlayController : IDisposable
     private IntPtr _pendingHideHwnd = IntPtr.Zero;
     private double _lastFps = double.NaN;
     private string? _fpsError;
+    private FpsAccuracy _fpsAccuracy = FpsAccuracy.Approximate;
+    private bool _approximateReported;
     private double _lastCpu = double.NaN;
     private double _lastGpu = double.NaN;
     private double _lastGpuTemp = double.NaN;
@@ -32,12 +34,53 @@ public sealed class OverlayController : IDisposable
 
     public event Action<string>? StatusMessage;
 
+    /// <summary>
+    /// Whether the live FPS reading is the game's real frame rate or a compositor-derived
+    /// approximation. Surfaced in the control deck so the number is never silently misleading.
+    /// </summary>
+    public FpsAccuracy FpsAccuracy => _fpsAccuracy;
+
     public OverlayController()
     {
         _window = new LayeredOverlayWindow();
         _renderer = new OverlayBitmapRenderer();
         _hotkey = new GlobalHotkeyService();
         _hotkey.HotkeyPressed += OnHotkeyPressed;
+
+        _fps.FpsUpdated += fps =>
+        {
+            // A live reading clears any earlier failure. Without this the overlay latches to
+            // "FPS: --" after the first transient error and never recovers for the session.
+            _fpsError = null;
+            _lastFps = fps;
+            PushRender();
+        };
+
+        _fps.ErrorOccurred += msg =>
+        {
+            OverlayLog.Write($"FPS error: {msg}");
+            _fpsError = msg switch
+            {
+                "exclusive-fullscreen" => "exclusive",
+                "no-presents" => "idle",
+                _ => "err",
+            };
+            _lastFps = double.NaN;
+            PushRender();
+        };
+
+        _fps.AccuracyChanged += accuracy =>
+        {
+            _fpsAccuracy = accuracy;
+
+            // Report the degraded case once per run, not on every game switch.
+            if (accuracy == FpsAccuracy.Approximate && !_approximateReported)
+            {
+                _approximateReported = true;
+                StatusMessage?.Invoke(
+                    "Overlay FPS is approximate — showing refresh rate. Exact FPS needs Performance Log Users membership; sign out and back in after installing.");
+            }
+        };
     }
 
     public void Start()
@@ -213,28 +256,14 @@ public sealed class OverlayController : IDisposable
 
     private void StartFps(uint pid)
     {
-        StopFps();
-        var src = new DwmFpsSource();
-        src.ErrorOccurred += msg =>
-        {
-            OverlayLog.Write($"FPS error: {msg}");
-            _fpsError = msg == "exclusive-fullscreen" ? "exclusive" : "err";
-            PushRender();
-        };
-        src.FpsUpdated += fps =>
-        {
-            _lastFps = fps;
-            PushRender();
-        };
-        _fps = src;
+        _lastFps = double.NaN;
+        _fpsError = null;
         _fps.StartTracking(pid);
     }
 
     private void StopFps()
     {
-        _fps?.StopTracking();
-        _fps?.Dispose();
-        _fps = null;
+        _fps.StopTracking();
         _lastFps = double.NaN;
         _fpsError = null;
     }
@@ -256,7 +285,12 @@ public sealed class OverlayController : IDisposable
         }
     }
 
-    private string[] BuildLines()
+    // Matches the dashboard's threshold palette (WarningBrush / CriticalBrush in
+    // TelemetryPanelCard) so the HUD and the app agree on what "hot" looks like.
+    private static readonly Color WarningColor = Color.FromArgb(0xF0, 0xC9, 0x68);
+    private static readonly Color CriticalColor = Color.FromArgb(0xFF, 0x97, 0x61);
+
+    private OverlayLine[] BuildLines()
     {
         var metrics = _config.Mode switch
         {
@@ -266,23 +300,59 @@ public sealed class OverlayController : IDisposable
             _ => ["fps"],
         };
 
-        var lines = new List<string>(metrics.Count);
+        var baseColor = ParseColor(_config.TextColor);
+        var lines = new List<OverlayLine>(metrics.Count);
+
         foreach (var m in metrics)
         {
-            lines.Add(m switch
+            // Values are right-aligned in a fixed-width field. Segoe UI uses tabular figures, so
+            // a constant character count means a constant pixel width — without this the row
+            // reflows every time a value crosses 9→10 or 99→100 and the HUD visibly twitches.
+            switch (m)
             {
-                "fps" => _fpsError != null ? "FPS: --"
-                       : double.IsNaN(_lastFps) ? "FPS: --"
-                       : $"FPS: {_lastFps:F0}",
-                "cpu" => double.IsNaN(_lastCpu) ? "CPU: --" : $"CPU: {_lastCpu:F0}%",
-                "gpu" => double.IsNaN(_lastGpu) ? "GPU: --" : $"GPU: {_lastGpu:F0}%",
-                "gpu-temp" => double.IsNaN(_lastGpuTemp) ? "GPU Temp: --" : $"GPU Temp: {_lastGpuTemp:F0}°C",
-                "memory" => double.IsNaN(_lastMemPct) ? "MEM: --" : $"MEM: {_lastMemPct:F0}%",
-                _ => m,
-            });
+                case "fps":
+                    lines.Add(new OverlayLine("FPS",
+                        _fpsError != null || double.IsNaN(_lastFps) ? "  --" : $"{_lastFps,4:F0}",
+                        baseColor));
+                    break;
+                case "cpu":
+                    lines.Add(new OverlayLine("CPU", FormatPercent(_lastCpu), UsageColor(_lastCpu, baseColor)));
+                    break;
+                case "gpu":
+                    lines.Add(new OverlayLine("GPU", FormatPercent(_lastGpu), UsageColor(_lastGpu, baseColor)));
+                    break;
+                case "gpu-temp":
+                    lines.Add(new OverlayLine("GPU Temp",
+                        double.IsNaN(_lastGpuTemp) ? " --" : $"{_lastGpuTemp,3:F0}°C",
+                        TempColor(_lastGpuTemp, baseColor)));
+                    break;
+                case "memory":
+                    lines.Add(new OverlayLine("MEM", FormatPercent(_lastMemPct), UsageColor(_lastMemPct, baseColor)));
+                    break;
+                default:
+                    lines.Add(new OverlayLine(m, string.Empty, baseColor));
+                    break;
+            }
         }
+
         return [.. lines];
     }
+
+    private static string FormatPercent(double value)
+        => double.IsNaN(value) ? " --%" : $"{value,3:F0}%";
+
+    private static Color UsageColor(double percent, Color normal)
+        => double.IsNaN(percent) ? normal
+         : percent > 90 ? CriticalColor
+         : percent > 75 ? WarningColor
+         : normal;
+
+    // GPU temperature bands rather than percentages: 85°C is the usual throttle neighbourhood.
+    private static Color TempColor(double celsius, Color normal)
+        => double.IsNaN(celsius) ? normal
+         : celsius > 85 ? CriticalColor
+         : celsius > 75 ? WarningColor
+         : normal;
 
     private static double? ExtractSample(MetricSnapshot snapshot, string panelKey, string seriesKey)
     {
@@ -305,6 +375,7 @@ public sealed class OverlayController : IDisposable
     {
         _pollTimer?.Dispose();
         StopFps();
+        _fps.Dispose();
         _hotkey.Dispose();
         _renderer.Dispose();
         _window.Dispose();

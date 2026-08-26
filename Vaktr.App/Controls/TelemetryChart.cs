@@ -78,6 +78,14 @@ public sealed class TelemetryChart : UserControl
     private DispatcherQueuePriority _queuedRedrawPriority = DispatcherQueuePriority.Low;
     private double _selectionStartX;
     private double _selectionCurrentX;
+
+    // Pointer-move coalescing. A 1000 Hz mouse raises PointerMoved far more often than the
+    // compositor draws, and each hover update rebuilds the tooltip string and runs a Measure()
+    // layout pass. Cheap state is written synchronously; the expensive visual work is deferred
+    // to at most once per rendered frame.
+    private bool _pointerFlushQueued;
+    private Windows.Foundation.Point _pendingPointerPosition;
+    private Action<double>? _pointerFlush;
     private readonly List<(Border Tooltip, Line Marker)> _pinnedTooltips = [];
 
 
@@ -190,7 +198,8 @@ public sealed class TelemetryChart : UserControl
         PointerMoved += OnPointerMoved;
         PointerReleased += OnPointerReleased;
         PointerCaptureLost += OnPointerCaptureLost;
-        PointerExited += (_, _) => HideHover();
+        PointerExited += (_, _) => { CancelPointerFlush(); HideHover(); };
+        Unloaded += (_, _) => CancelPointerFlush();
         DoubleTapped += (_, _) =>
         {
             ClearPinnedTooltips();
@@ -1203,15 +1212,46 @@ public sealed class TelemetryChart : UserControl
 
     private void OnPointerMoved(object sender, PointerRoutedEventArgs e)
     {
-        if (!_isSelecting)
+        _pendingPointerPosition = e.GetCurrentPoint(this).Position;
+
+        // Kept synchronous so CompleteSelection always sees the true release position even if
+        // the final move's visual update was coalesced away.
+        if (_isSelecting)
         {
-            UpdateHover(e.GetCurrentPoint(this).Position);
-            return;
+            _selectionCurrentX = _pendingPointerPosition.X;
+            e.Handled = true;
         }
 
-        _selectionCurrentX = e.GetCurrentPoint(this).Position.X;
-        UpdateSelectionVisual();
-        e.Handled = true;
+        QueuePointerFlush();
+    }
+
+    private void QueuePointerFlush()
+    {
+        if (_pointerFlushQueued) return;
+        _pointerFlushQueued = true;
+        _pointerFlush ??= FlushPointerVisual;
+        MotionTicker.Add(_pointerFlush);
+    }
+
+    private void CancelPointerFlush()
+    {
+        if (!_pointerFlushQueued || _pointerFlush is null) return;
+        _pointerFlushQueued = false;
+        MotionTicker.Remove(_pointerFlush);
+    }
+
+    private void FlushPointerVisual(double dt)
+    {
+        CancelPointerFlush();
+
+        if (_isSelecting)
+        {
+            UpdateSelectionVisual();
+        }
+        else
+        {
+            UpdateHover(_pendingPointerPosition);
+        }
     }
 
     private void OnPointerReleased(object sender, PointerRoutedEventArgs e)
@@ -1244,6 +1284,7 @@ public sealed class TelemetryChart : UserControl
     private void CompleteSelection()
     {
         _isSelecting = false;
+        CancelPointerFlush();
         _selectionRectangle.Visibility = Visibility.Collapsed;
 
         var left = Math.Min(_selectionStartX, _selectionCurrentX);
