@@ -935,7 +935,6 @@ public sealed partial class ShellWindow
             Children =
             {
                 CreateAccentText("LIVE BOARD", 11, 85),
-                CreateSecondaryText("Real-time telemetry panels.", 13),
             },
         });
 
@@ -957,6 +956,9 @@ public sealed partial class ShellWindow
         };
     }
 
+    // The eyebrow alone names the section. The descriptive line under it ("Current node
+    // snapshot.") restated what the cards below plainly show, so it was pure filler between
+    // the reader and the data.
     private static Grid CreateSectionBand(string eyebrow, string text)
     {
         return new Grid
@@ -970,7 +972,6 @@ public sealed partial class ShellWindow
                     Children =
                     {
                         CreateAccentText(eyebrow, 11, 108),
-                        CreateSecondaryText(text, 12.5),
                     },
                 },
             },

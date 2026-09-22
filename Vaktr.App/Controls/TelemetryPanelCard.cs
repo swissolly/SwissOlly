@@ -120,13 +120,22 @@ public sealed class TelemetryPanelCard : UserControl
         _scaleText.TextWrapping = TextWrapping.NoWrap;
         _scaleText.TextTrimming = TextTrimming.CharacterEllipsis;
         _scaleText.MaxWidth = 200;
-        _titleText = CreateTextBlock("Segoe UI Variable Display", 15.5, FontWeights.Medium);
+        // The title is an eyebrow, not a headline. At 15.5px against a 28px value the two were
+        // only 1.8x apart, so the card had no clear focal point and every panel read as a wall of
+        // similarly-weighted text. Small, tracked and set back, the title identifies the panel and
+        // then gets out of the way; the number is what you actually came to read.
+        _titleText = CreateTextBlock("Segoe UI Variable Text", 10.5, FontWeights.SemiBold);
+        _titleText.CharacterSpacing = 95;
         _titleText.TextTrimming = TextTrimming.CharacterEllipsis;
-        _titleText.TextWrapping = TextWrapping.WrapWholeWords;
-        _titleText.MaxLines = 2;
-        _titleText.Opacity = 0.94;
-        _currentValueText = CreateTextBlock("Bahnschrift", 28, FontWeights.SemiBold);
-        _currentValueText.CharacterSpacing = -12;
+        _titleText.TextWrapping = TextWrapping.NoWrap;
+        _titleText.Opacity = 0.82;
+
+        // Hero. ~3.4x the eyebrow, negatively tracked so large numerals sit tight rather than
+        // sprawling — the detail that separates a designed readout from a big default font size.
+        _currentValueText = CreateTextBlock("Bahnschrift", 36, FontWeights.SemiBold);
+        _currentValueText.CharacterSpacing = -28;
+        _currentValueText.TextTrimming = TextTrimming.CharacterEllipsis;
+        _currentValueText.TextWrapping = TextWrapping.NoWrap;
         _secondaryValueText = CreateTextBlock(fontSize: 11.5);
         _secondaryValueText.Opacity = 0.78;
 
@@ -184,11 +193,12 @@ public sealed class TelemetryPanelCard : UserControl
         _chart.ZoomSelectionRequested += OnChartZoomSelectionRequested;
         _chart.ZoomResetRequested += OnChartZoomResetRequested;
 
+        // The chart's own plot surface already paints an inset fill, so an outline here just
+        // drew a second rectangle a few pixels outside the first one.
         _chartFrame = new Border
         {
             Background = ResolveBrush("SurfaceInsetBrush", "#091321"),
-            BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E"),
-            BorderThickness = new Thickness(0.8),
+            BorderThickness = new Thickness(0),
             CornerRadius = new CornerRadius(14),
             Padding = new Thickness(4, 4, 4, 3),
             Child = _chart,
@@ -405,13 +415,14 @@ public sealed class TelemetryPanelCard : UserControl
         Grid.SetColumn(_titleText, 1);
         _titleText.VerticalAlignment = VerticalAlignment.Center;
 
+        // Caption, not a control. It states the chart's ceiling ("100% ceiling · 100.8k handles")
+        // and was never clickable, so boxing it made it compete with the range chips beside it.
         _scalePill = new Border
         {
-            Background = ResolveBrush("PanelOverlayBrush", "#091321"),
-            BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E"),
-            BorderThickness = new Thickness(0.7),
+            Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
+            BorderThickness = new Thickness(0),
             CornerRadius = new CornerRadius(9),
-            Padding = new Thickness(10, 3, 10, 3),
+            Padding = new Thickness(2, 3, 10, 3),
             Child = _scaleText,
             HorizontalAlignment = HorizontalAlignment.Right,
             VerticalAlignment = VerticalAlignment.Center,
@@ -575,6 +586,7 @@ public sealed class TelemetryPanelCard : UserControl
         {
             UpdateBadgeIcon(null);
             _footerText.Text = string.Empty;
+            _footerText.Visibility = Visibility.Collapsed;
             _scaleText.Text = string.Empty;
             _scalePill.Visibility = Visibility.Collapsed;
             _titleText.Text = "Telemetry";
@@ -601,12 +613,20 @@ public sealed class TelemetryPanelCard : UserControl
         }
 
         UpdateBadgeIcon(panel);
-        _footerText.Text = panel.IsZoomed ? $"\u23F8 {panel.FooterText}" : panel.FooterText;
-        _footerText.Opacity = panel.IsZoomed ? 0.85 : 0.6;
-        _footerText.Foreground = panel.IsZoomed
-            ? ResolveBrush("AccentBrush", "#66E7FF")
-            : ResolveBrush("TextMutedBrush", "#7D9AB6");
-        _titleText.Text = panel.Title;
+
+        // Unzoomed this line reads "1h replay", which is exactly what the highlighted range chip
+        // a few inches to the right already says \u2014 a redundant caption on every card in the
+        // default state. Zoomed it reports the actual span ("zoomed 3.2m"), which nothing else
+        // shows, so it earns its place only then.
+        _footerText.Visibility = panel.IsZoomed ? Visibility.Visible : Visibility.Collapsed;
+        if (panel.IsZoomed)
+        {
+            _footerText.Text = $"\u23F8 {panel.FooterText}";
+            _footerText.Opacity = 0.85;
+            _footerText.Foreground = ResolveBrush("AccentBrush", "#66E7FF");
+        }
+        // Uppercased for the eyebrow treatment: "CPU Total" -> "CPU TOTAL".
+        _titleText.Text = panel.Title.ToUpperInvariant();
         _currentValueText.Text = panel.CurrentValue;
         _secondaryValueText.Text = panel.SecondaryValue;
         _scaleText.Text = panel.ScaleLabel;
@@ -746,10 +766,9 @@ public sealed class TelemetryPanelCard : UserControl
         _cardBorder.Translation = new System.Numerics.Vector3(0f, 0f, 0f);
         _rangeShell.Background = ResolveBrush("SurfaceInsetBrush", "#091321");
         _rangeShell.BorderBrush = strokeBrush;
-        _scalePill.Background = ResolveBrush("PanelOverlayBrush", "#091321");
-        _scalePill.BorderBrush = strokeBrush;
+        // Both are intentionally borderless — re-applying a stroke here would restore the boxes.
+        _scalePill.Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
         _chartFrame.Background = ResolveBrush("SurfaceInsetBrush", "#091321");
-        _chartFrame.BorderBrush = strokeBrush;
         _processSection.Background = ResolveBrush("SurfaceInsetBrush", "#091321");
         _processSection.BorderBrush = strokeBrush;
         _legendDivider.Background = strokeBrush;
@@ -772,13 +791,13 @@ public sealed class TelemetryPanelCard : UserControl
         _sortNameButton.RefreshThemeResources();
         _perProcessChartButton.RefreshThemeResources();
 
-        var legendBg = ResolveBrush("SurfaceElevatedBrush", "#112033");
         var secondaryBrush = ResolveBrush("TextSecondaryBrush", "#B7CCE1");
         var primaryBrush = ResolveBrush("TextPrimaryBrush", "#F2F8FF");
         foreach (var rowParts in _legendRows.Values)
         {
-            rowParts.InnerBorder.Background = legendBg;
-            rowParts.InnerBorder.BorderBrush = strokeBrush;
+            // Legend rows are deliberately borderless and transparent at rest; re-applying a
+            // background here on theme change would put the boxes back.
+            rowParts.InnerBorder.Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
             rowParts.NameText.Foreground = secondaryBrush;
             rowParts.ValueText.Foreground = primaryBrush;
         }
@@ -802,7 +821,7 @@ public sealed class TelemetryPanelCard : UserControl
         {
             _footerText.Foreground = ResolveBrush("TextMutedBrush", "#7D9AB6");
             _scaleText.Foreground = ResolveBrush("TextSecondaryBrush", "#B7CCE1");
-            _titleText.Foreground = ResolveBrush("TextPrimaryBrush", "#F2F8FF");
+            _titleText.Foreground = ResolveBrush("TextSecondaryBrush", "#C6D7EA");
             _currentValueText.Foreground = ResolveBrush("TextPrimaryBrush", "#F2F8FF");
             _secondaryValueText.Foreground = ResolveBrush("TextSecondaryBrush", "#B7CCE1");
             _processSectionTitleText.Foreground = ResolveBrush("TextSecondaryBrush", "#B7CCE1");
@@ -819,10 +838,16 @@ public sealed class TelemetryPanelCard : UserControl
             _legendRows.Clear();
             _legendHost.Children.Clear();
             _legendScroller.Visibility = Visibility.Collapsed;
+            _legendDivider.Visibility = Visibility.Collapsed;
             return;
         }
 
-        _legendScroller.Visibility = panel.SupportsProcessTable ? Visibility.Collapsed : Visibility.Visible;
+        // A single-series panel already states its value in the header (and again in the gauge,
+        // where there is one), so a one-row legend repeating it a third time is noise — and with
+        // nothing to compare against, click-to-isolate has nothing to isolate from.
+        var legendEarnsItsSpace = !panel.SupportsProcessTable && panel.VisibleSeries.Count > 1;
+        _legendScroller.Visibility = legendEarnsItsSpace ? Visibility.Visible : Visibility.Collapsed;
+        _legendDivider.Visibility = _legendScroller.Visibility;
 
         if (_legendRows.Count == 0 && _legendHost.Children.Count > 0)
         {
@@ -1098,7 +1123,7 @@ public sealed class TelemetryPanelCard : UserControl
         _badgeBorder.Background = ResolveBrush("SurfaceInsetBrush", "#091321");
         _footerText.Foreground = ResolveBrush("TextMutedBrush", "#7D9AB6");
         _scaleText.Foreground = ResolveBrush("TextSecondaryBrush", "#B7CCE1");
-        _titleText.Foreground = ResolveBrush("TextPrimaryBrush", "#F2F8FF");
+        _titleText.Foreground = ResolveBrush("TextSecondaryBrush", "#C6D7EA");
         _secondaryValueText.Foreground = ResolveBrush("TextSecondaryBrush", "#B7CCE1");
         _processSectionTitleText.Foreground = ResolveBrush("TextSecondaryBrush", "#B7CCE1");
 
@@ -1643,26 +1668,27 @@ public sealed class TelemetryPanelCard : UserControl
         row.Children.Add(valueText);
         Grid.SetColumn(valueText, 2);
 
+        // Borderless by design. A 16-core CPU panel renders 16 of these; giving each its own
+        // outline and inset fill turned the card into a stack of boxes. The row reads as a row —
+        // the colour dot and the value column carry the structure, and hover supplies the only
+        // affordance needed for the click-to-isolate behaviour.
         var border = new Border
         {
-            Background = ResolveBrush("SurfaceInsetBrush", "#091321"),
-            BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E"),
-            BorderThickness = new Thickness(0.8),
-            CornerRadius = new CornerRadius(11),
-            Padding = new Thickness(11, 7, 11, 7),
+            Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
+            BorderThickness = new Thickness(0),
+            CornerRadius = new CornerRadius(8),
+            Padding = new Thickness(10, 6, 10, 6),
             Child = row,
         };
 
         // Hover reads current theme each time — no stale captured brushes
         border.PointerEntered += (_, _) =>
         {
-            border.Background = ResolveBrush("SurfaceStrongBrush", "#18314A");
-            border.BorderBrush = ResolveBrush("AccentStrongBrush", "#9FEFFF");
+            border.Background = ResolveBrush("SurfaceElevatedBrush", "#112033");
         };
         border.PointerExited += (_, _) =>
         {
-            border.Background = ResolveBrush("SurfaceInsetBrush", "#091321");
-            border.BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E");
+            border.Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
         };
 
         var wrapper = new ClickableBorder(border);

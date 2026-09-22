@@ -103,7 +103,7 @@ public sealed class TelemetryChart : UserControl
         {
             RadiusX = 10,
             RadiusY = 10,
-            StrokeThickness = 0.9,
+            StrokeThickness = 0,
             Opacity = 0.98,
             IsHitTestVisible = false,
         };
@@ -437,7 +437,9 @@ public sealed class TelemetryChart : UserControl
         var drawFilledArea = seriesCount <= 3;
         var drawPointMarkers = seriesCount <= 4;
         var pointBudget = ResolvePointBudget(width, seriesCount, end - start);
-        var strokeThickness = seriesCount <= 2 ? 2d : seriesCount <= 6 ? 1.7d : 1.35d;
+        // A touch heavier for sparse series — a confident trace over a soft fill is what makes a
+        // chart read as designed rather than plotted.
+        var strokeThickness = seriesCount <= 2 ? 2.4d : seriesCount <= 6 ? 1.9d : 1.4d;
 
         _gridCanvas.Children.Clear();
         _dataCanvas.Children.Clear();
@@ -490,7 +492,9 @@ public sealed class TelemetryChart : UserControl
                         {
                             Data = BuildAreaGeometry(fillProjected, TopPadding + plotHeight),
                             Fill = item.FillBrush,
-                            Opacity = seriesCount == 1 ? 0.7 : 0.5,
+                            // Single series can carry its full gradient; stacked series stay
+                            // translucent so overlapping fills don't turn to mud.
+                            Opacity = seriesCount == 1 ? 1.0 : 0.45,
                         });
                     }
                 }
@@ -553,7 +557,10 @@ public sealed class TelemetryChart : UserControl
 
     private void RefreshPlotSurfaceThemeResources()
     {
-        _plotFrame.Stroke = ResolveBrush("SurfaceStrokeBrush", "#27425E");
+        // No outline. The inset fill already separates the plot from the card, and a hard
+        // stroked rectangle around every chart — inside a bordered card, inside a bordered
+        // panel — was the main source of the nested-boxes look.
+        _plotFrame.Stroke = null;
         _plotFrame.Fill = ResolveBrush("SurfaceInsetBrush", "#091321");
         _plotTint.Fill = ResolveBrush("AccentSoftBrush", "#10394D");
         _leftEdgeFade.Fill = CreateEdgeFadeBrush(isLeadingEdge: true);

@@ -138,7 +138,8 @@ Full plan: `~/.claude/plans/adaptive-foraging-mist.md` (or read this file end-to
   - Anti-cheat-protected (Valorant or CS2) — confirm game launches normally
   - HDR game (note: overlay renders dim — known v1.2.0 limitation)
   - Multi-monitor mixed-DPI: game on secondary monitor, overlay scales correctly
-  - **FPS cross-check**: run alongside the Steam overlay or RTSS and confirm the numbers agree within a frame or two
+  - [x] **FPS cross-check** — verified against Overwatch: the overlay read 143 FPS while Overwatch's own built-in performance counter read 143 in the opposite corner of the same frame. Also confirms the overlay paints correctly over a borderless anti-cheat-protected title (Overwatch runs Defence Matrix) with the game running normally.
+  - Repeat the cross-check on an **uncapped** title where the frame rate sits away from the refresh rate — Overwatch at 143 on a 144 Hz panel is close enough to the refresh rate that it does not by itself distinguish the ETW source from the old compositor-based one.
   - **Uncapped frame rate**: confirm the reading tracks the game rather than pinning to the refresh rate — this is the specific failure the ETW source exists to fix
   - **Frame-limited game** (cap set below refresh, e.g. 60 on a 144 Hz panel) → reads 60, not 144
   - **D3D9-era title** → present events arrive on the D3D9 provider and FPS appears
@@ -298,3 +299,105 @@ Grounded in `Vaktr.Overlay/Rendering/OverlayBitmapRenderer.cs` and `OverlayContr
   down permanently. Requires bumping `Vaktr.Tests` to `net8.0-windows10.0.19041.0` and adding a
   `Vaktr.Overlay` project reference (verified during Step 6 with a scratch harness, but not yet a
   standing test).
+
+## 10.8 — Visual density pass (nested boxes)
+
+The dominant reason the dashboard read as busy rather than sleek: almost every element drew its
+own outline, so a chart appeared as a rectangle inside a rectangle inside a card inside a panel.
+Fixing density is mostly deletion — the spacing and colour work was already sound.
+
+- [x] **Legend rows** (`TelemetryPanelCard.CreateLegendRow`) — were an inset fill + 0.8px outline
+  + radius 11 each. A 16-core CPU panel drew 16 of them, which is what made that card look like a
+  stack of boxes. Now transparent and borderless, with a subtle hover fill as the only affordance.
+  Click-to-isolate still works; focus state was always carried by `Row.Opacity`, not the border.
+- [x] **Chart plot outline** (`TelemetryChart._plotFrame`) — stroke removed. The inset fill alone
+  separates plot from card.
+- [x] **Chart frame** (`TelemetryPanelCard._chartFrame`) — border removed; it was drawing a second
+  rounded rectangle a few pixels outside the plot surface's own.
+- [x] **Range / sort chips** (`ActionChip`) — inactive chips keep their surface fill but lose their
+  outline, so `1m / 5m / 15m / 1h` reads as one segmented control with the selection bordered and
+  filled, rather than four competing buttons. Inactive labels drop to secondary text weight so the
+  active range is obvious at a glance. Focus ring is preserved unconditionally.
+- [x] **Scale caption** (`_scalePill`) — "100% ceiling · 100.8k handles" is a caption, never
+  clickable; unboxed so it stops competing with the real controls beside it.
+- [x] **Single-series legends** — a one-row legend repeating the header value is removed, along
+  with its divider. Affects CPU Total, Memory, GPU Memory, GPU Temperature, and both drive panels.
+- [x] **Footer replay caption** — hidden unless zoomed. Unzoomed it said "1h replay", duplicating
+  the highlighted range chip; zoomed it reports the real span, which nothing else shows.
+- [x] **Section filler text** — "Current node snapshot." / "Real-time telemetry panels." dropped;
+  the eyebrow already names the section and the cards below show what they are.
+- [x] Process rows examined and **deliberately left alone** — they already use a 0.4px bottom
+  hairline with a Grafana-style gradient meter fill, which is good design, not clutter.
+
+**Verified in the running app** (captured with `PrintWindow`, no focus steal): legend rows, chart
+outlines, segmented chips, and single-series legend removal all confirmed visually against the
+previous `Assets/dashboard.png`. The scale caption, chart frame, footer caption, and section-filler
+changes are built and tested but **not yet seen running** — they are the same class of change as
+the verified ones, but should be eyeballed on next launch.
+
+### Still open after this pass
+
+- [ ] **Dead vertical space**: cards stretch to match the tallest in their row, so panels without a
+  process table (GPU Memory, the drive panels) show a large empty region. Either let cards size
+  independently or give the short panels something to fill with. Biggest remaining layout problem.
+- [ ] **Header block**: logo + "Vaktr" + "SYSTEM TELEMETRY DASHBOARD" consumes a lot of vertical
+  space above the fold for little information.
+- [ ] **Process table chrome**: section label + sort chips + PROCESS/DETAILS/VALUE header is three
+  rows of furniture above a simple list.
+- [ ] A stray horizontal scrollbar artifact appears under the process list at some widths.
+
+## 10.9 — Design pass (making it look designed, not plotted)
+
+10.8 removed clutter but the result still read as generic: decluttering is subtraction, and nothing
+had been added back. Three things were actually making it look basic.
+
+### Strokes were wireframe, not hairline
+
+The dark palette's strokes were saturated mid-blues at high contrast — `#28445E` shell, `#315274`
+surface, `#426A8C` grid. Every card, chip, and gridline therefore drew a *visible outline*, which
+is what made the dashboard look like a technical diagram rather than a designed surface.
+
+- [x] `SurfaceStroke` `#315274` → `#1E2835`, `ShellStroke` `#28445E` → `#18212D`. Separation now
+  comes from surface elevation; the stroke only catches the edge.
+- [x] `SurfaceGrid` `#426A8C` → `#1A222D`. Gridlines should be felt, not read.
+- [x] `TextMuted` `#8098B2` → `#7C8B9E` — slightly desaturated so metadata stops competing.
+- [x] Light theme matched: strokes `#C8D2DE` → `#E3E9F0`, `#CAD4DF` → `#DFE6EE`, grid `#C7D2DE` →
+  `#E7ECF2`.
+
+### Type hierarchy had no focal point
+
+Card title was 15.5px against a 28px value — only **1.8x** apart. Nothing dominated, so every panel
+read as a wall of similarly-weighted text.
+
+- [x] Title demoted to an eyebrow: 10.5px SemiBold, `CharacterSpacing` 95, uppercased
+  ("CPU Total" → "CPU TOTAL"), secondary text colour, single line. It identifies the panel and
+  gets out of the way.
+- [x] Value promoted to hero: 28px → **36px**, `CharacterSpacing` -12 → **-28**. Negative tracking
+  on large numerals is the detail that separates a designed readout from a big default font size.
+- [x] Ratio is now ~3.4x. There is a clear focal point per card.
+
+### Charts were washed out
+
+The area gradient topped out at alpha 64 and was then multiplied by a 0.7 layer opacity — landing
+near 18%, enough to tint the plot bed but too weak to give the trace any body.
+
+- [x] Gradient richer at the crest and falling away faster: `64→12→0` at offsets `0/0.7/1` becomes
+  `120→38→0` at `0/0.45/1`.
+- [x] Single-series fills render at full opacity (was 0.7); multi-series drop to 0.45 so
+  overlapping fills don't turn to mud.
+- [x] Stroke weight up for sparse series: `2.0/1.7/1.35` → `2.4/1.9/1.4`.
+
+**Status: built clean on x64 + ARM64, 47/47 tests pass, but NOT yet seen running.** This is a
+larger visual change than 10.8 and the type hierarchy in particular should be eyeballed — the
+36px hero value with `NoWrap` + ellipsis needs checking against the longest strings
+("27.2 GiB used", "Drive C: Capacity") at the narrow 1-column breakpoint.
+
+### Still open
+
+- [ ] **Card depth.** Cards are flat fills with a hairline. Real elevation — a soft shadow under
+  each card — is the remaining lever for making them feel like objects rather than regions.
+  WinUI `ThemeShadow` + `Translation` is the mechanism; `TelemetryPanelCard` already animates
+  `Translation` on hover, so the hook exists.
+- [ ] **Backdrop depth.** The shell is a flat fill. A very subtle radial gradient behind the
+  content would stop the background reading as a void.
+- [ ] Dead vertical space, header block, and process-table chrome (carried from 10.8).

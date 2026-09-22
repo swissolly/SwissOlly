@@ -2070,8 +2070,11 @@ public sealed class MetricPanelViewModel : ObservableObject
             EndPoint = new Windows.Foundation.Point(0, 1),
             GradientStops =
             {
-                new GradientStop { Color = ColorHelper.FromArgb(64, color.R, color.G, color.B), Offset = 0 },
-                new GradientStop { Color = ColorHelper.FromArgb(12, color.R, color.G, color.B), Offset = 0.7 },
+                // Richer at the crest and falling away faster. The previous 64 top alpha was
+                // further multiplied by the chart's 0.7 layer opacity, landing near 18% — enough
+                // to tint the plot bed but too weak to give the trace any body.
+                new GradientStop { Color = ColorHelper.FromArgb(120, color.R, color.G, color.B), Offset = 0 },
+                new GradientStop { Color = ColorHelper.FromArgb(38, color.R, color.G, color.B), Offset = 0.45 },
                 new GradientStop { Color = ColorHelper.FromArgb(0, color.R, color.G, color.B), Offset = 1.0 },
             },
         };

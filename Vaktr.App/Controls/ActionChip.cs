@@ -219,25 +219,25 @@ public sealed class ActionChip : UserControl
             ? _cachedAccentBg
             : _isHovered ? _cachedHoverBg : _cachedIdleBg;
 
-        _surface.BorderThickness = new Thickness(_isFocused ? 1.2 : 0.8);
-        if (isLight)
+        // Inactive chips carry a surface fill but no outline. Chips appear in groups of four
+        // (1m / 5m / 15m / 1h, Chart / Highest / Lowest / Name), and outlining every one of them
+        // made a row of ranges read as four competing buttons rather than one choice among four.
+        // The selected chip is the only one that gets a border, so the group reads as a segmented
+        // control. Focus keeps its ring regardless — that is an accessibility affordance, not
+        // decoration.
+        var showBorder = useAccent || _isFocused;
+        _surface.BorderThickness = new Thickness(showBorder ? (_isFocused ? 1.2 : 1.0) : 0);
+
+        if (showBorder)
         {
-            _surface.BorderBrush = _isFocused
-                ? ResolveBrush("AccentStrongBrush", "#04506E")
-                : useAccent
-                ? ResolveBrush("AccentStrongBrush", "#04506E")
-                : ResolveBrush("SurfaceStrokeBrush", _isHovered ? "#A0B4C8" : "#C0CEDC");
-        }
-        else
-        {
-            _surface.BorderBrush = _isFocused
-                ? ResolveBrush("AccentStrongBrush", "#9EEFFF")
-                : useAccent
-                ? ResolveBrush("AccentStrongBrush", "#9EEFFF")
-                : ResolveBrush("SurfaceStrokeBrush", _isHovered ? "#2C4866" : "#243D55");
+            _surface.BorderBrush = ResolveBrush("AccentStrongBrush", isLight ? "#04506E" : "#9EEFFF");
         }
 
-        _label.Foreground = ResolveBrush("TextPrimaryBrush", isLight ? "#0A1824" : "#F2F8FF");
+        // Selected chips read at full strength; the rest sit back so the active range is obvious
+        // at a glance instead of having to be picked out of four identically-weighted labels.
+        _label.Foreground = useAccent || _isHovered
+            ? ResolveBrush("TextPrimaryBrush", isLight ? "#0A1824" : "#F2F8FF")
+            : ResolveBrush("TextSecondaryBrush", isLight ? "#3C5771" : "#B7CCE1");
         Opacity = _isPressed ? 0.84 : _isHovered ? 0.97 : 1.0;
         _glow.Background = ResolveBrush("AccentHaloBrush", "#2B8FE6C4");
         _glow.Opacity = _isFocused ? 0.08 : useAccent ? 0.04 : 0;

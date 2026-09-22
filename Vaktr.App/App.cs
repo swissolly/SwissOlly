@@ -95,15 +95,15 @@ public sealed class App : Application
             ? new ThemePalette(
                 "#EEF2F7",     // AppBackdrop — neutral light shell background
                 "#F7F9FC",     // ShellBackground — brighter than the app backdrop
-                "#CAD4DF",     // ShellStroke — soft but visible shell framing
+                "#DFE6EE",     // ShellStroke — hairline, matching the dark theme's restraint
                 "#FFFFFF",     // Surface — primary white cards
                 "#FBFCFE",     // SurfaceElevated — nearly-white raised surfaces
                 "#EEF2F7",     // SurfaceStrong — compact controls and hover states
                 "#F3F6FA",     // SurfaceInset — recessed chart/process beds
-                "#C8D2DE",     // SurfaceStroke — crisp borders on light cards
+                "#E3E9F0",     // SurfaceStroke — hairline on light cards
                 "#C8FFFFFF",   // SurfaceHighlight — restrained highlight for glassy edges
                 "#E8EEF5",     // PanelOverlay — subtle supporting pill/background tint
-                "#C7D2DE",     // SurfaceGrid — visible but not blue-heavy chart grid
+                "#E7ECF2",     // SurfaceGrid — chart grid felt rather than read
                 "#0D1A25",     // TextPrimary — strong dark text
                 "#3A4F63",     // TextSecondary — calmer supporting copy
                 "#66788A",     // TextMuted — readable metadata
@@ -118,18 +118,24 @@ public sealed class App : Application
             : new ThemePalette(
                 "#030812",
                 "#07101B",
-                "#28445E",
+                // Strokes are hairlines, not wireframe. The previous values (#28445E shell,
+                // #315274 surface, #426A8C grid) were saturated mid-blues at high enough contrast
+                // that every card, chip and gridline drew a visible outline — the single biggest
+                // reason the dashboard read as a diagram rather than a designed surface.
+                // Separation now comes from surface elevation; the stroke only catches the edge.
+                "#18212D",
                 "#0C1726",
                 "#112033",
                 "#18314A",
                 "#091321",
-                "#315274",
+                "#1E2835",
                 "#22FFFFFF",
                 "#091321",
-                "#426A8C",
+                // Gridlines should be felt, not read. They sit just above the plot bed.
+                "#1A222D",
                 "#F4F9FF",
                 "#C6D7EA",
-                "#8098B2",
+                "#7C8B9E",
                 "#6FE2FF",
                 "#C7F5FF",
                 "#163B60",
