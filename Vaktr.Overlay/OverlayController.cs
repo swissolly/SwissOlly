@@ -35,8 +35,8 @@ public sealed class OverlayController : IDisposable
     public event Action<string>? StatusMessage;
 
     /// <summary>
-    /// Whether the live FPS reading is the game's real frame rate or a compositor-derived
-    /// approximation. Surfaced in the control deck so the number is never silently misleading.
+    /// Whether the reading counts the game's present calls or is a compositor-derived estimate.
+    /// Present calls are not correlated with frames confirmed displayed by the monitor.
     /// </summary>
     public FpsAccuracy FpsAccuracy => _fpsAccuracy;
 
@@ -78,7 +78,7 @@ public sealed class OverlayController : IDisposable
             {
                 _approximateReported = true;
                 StatusMessage?.Invoke(
-                    "Overlay FPS is approximate — showing refresh rate. Exact FPS needs Performance Log Users membership; sign out and back in after installing.");
+                    "FPS is an estimate from display timing, not the game's frame rate. Exact readings need Performance Log Users membership and a new Windows sign-in; restart Vaktr after signing back in.");
             }
         };
     }
@@ -311,8 +311,13 @@ public sealed class OverlayController : IDisposable
             switch (m)
             {
                 case "fps":
+                    string value = _fpsError != null || double.IsNaN(_lastFps)
+                        ? "  --"
+                        : _fpsAccuracy == FpsAccuracy.Approximate
+                            ? $"~{_lastFps,3:F0}"
+                            : $"{_lastFps,4:F0}";
                     lines.Add(new OverlayLine("FPS",
-                        _fpsError != null || double.IsNaN(_lastFps) ? "  --" : $"{_lastFps,4:F0}",
+                        value,
                         baseColor));
                     break;
                 case "cpu":

@@ -2,7 +2,7 @@ namespace Vaktr.Overlay.Fps;
 
 public enum FpsAccuracy
 {
-    /// <summary>Counts the tracked process's own present calls. This is the game's real frame rate.</summary>
+    /// <summary>Counts the tracked process's own present calls, not frames confirmed displayed by the monitor.</summary>
     Exact,
 
     /// <summary>

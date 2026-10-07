@@ -4,13 +4,9 @@ using Windows.UI;
 
 namespace Vaktr.App.Controls;
 
-// Shared theme/brush-resolution helpers previously duplicated near-verbatim across
-// ShellWindow.Polished.UI.cs, TelemetryChart.cs, TelemetryPanelCard.cs, ActionChip.cs,
-// InlineTextEntry.cs, and IconFactory.cs. Two distinct gradient patterns exist in the app
-// (diffed entry-by-entry before merging — no behavior change from consolidation):
-//   - CreateSurfaceLiftGradient: cached, per-hex-pair LiftToLight table (cards/chart/panels)
-//   - CreateThemeResourceGradient: uncached, always resolves from SurfaceElevatedBrush/
-//     SurfaceStrongBrush theme resources regardless of the hex pair passed in (chips/entries/icons)
+// Shared theme and brush-resolution helpers used by the shell and telemetry controls.
+// Surface gradients stay cached; theme resources define dark surfaces while light surfaces
+// retain their per-surface lift values.
 internal static class ThemeVisuals
 {
     public static Brush ResolveBrush(string key, string fallbackHex)
@@ -59,7 +55,7 @@ internal static class ThemeVisuals
         };
     }
 
-    // ── Pattern A: cached, per-surface LiftToLight gradient (ShellWindow / TelemetryChart / TelemetryPanelCard) ──
+    // ── Cached surface gradient (ShellWindow / TelemetryChart / TelemetryPanelCard) ──
 
     private static readonly Dictionary<string, LinearGradientBrush> s_liftGradientCache = new(StringComparer.Ordinal);
     private static bool s_lastCachedLightMode;
@@ -86,33 +82,22 @@ internal static class ThemeVisuals
             return cached;
         }
 
-        LinearGradientBrush brush;
-        if (isLight)
+        var startColor = isLight
+            ? LiftToLight(startHex)
+            : ResolveColor("SurfaceElevatedBrush", "#222529");
+        var endColor = isLight
+            ? LiftToLight(endHex)
+            : ResolveColor("SurfaceBrush", "#1C1F22");
+        var brush = new LinearGradientBrush
         {
-            brush = new LinearGradientBrush
+            StartPoint = new Windows.Foundation.Point(0, 0),
+            EndPoint = new Windows.Foundation.Point(1, 1),
+            GradientStops = new GradientStopCollection
             {
-                StartPoint = new Windows.Foundation.Point(0, 0),
-                EndPoint = new Windows.Foundation.Point(1, 1),
-                GradientStops = new GradientStopCollection
-                {
-                    new GradientStop { Color = LiftToLight(startHex), Offset = 0d },
-                    new GradientStop { Color = LiftToLight(endHex), Offset = 1d },
-                },
-            };
-        }
-        else
-        {
-            brush = new LinearGradientBrush
-            {
-                StartPoint = new Windows.Foundation.Point(0, 0),
-                EndPoint = new Windows.Foundation.Point(1, 1),
-                GradientStops = new GradientStopCollection
-                {
-                    new GradientStop { Color = BrushFactory.ParseColor(startHex), Offset = 0d },
-                    new GradientStop { Color = BrushFactory.ParseColor(endHex), Offset = 1d },
-                },
-            };
-        }
+                new GradientStop { Color = startColor, Offset = 0d },
+                new GradientStop { Color = endColor, Offset = 1d },
+            },
+        };
 
         s_liftGradientCache[cacheKey] = brush;
         return brush;
@@ -173,7 +158,7 @@ internal static class ThemeVisuals
         };
     }
 
-    // ── Pattern B: uncached, theme-resource-based gradient (ActionChip / InlineTextEntry / IconFactory) ──
+    // ── Theme-resource-based gradient (ActionChip / InlineTextEntry / IconFactory) ──
 
     public static Brush CreateThemeResourceGradient(string startHex, string endHex)
     {
@@ -197,8 +182,8 @@ internal static class ThemeVisuals
             EndPoint = new Windows.Foundation.Point(1, 1),
             GradientStops = new GradientStopCollection
             {
-                new GradientStop { Color = BrushFactory.ParseColor(startHex), Offset = 0d },
-                new GradientStop { Color = BrushFactory.ParseColor(endHex), Offset = 1d },
+                new GradientStop { Color = ResolveColor("SurfaceElevatedBrush", "#222529"), Offset = 0d },
+                new GradientStop { Color = ResolveColor("SurfaceStrongBrush", "#292D31"), Offset = 1d },
             },
         };
     }

@@ -49,6 +49,7 @@ public sealed partial class ShellWindow : Window
     private readonly Grid _summaryHost;
     private readonly Grid _dashboardGrid;
     private readonly TextBlock _statusText;
+    private readonly Ellipse _statusIndicator;
     private readonly ActionChip _globalRangeButton;
     private readonly Border _globalRangeEditorHost;
     private readonly ActionChip _globalOneMinuteButton;
@@ -113,22 +114,32 @@ public sealed partial class ShellWindow : Window
 
         Title = "Vaktr";
 
-        _statusText = CreateMutedText(string.Empty, 11);
-        _statusText.Opacity = 0.7;
+        _statusText = CreateSecondaryText(string.Empty, 11.5);
+        _statusText.MaxWidth = 280;
+        _statusText.TextWrapping = TextWrapping.NoWrap;
+        _statusText.TextTrimming = TextTrimming.CharacterEllipsis;
+        _statusIndicator = new Ellipse
+        {
+            Width = 7,
+            Height = 7,
+            Fill = ResolveBrush("AccentBrush", "#79B8FF"),
+            VerticalAlignment = VerticalAlignment.Center,
+        };
         _controlsBodyHost = new Border();
         _brandHost = CreateBrandPlaceholder();
         _summaryHost = new Grid
         {
-            ColumnSpacing = 16,
-            RowSpacing = 16,
+            ColumnSpacing = 12,
+            RowSpacing = 12,
         };
         _dashboardGrid = new Grid
         {
-            ColumnSpacing = 20,
-            RowSpacing = 20,
+            ColumnSpacing = 16,
+            RowSpacing = 16,
         };
         _globalRangeButton = CreateActionChip("15m", OnToggleGlobalRangeEditor, true);
-        _globalRangeButton.MinWidth = 132;
+        _globalRangeButton.MinWidth = 88;
+        ToolTipService.SetToolTip(_globalRangeButton, "Choose the time range for all charts");
         _globalRangeEditorHost = new Border
         {
             Visibility = Visibility.Collapsed,
@@ -147,10 +158,11 @@ public sealed partial class ShellWindow : Window
         _globalNinetyDayButton = CreateGlobalRangeChip("90d", 129600);
         _globalOneYearButton = CreateGlobalRangeChip("1y", 525600);
         _globalResetZoomButton = CreateActionChip("Reset zoom", OnResetAllZoomClick);
+        ToolTipService.SetToolTip(_globalResetZoomButton, "Return all charts to the live window");
         _titleBarDragHost = new Grid
         {
             Height = 34,
-            Background = ResolveBrush("AppBackdropBrush", "#030812"),
+            Background = ResolveBrush("AppBackdropBrush", "#111315"),
         };
         _scrollHost = new ScrollViewer
         {
@@ -196,7 +208,7 @@ public sealed partial class ShellWindow : Window
                 oldParent.Children.Remove(_loadingOverlay);
             }
 
-            _loadingOverlay.Background = ResolveBrush("AppBackdropBrush", "#030812");
+            _loadingOverlay.Background = ResolveBrush("AppBackdropBrush", "#111315");
             fullLayout.Children.Add(_loadingOverlay);
             Grid.SetRow(_loadingOverlay, 1);
             Canvas.SetZIndex(_loadingOverlay, 100);
@@ -229,6 +241,9 @@ public sealed partial class ShellWindow : Window
         }
 
         StartupTrace.Write("BuildFullUi complete");
+        // The dashboard has its own waiting states; telemetry must not keep the
+        // entire app hidden if the first sample is slow or unavailable.
+        DismissLoadingOverlay();
     }
 
     public void ApplyInitialTheme(ThemeMode mode)
@@ -267,6 +282,7 @@ public sealed partial class ShellWindow : Window
         RefreshShellSurfaceThemeResources();
         RefreshSummaryCardThemeResources();
         RefreshGlobalRangeControls();
+        UpdateStatusText();
 
         foreach (var chip in new[]
         {
@@ -327,14 +343,13 @@ public sealed partial class ShellWindow : Window
 
         foreach (var card in _viewModel.SummaryCards)
         {
-            var badgeHost = (Border)IconFactory.CreateTile(card.Title, card.AccentBrush, 48, 16);
+            var badgeHost = (Border)IconFactory.CreateTile(card.Title, card.AccentBrush, 38, 15);
             badgeHost.VerticalAlignment = VerticalAlignment.Center;
 
             var titleText = CreateMutedText(string.Empty, 9.5);
-            titleText.CharacterSpacing = 110;
             titleText.SetBinding(TextBlock.TextProperty, new Binding { Path = new PropertyPath(nameof(SummaryCardViewModel.Title)) });
 
-            var valueText = CreatePrimaryText(string.Empty, 28, true);
+            var valueText = CreatePrimaryText(string.Empty, 24, true);
             valueText.FontFamily = new FontFamily("Bahnschrift");
             valueText.SetBinding(TextBlock.TextProperty, new Binding { Path = new PropertyPath(nameof(SummaryCardViewModel.Value)) });
 
@@ -344,7 +359,7 @@ public sealed partial class ShellWindow : Window
             // Mini utilization bar — thin horizontal bar below the value
             var gaugeTrack = new Border
             {
-                Height = 4,
+                Height = 3,
                 CornerRadius = new CornerRadius(2),
                 Background = ResolveBrush("SurfaceStrokeBrush", "#27425E"),
                 Opacity = 0.38,
@@ -352,7 +367,7 @@ public sealed partial class ShellWindow : Window
             };
             var gaugeFill = new Border
             {
-                Height = 4,
+                Height = 3,
                 CornerRadius = new CornerRadius(2),
                 HorizontalAlignment = HorizontalAlignment.Left,
                 Background = card.AccentBrush,
@@ -411,12 +426,12 @@ public sealed partial class ShellWindow : Window
             var summaryCard = new Border
             {
                 DataContext = card,
-                Background = CreateSurfaceGradient("#101B2D", "#16273D"),
+                Background = ResolveBrush("SurfaceBrush", "#1C1F22"),
                 BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E"),
                 BorderThickness = new Thickness(0.9),
-                CornerRadius = new CornerRadius(18),
-                Padding = new Thickness(18, 15, 18, 15),
-                MinHeight = 98,
+                CornerRadius = new CornerRadius(8),
+                Padding = new Thickness(14, 12, 14, 12),
+                MinHeight = 84,
                 Child = contentGrid,
             };
             _summaryHost.Children.Add(summaryCard);
@@ -444,7 +459,7 @@ public sealed partial class ShellWindow : Window
         for (var i = 0; i < _summaryCardVisuals.Count; i++)
         {
             var visual = _summaryCardVisuals[i];
-            visual.Surface.Background = CreateSurfaceGradient("#101B2D", "#16273D");
+            visual.Surface.Background = ResolveBrush("SurfaceBrush", "#1C1F22");
             visual.Surface.BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E");
             visual.TitleText.Foreground = ResolveBrush("TextMutedBrush", "#7D9AB6");
             visual.ValueText.Foreground = ResolveBrush("TextPrimaryBrush", "#F2F8FF");
@@ -454,7 +469,7 @@ public sealed partial class ShellWindow : Window
             // Skip badge recreation — just update its background/border colors
             if (visual.BadgeHost is Border badge)
             {
-                badge.Background = CreateSurfaceGradient("#102131", "#17304A");
+                badge.Background = ResolveBrush("SurfaceInsetBrush", "#141619");
                 badge.BorderBrush = visual.ViewModel.AccentBrush;
             }
         }
@@ -957,7 +972,7 @@ public sealed partial class ShellWindow : Window
         _ = DispatcherQueue.TryEnqueue(DispatcherQueuePriority.Low, () =>
         {
             StartupTrace.WriteException("Collection failed", ex);
-            if (_viewModel.DashboardPanels.Count == 0)
+            if (!_hasReceivedFirstSnapshot)
             {
                 _viewModel.StatusText = $"Telemetry retrying: {ex.Message}";
                 UpdateStatusText();
@@ -993,10 +1008,6 @@ public sealed partial class ShellWindow : Window
         {
             _hasReceivedFirstSnapshot = true;
             StartupTrace.Write($"First snapshot collected // samples={snapshot.Samples.Count}");
-            if (_loadingOverlay is not null)
-            {
-                DismissLoadingOverlay();
-            }
         }
 
         // Suspend rendering during the snapshot application pass so that
@@ -1205,7 +1216,7 @@ public sealed partial class ShellWindow : Window
                             {
                                 _isWindowResizing = false;
                                 if (_scrollHost.Content is UIElement sc) sc.CacheMode = null;
-                                if (_shellBorderRef is not null) _shellBorderRef.CornerRadius = new CornerRadius(22);
+                                if (_shellBorderRef is not null) _shellBorderRef.CornerRadius = new CornerRadius(0);
                                 foreach (var card in _panelCards.Values)
                                 {
                                     card.SetResizeMode(false);
@@ -1227,7 +1238,7 @@ public sealed partial class ShellWindow : Window
 
                     if (_shellBorderRef is not null)
                     {
-                        _shellBorderRef.CornerRadius = new CornerRadius(22);
+                        _shellBorderRef.CornerRadius = new CornerRadius(0);
                     }
 
                     var nextColumnCount = DetermineDashboardColumns();
@@ -1736,8 +1747,8 @@ public sealed partial class ShellWindow : Window
                 s_brandBitmapPath = imagePath;
             }
 
-            _brandHost.Width = 96;
-            _brandHost.Height = 96;
+            _brandHost.Width = 44;
+            _brandHost.Height = 44;
             _brandHost.Children.Clear();
             _brandHost.Children.Add(new Microsoft.UI.Xaml.Controls.Image
             {
@@ -1830,31 +1841,20 @@ public sealed partial class ShellWindow : Window
         UpdateStatusText();
         StartupTrace.Write("Calling CollectorService.StartAsync");
 
-        // Fire and forget — don't block startup waiting for the collector.
-        // The collector runs on a background thread and fires SnapshotCollected
-        // when the first sample is ready. The loading overlay dismisses on
-        // first snapshot, not on collector start.
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                await _collectorService.StartAsync(config, CancellationToken.None);
-                StartupTrace.Write("CollectorService.StartAsync complete");
-            }
-            catch (Exception ex)
-            {
-                StartupTrace.WriteException("CollectorService.StartAsync", ex);
-            }
-        });
+        // StartAsync initializes the SQLite store before returning. Awaiting it
+        // here keeps history loading from racing that initialization; sampling
+        // itself continues on the collector's background loop.
+        await _collectorService.StartAsync(config, CancellationToken.None);
+        StartupTrace.Write("CollectorService.StartAsync complete");
 
-        // Immediately proceed with UI setup — don't wait for collector
+        // The shell is already visible; show a waiting status until the first sample.
         DispatcherQueue.TryEnqueue(() =>
         {
             if (!_summaryCardsBound)
             {
                 BuildSummaryCards();
             }
-            _viewModel.StatusText = _viewModel.DashboardPanels.Count > 0 ? "Streaming local telemetry" : "Waiting for first sample";
+            _viewModel.StatusText = "Waiting for first sample";
             UpdateStatusText();
             StartupTrace.Write($"EnsureCollectorRunningAsync complete // dashboardPanels={_viewModel.DashboardPanels.Count}");
         });
@@ -1864,6 +1864,15 @@ public sealed partial class ShellWindow : Window
     {
         var text = _viewModel.StatusText;
         _statusText.Text = text;
+        var isIssue = text.Contains("issue", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("retrying", StringComparison.OrdinalIgnoreCase);
+        var isWaiting = text.Contains("waiting", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("arming", StringComparison.OrdinalIgnoreCase);
+        _statusIndicator.Fill = isIssue
+            ? ResolveBrush("CriticalBrush", "#FF897D")
+            : isWaiting
+                ? ResolveBrush("TextMutedBrush", "#858B93")
+                : ResolveBrush("AccentBrush", "#79B8FF");
 
         if (!string.Equals(_lastRenderedStatusText, text, StringComparison.Ordinal))
         {
@@ -1933,8 +1942,8 @@ public sealed partial class ShellWindow : Window
         {
             if (_shellBorderRef is not null)
             {
-                _shellBorderRef.Background = ResolveBrush("ShellBackgroundBrush", "#07101B");
-                _shellBorderRef.BorderBrush = ResolveBrush("ShellStrokeBrush", "#1A3145");
+                _shellBorderRef.Background = BrushFactory.CreateBrush("#00FFFFFF");
+                _shellBorderRef.BorderBrush = BrushFactory.CreateBrush("#00FFFFFF");
             }
 
             var titleBar = AppWindow.TitleBar;
@@ -1972,8 +1981,8 @@ public sealed partial class ShellWindow : Window
     {
         if (_controlsSurfaceRef is not null)
         {
-            _controlsSurfaceRef.Background = CreateSurfaceGradient("#0F1B2D", "#15263D");
-            _controlsSurfaceRef.BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E");
+            _controlsSurfaceRef.Background = BrushFactory.CreateBrush("#00FFFFFF");
+            _controlsSurfaceRef.BorderBrush = BrushFactory.CreateBrush("#00FFFFFF");
         }
     }
 
@@ -2013,7 +2022,7 @@ public sealed partial class ShellWindow : Window
             Background = ResolveBrush("SurfaceElevatedBrush", "#132235"),
             BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E"),
             BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(18),
+            CornerRadius = new CornerRadius(8),
             Padding = new Thickness(14, 12, 14, 12),
             Child = new StackPanel
             {
@@ -2064,7 +2073,7 @@ public sealed partial class ShellWindow : Window
             Background = ResolveBrush("SurfaceElevatedBrush", "#132235"),
             BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E"),
             BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(18),
+            CornerRadius = new CornerRadius(8),
             Padding = new Thickness(14, 12, 14, 12),
             Child = new StackPanel
             {
@@ -2114,10 +2123,10 @@ public sealed partial class ShellWindow : Window
         var shell = new Border
         {
             Margin = new Thickness(0, 10, 0, 0),
-            Background = ResolveBrush("SurfaceBrush", "#0C1726"),
+            Background = ResolveBrush("SurfaceBrush", "#1C1F22"),
             BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E"),
             BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(22),
+            CornerRadius = new CornerRadius(8),
             Padding = new Thickness(16, 14, 16, 14),
             Child = new StackPanel
             {

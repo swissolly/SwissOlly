@@ -65,7 +65,7 @@ public sealed class UsageGauge : UserControl
         _canvas = new Canvas();
         _frameBorder = new Border
         {
-            CornerRadius = new CornerRadius(16),
+            CornerRadius = new CornerRadius(8),
             BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E"),
             BorderThickness = new Thickness(0.8),
             Background = CreateThemedGradient(),
@@ -73,7 +73,7 @@ public sealed class UsageGauge : UserControl
         _innerBorder = new Border
         {
             Margin = new Thickness(6),
-            CornerRadius = new CornerRadius(16),
+            CornerRadius = new CornerRadius(8),
             BorderBrush = ResolveBrush("SurfaceGridBrush", "#35587A"),
             BorderThickness = new Thickness(0.8),
             Opacity = 0.18,
@@ -172,27 +172,16 @@ public sealed class UsageGauge : UserControl
 
     private static LinearGradientBrush CreateThemedGradient()
     {
-        var isLight = IsLightMode();
         return new LinearGradientBrush
         {
             StartPoint = new Windows.Foundation.Point(0, 0),
             EndPoint = new Windows.Foundation.Point(1, 1),
             GradientStops = new GradientStopCollection
             {
-                new GradientStop { Color = BrushFactory.ParseColor(isLight ? "#F2F6FB" : "#0E1A2B"), Offset = 0d },
-                new GradientStop { Color = BrushFactory.ParseColor(isLight ? "#E6EFF7" : "#13263B"), Offset = 1d },
+                new GradientStop { Color = ThemeVisuals.ResolveColor("SurfaceElevatedBrush", "#222529"), Offset = 0d },
+                new GradientStop { Color = ThemeVisuals.ResolveColor("SurfaceBrush", "#1C1F22"), Offset = 1d },
             },
         };
-    }
-
-    private static bool IsLightMode()
-    {
-        if (Application.Current.Resources.TryGetValue("AppBackdropBrush", out var value) && value is SolidColorBrush brush)
-        {
-            var c = brush.Color;
-            return (0.2126 * c.R) + (0.7152 * c.G) + (0.0722 * c.B) >= 170d;
-        }
-        return false;
     }
 
     private bool _renderingSuspended;

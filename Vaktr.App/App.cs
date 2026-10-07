@@ -93,57 +93,51 @@ public sealed class App : Application
     {
         var palette = mode == ThemeMode.Light
             ? new ThemePalette(
-                "#EEF2F7",     // AppBackdrop — neutral light shell background
-                "#F7F9FC",     // ShellBackground — brighter than the app backdrop
-                "#DFE6EE",     // ShellStroke — hairline, matching the dark theme's restraint
+                "#F2F3F5",     // AppBackdrop
+                "#FFFFFF",     // ShellBackground
+                "#E4E6E9",     // ShellStroke
                 "#FFFFFF",     // Surface — primary white cards
-                "#FBFCFE",     // SurfaceElevated — nearly-white raised surfaces
-                "#EEF2F7",     // SurfaceStrong — compact controls and hover states
-                "#F3F6FA",     // SurfaceInset — recessed chart/process beds
-                "#E3E9F0",     // SurfaceStroke — hairline on light cards
+                "#FAFAFB",     // SurfaceElevated
+                "#F4F5F6",     // SurfaceStrong
+                "#F1F2F4",     // SurfaceInset
+                "#E7E8EA",     // SurfaceStroke
                 "#C8FFFFFF",   // SurfaceHighlight — restrained highlight for glassy edges
-                "#E8EEF5",     // PanelOverlay — subtle supporting pill/background tint
-                "#E7ECF2",     // SurfaceGrid — chart grid felt rather than read
-                "#0D1A25",     // TextPrimary — strong dark text
-                "#3A4F63",     // TextSecondary — calmer supporting copy
-                "#66788A",     // TextMuted — readable metadata
-                "#0C6B96",     // Accent — cooler cyan-blue without neon contrast
-                "#0A4E6D",     // AccentStrong — stronger interactive state
-                "#DDEAF6",     // AccentSoft — quiet accent tint
-                "#18609020",   // AccentHalo
-                "#15C09040",   // WarningHalo
-                "#B8861F",     // Warning
-                "#C96C36",     // Critical
-                "#80D8E4F0")   // OverlayScrim
+                "#F4F5F6",     // PanelOverlay
+                "#E5E7EA",     // SurfaceGrid
+                "#1C1D1F",     // TextPrimary
+                "#45484D",     // TextSecondary
+                "#747980",     // TextMuted
+                "#1769C2",     // Accent
+                "#0D4F99",     // AccentStrong
+                "#E5EFFB",     // AccentSoft
+                "#1A1769C2",   // AccentHalo
+                "#18C08326",   // WarningHalo
+                "#A96500",     // Warning
+                "#C7463B",     // Critical
+                "#80E7E8EA")   // OverlayScrim
             : new ThemePalette(
-                "#030812",
-                "#07101B",
-                // Strokes are hairlines, not wireframe. The previous values (#28445E shell,
-                // #315274 surface, #426A8C grid) were saturated mid-blues at high enough contrast
-                // that every card, chip and gridline drew a visible outline — the single biggest
-                // reason the dashboard read as a diagram rather than a designed surface.
-                // Separation now comes from surface elevation; the stroke only catches the edge.
-                "#18212D",
-                "#0C1726",
-                "#112033",
-                "#18314A",
-                "#091321",
-                "#1E2835",
-                "#22FFFFFF",
-                "#091321",
-                // Gridlines should be felt, not read. They sit just above the plot bed.
-                "#1A222D",
-                "#F4F9FF",
-                "#C6D7EA",
-                "#7C8B9E",
-                "#6FE2FF",
-                "#C7F5FF",
-                "#163B60",
-                "#2B8FE6C4",
-                "#1EFFA25C",
-                "#F0C968",
-                "#FF9761",
-                "#B0060A12");
+                "#111315",
+                "#17191C",
+                "#202327",
+                "#1C1F22",
+                "#222529",
+                "#292D31",
+                "#141619",
+                "#2C3035",
+                "#2BFFFFFF",
+                "#25282C",
+                "#2B3036",
+                "#F4F5F7",
+                "#C4C8CE",
+                "#858B93",
+                "#79B8FF",
+                "#B6D9FF",
+                "#294A6B",
+                "#2479B8FF",
+                "#20E6A34B",
+                "#F2BF66",
+                "#FF897D",
+                "#B0080A0C");
 
         SetBrushResource("AppBackdropBrush", palette.AppBackdrop);
         SetBrushResource("ShellBackgroundBrush", palette.ShellBackground);

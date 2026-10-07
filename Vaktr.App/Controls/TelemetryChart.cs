@@ -101,16 +101,16 @@ public sealed class TelemetryChart : UserControl
         _interactionCanvas = new Canvas();
         _plotFrame = new Rectangle
         {
-            RadiusX = 10,
-            RadiusY = 10,
+            RadiusX = 8,
+            RadiusY = 8,
             StrokeThickness = 0,
             Opacity = 0.98,
             IsHitTestVisible = false,
         };
         _plotTint = new Rectangle
         {
-            RadiusX = 10,
-            RadiusY = 10,
+            RadiusX = 8,
+            RadiusY = 8,
             Opacity = 0.04,
             IsHitTestVisible = false,
         };
@@ -157,10 +157,10 @@ public sealed class TelemetryChart : UserControl
         _hoverTooltip = new Border
         {
             Visibility = Visibility.Collapsed,
-            Background = CreateSurfaceGradient("#15283B", "#203851"),
+            Background = ResolveBrush("SurfaceElevatedBrush", "#222529"),
             BorderBrush = ResolveBrush("AccentSoftBrush", "#163B60"),
             BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(11),
+            CornerRadius = new CornerRadius(8),
             Padding = new Thickness(12, 9, 12, 9),
             Child = _hoverTooltipText,
             IsHitTestVisible = false,
@@ -282,7 +282,7 @@ public sealed class TelemetryChart : UserControl
     {
         RefreshPlotSurfaceThemeResources();
         _hoverLine.Stroke = ResolveBrush("AccentStrongBrush", "#B7F7FF");
-        _hoverTooltip.Background = CreateSurfaceGradient("#15283B", "#203851");
+        _hoverTooltip.Background = ResolveBrush("SurfaceElevatedBrush", "#222529");
         _hoverTooltip.BorderBrush = ResolveBrush("AccentSoftBrush", "#163B60");
         _selectionRectangle.Fill = ResolveBrush("AccentHaloBrush", "#2B8FE6C4");
         _hoverTooltipText.Foreground = ResolveBrush("TextPrimaryBrush", "#F2F8FF");
@@ -1121,9 +1121,7 @@ public sealed class TelemetryChart : UserControl
 
     private static Brush CreateEdgeFadeBrush(bool isLeadingEdge)
     {
-        var plotBackground = IsLightPaletteActive()
-            ? BrushFactory.ParseColor("#EEF2F8")
-            : BrushFactory.ParseColor("#0A141F");
+        var plotBackground = ThemeVisuals.ResolveColor("SurfaceInsetBrush", "#141619");
 
         return new LinearGradientBrush
         {
@@ -1144,8 +1142,6 @@ public sealed class TelemetryChart : UserControl
             },
         };
     }
-
-    private static Brush CreateSurfaceGradient(string startHex, string endHex) => ThemeVisuals.CreateSurfaceLiftGradient(startHex, endHex);
 
     private static bool IsLightPaletteActive() => ThemeVisuals.IsLightPaletteActive();
 
@@ -1564,10 +1560,10 @@ public sealed class TelemetryChart : UserControl
         };
         var pinnedBorder = new Border
         {
-            Background = CreateSurfaceGradient("#15283B", "#203851"),
+            Background = ResolveBrush("SurfaceElevatedBrush", "#222529"),
             BorderBrush = ResolveBrush("AccentStrongBrush", "#B7F7FF"),
             BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(10),
+            CornerRadius = new CornerRadius(8),
             Padding = new Thickness(8, 6, 8, 6),
             Child = pinnedText,
             IsHitTestVisible = true,

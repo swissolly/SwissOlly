@@ -32,9 +32,9 @@ public sealed class ActionChip : UserControl
 
         _surface = new Border
         {
-            CornerRadius = new CornerRadius(10),
+            CornerRadius = new CornerRadius(8),
             BorderThickness = new Thickness(0.8),
-            Padding = new Thickness(12, 6, 12, 6),
+            Padding = new Thickness(10, 5, 10, 5),
             Background = ResolveBrush("SurfaceElevatedBrush", "#111D2A"),
             BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#243D55"),
         };

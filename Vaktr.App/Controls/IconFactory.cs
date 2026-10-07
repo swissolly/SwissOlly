@@ -12,7 +12,7 @@ internal static class IconFactory
 
     public static FrameworkElement CreateTile(string key, Brush accentBrush, double size = 44, double iconSize = 18)
     {
-        var corner = Math.Max(12, size * 0.28);
+        var corner = Math.Clamp(size * 0.2, 4, 8);
         var isLight = IsLightPaletteActive();
 
         if (isLight && accentBrush is SolidColorBrush lightSolid)
@@ -35,7 +35,7 @@ internal static class IconFactory
         {
             Width = size,
             Height = size,
-            Background = CreateSurfaceGradient("#102031", "#15273D"),
+            Background = ResolveBrush("SurfaceInsetBrush", "#141619"),
             BorderBrush = CreateOpacityBrush(accentBrush, 0.4),
             BorderThickness = new Thickness(1),
             CornerRadius = new CornerRadius(corner),
@@ -108,8 +108,6 @@ internal static class IconFactory
         };
     }
 
-    private static Brush CreateSurfaceGradient(string startHex, string endHex) => ThemeVisuals.CreateThemeResourceGradient(startHex, endHex);
-
     private static Brush CreateInnerGlowBrush(Brush accentBrush)
     {
         if (accentBrush is SolidColorBrush solidBrush)
@@ -128,7 +126,7 @@ internal static class IconFactory
             return glowBrush;
         }
 
-        return CreateSurfaceGradient("#143249", "#0C1622");
+        return ResolveBrush("SurfaceInsetBrush", "#141619");
     }
 
     private static bool IsLightPaletteActive() => ThemeVisuals.IsLightPaletteActive();

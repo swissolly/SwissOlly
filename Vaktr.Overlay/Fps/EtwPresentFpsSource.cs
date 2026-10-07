@@ -5,12 +5,13 @@ using static Vaktr.Overlay.Fps.EtwInterop;
 namespace Vaktr.Overlay.Fps;
 
 /// <summary>
-/// True per-process frame rate, measured by counting the tracked game's own present calls
-/// on the Microsoft-Windows-DXGI and Microsoft-Windows-D3D9 ETW providers.
+/// Per-process present rate, measured by counting the tracked game's own present calls on the
+/// Microsoft-Windows-DXGI and Microsoft-Windows-D3D9 ETW providers. This does not correlate
+/// presents with frames confirmed as displayed by the monitor.
 ///
 /// This is what <see cref="DwmFpsSource"/> could not do: DWM flush timing measures the
 /// compositor's cadence, which is the display refresh rate regardless of what the game is
-/// presenting. Counting presents attributed to a PID measures the game.
+/// presenting. Counting presents attributed to a PID measures the game's submission rate.
 ///
 /// Requires rights to create a real-time ETW session — Administrators or the built-in
 /// "Performance Log Users" group. The installer adds the installing user to that group, so a
