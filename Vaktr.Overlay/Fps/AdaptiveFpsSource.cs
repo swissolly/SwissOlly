@@ -3,17 +3,18 @@ using Vaktr.Overlay.Rendering;
 namespace Vaktr.Overlay.Fps;
 
 /// <summary>
-/// Prefers exact present-based FPS, degrading to compositor timing when the machine can't
-/// give us an ETW session. Callers see one <see cref="IFpsSource"/> and are told, via
-/// <see cref="AccuracyChanged"/>, which one they actually got.
+/// Uses process-attributed present events for game FPS. It never substitutes compositor cadence,
+/// because that measures monitor refresh and can substantially overstate a game's frame rate.
 /// </summary>
 internal sealed class AdaptiveFpsSource : IFpsSource
 {
-    private readonly DwmFpsSource _dwm = new();
     private EtwPresentFpsSource? _etw;
     private IFpsSource? _active;
     private bool _etwUsable;
     private bool _probed;
+    private bool _unavailableReported;
+    private bool _errorRaisedThisStart;
+    private string _unavailableReason = "etw-unavailable";
 
     public event Action<double>? FpsUpdated;
     public event Action<string>? ErrorOccurred;
@@ -21,7 +22,7 @@ internal sealed class AdaptiveFpsSource : IFpsSource
     /// <summary>Raised when the live source changes, so the UI can explain what it is showing.</summary>
     public event Action<FpsAccuracy>? AccuracyChanged;
 
-    public FpsAccuracy Accuracy => _active?.Accuracy ?? FpsAccuracy.Approximate;
+    public FpsAccuracy Accuracy => _active?.Accuracy ?? FpsAccuracy.Unavailable;
 
     public void StartTracking(uint pid)
     {
@@ -30,10 +31,11 @@ internal sealed class AdaptiveFpsSource : IFpsSource
         if (!_probed)
         {
             _probed = true;
-            _etwUsable = EtwPresentFpsSource.IsAvailable();
+            _etwUsable = EtwPresentFpsSource.IsAvailable(out _unavailableReason);
             OverlayLog.Write($"FPS source probe: ETW {(_etwUsable ? "available" : "unavailable")}");
         }
 
+        _errorRaisedThisStart = false;
         if (_etwUsable)
         {
             _etw = new EtwPresentFpsSource();
@@ -43,22 +45,27 @@ internal sealed class AdaptiveFpsSource : IFpsSource
             if (_etw.IsRunning)
             {
                 _active = _etw;
+                _unavailableReported = false;
                 AccuracyChanged?.Invoke(FpsAccuracy.Exact);
                 return;
             }
 
-            // Session creation failed after the probe said it should work — don't retry per game.
-            OverlayLog.Write("FPS: ETW start failed, falling back to compositor timing");
+            // Session creation failed after the probe said it should work. Do not substitute
+            // monitor refresh for a game's FPS; leave the reading unavailable instead.
             Detach(_etw);
             _etw.Dispose();
             _etw = null;
             _etwUsable = false;
+            _unavailableReason = "etw-unavailable";
         }
 
-        Attach(_dwm);
-        _dwm.StartTracking(pid);
-        _active = _dwm;
-        AccuracyChanged?.Invoke(FpsAccuracy.Approximate);
+        if (!_errorRaisedThisStart && !_unavailableReported)
+        {
+            ErrorOccurred?.Invoke(_unavailableReason);
+        }
+
+        _unavailableReported = true;
+        AccuracyChanged?.Invoke(FpsAccuracy.Unavailable);
     }
 
     public void StopTracking()
@@ -93,15 +100,17 @@ internal sealed class AdaptiveFpsSource : IFpsSource
 
     private void OnError(string reason)
     {
-        // A startup failure is handled inline in StartTracking; anything reaching here is a
-        // runtime condition the controller should surface (stall, exclusive fullscreen).
+        _errorRaisedThisStart = true;
+        if (reason.StartsWith("etw-", StringComparison.Ordinal))
+        {
+            _unavailableReason = reason;
+        }
         ErrorOccurred?.Invoke(reason);
     }
 
     public void Dispose()
     {
         StopTracking();
-        _dwm.Dispose();
         _etw?.Dispose();
     }
 }

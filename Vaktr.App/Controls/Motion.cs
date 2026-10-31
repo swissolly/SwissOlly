@@ -1,4 +1,8 @@
 using System.Diagnostics;
+using System.Numerics;
+using Microsoft.UI.Composition;
+using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Hosting;
 using Microsoft.UI.Xaml.Media;
 
 namespace Vaktr.App.Controls;
@@ -16,6 +20,14 @@ internal static class Motion
     /// <summary>Standard duration for a value settling into place. Must stay well under the
     /// fastest scrape interval (1s) so a gauge is never permanently mid-flight.</summary>
     public const double ValueDurationSeconds = 0.30;
+
+    /// <summary>
+    /// How far an entering element travels. Kept small deliberately: a long rise reads as the app
+    /// being slow to settle, and at a 6px travel the eye registers the arrival rather than the
+    /// journey. Paired with short durations below so the whole launch sequence finishes well
+    /// inside half a second.
+    /// </summary>
+    private const float EntranceRise = 6f;
 
     private static bool? s_animationsEnabled;
 
@@ -47,6 +59,64 @@ internal static class Motion
         var inv = 1d - t;
         return 1d - (inv * inv * inv);
     }
+
+    public static void PlayEntrance(UIElement element, TimeSpan delay = default)
+    {
+        if (!AnimationsEnabled || element.XamlRoot is null)
+        {
+            return;
+        }
+
+        Visual? visual = null;
+        try
+        {
+            visual = ElementCompositionPreview.GetElementVisual(element);
+            var compositor = visual.Compositor;
+            var easing = compositor.CreateCubicBezierEasingFunction(
+                new Vector2(0.16f, 1f),
+                new Vector2(0.3f, 1f));
+
+            // Build both animations BEFORE hiding the element. The previous order set
+            // Opacity = 0 first, so any throw between there and StartAnimation — or an element
+            // torn down mid-flight — left the visual permanently invisible with no way back.
+            var opacity = compositor.CreateScalarKeyFrameAnimation();
+            opacity.InsertKeyFrame(0f, 0f);
+            opacity.InsertKeyFrame(1f, 1f, easing);
+            opacity.Duration = TimeSpan.FromMilliseconds(170);
+            opacity.DelayTime = delay;
+
+            var offset = compositor.CreateVector3KeyFrameAnimation();
+            offset.InsertKeyFrame(0f, new Vector3(0f, EntranceRise, 0f));
+            offset.InsertKeyFrame(1f, Vector3.Zero, easing);
+            offset.Duration = TimeSpan.FromMilliseconds(210);
+            offset.DelayTime = delay;
+
+            visual.Opacity = 0f;
+            visual.Offset = new Vector3(0f, EntranceRise, 0f);
+            visual.StartAnimation("Opacity", opacity);
+            visual.StartAnimation("Offset", offset);
+        }
+        catch (Exception)
+        {
+            // An entrance flourish is never worth a blank panel or a crash. Restore a visible,
+            // un-offset state and carry on without the animation.
+            try
+            {
+                if (visual is not null)
+                {
+                    visual.StopAnimation("Opacity");
+                    visual.StopAnimation("Offset");
+                    visual.Opacity = 1f;
+                    visual.Offset = Vector3.Zero;
+                }
+            }
+            catch
+            {
+                // Nothing further we can do; the element keeps its XAML-level opacity.
+            }
+        }
+    }
+
 }
 
 /// <summary>
@@ -98,8 +168,28 @@ internal static class MotionTicker
         // A callback may remove itself when it settles, so iterate a copy.
         s_scratch.Clear();
         s_scratch.AddRange(s_callbacks);
+
         foreach (var cb in s_scratch)
-            cb(dt);
+        {
+            try
+            {
+                cb(dt);
+            }
+            catch (Exception)
+            {
+                // Without isolation one throwing animator aborted the whole loop, skipping every
+                // remaining animator for that frame, and - because it was never removed - threw
+                // again at 60Hz forever. Drop the offender and keep the rest running.
+                s_callbacks.Remove(cb);
+
+                if (s_callbacks.Count == 0 && s_attached)
+                {
+                    s_attached = false;
+                    CompositionTarget.Rendering -= OnRendering;
+                    s_clock.Stop();
+                }
+            }
+        }
     }
 }
 

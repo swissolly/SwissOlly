@@ -17,8 +17,8 @@ namespace Vaktr.Overlay.Fps;
 /// "Performance Log Users" group. The installer adds the installing user to that group, so a
 /// normal install gets exact FPS without the app ever running elevated. When the right is
 /// absent (portable use, build-from-source, group membership not yet picked up by the logon
-/// token) <see cref="StartTracking"/> fails cleanly and <see cref="AdaptiveFpsSource"/> falls
-/// back to the approximate source.
+/// token) <see cref="StartTracking"/> fails cleanly and <see cref="AdaptiveFpsSource"/> reports
+/// FPS as unavailable rather than substituting the monitor refresh rate.
 /// </summary>
 internal sealed class EtwPresentFpsSource : IFpsSource
 {
@@ -38,6 +38,7 @@ internal sealed class EtwPresentFpsSource : IFpsSource
     private volatile uint _trackedPid;
     private volatile bool _running;
     private long _lastPresentTick;
+    private long _newestPresentTick;
     private long _lastEmittedTick;
     private bool _stallReported;
 
@@ -53,8 +54,9 @@ internal sealed class EtwPresentFpsSource : IFpsSource
     internal bool IsRunning => _running;
 
     /// <summary>Cheap permission probe: start and immediately tear down a session.</summary>
-    internal static bool IsAvailable()
+    internal static bool IsAvailable(out string failureReason)
     {
+        failureReason = string.Empty;
         IntPtr props = AllocProperties();
         try
         {
@@ -69,14 +71,25 @@ internal sealed class EtwPresentFpsSource : IFpsSource
             {
                 OverlayLog.Write($"ETW probe: StartTrace rc={rc}"
                     + (rc == ErrorAccessDenied ? " (access denied — not in Performance Log Users)" : ""));
+                failureReason = rc == ErrorAccessDenied
+                    ? "etw-access-denied"
+                    : $"etw-probe-failed-{rc}";
                 return false;
             }
 
             ControlTrace(handle, SessionName, props, EventTraceControlStop);
             return true;
         }
-        catch (DllNotFoundException) { return false; }
-        catch (EntryPointNotFoundException) { return false; }
+        catch (DllNotFoundException)
+        {
+            failureReason = "etw-unavailable";
+            return false;
+        }
+        catch (EntryPointNotFoundException)
+        {
+            failureReason = "etw-unavailable";
+            return false;
+        }
         finally
         {
             Marshal.FreeHGlobal(props);
@@ -185,9 +198,22 @@ internal sealed class EtwPresentFpsSource : IFpsSource
                 OverlayLog.Write($"ETW: CloseTrace rc={rc}");
         }
 
-        _consumer?.Join(2000);
+        // If ProcessTrace has not returned, ETW may still invoke the callback. Dropping the
+        // delegate root here would let the GC collect the thunk and the next event would call
+        // into freed memory - an access violation on the ETW consumer thread, unrecoverable.
+        var consumerExited = _consumer?.Join(5000) ?? true;
+        if (!consumerExited)
+        {
+            OverlayLog.Write("ETW: consumer thread did not exit; keeping callback rooted");
+        }
+
         _consumer = null;
         Cleanup();
+
+        if (consumerExited)
+        {
+            _callback = null;
+        }
 
         lock (_gate)
             _presentTicks.Clear();
@@ -228,6 +254,9 @@ internal sealed class EtwPresentFpsSource : IFpsSource
         lock (_gate)
         {
             _presentTicks.Enqueue(ts);
+            // Tracked explicitly: Queue<T>.Last() is Enumerable.Last over a non-indexable
+            // collection, so it walked all ~300 entries (twice) on every emit.
+            _newestPresentTick = ts;
             _lastPresentTick = System.Diagnostics.Stopwatch.GetTimestamp();
         }
     }
@@ -237,6 +266,9 @@ internal sealed class EtwPresentFpsSource : IFpsSource
         if (!_running) return;
 
         double fps;
+        var raiseStall = false;
+        try
+        {
         lock (_gate)
         {
             long freq = System.Diagnostics.Stopwatch.Frequency;
@@ -246,9 +278,12 @@ internal sealed class EtwPresentFpsSource : IFpsSource
                 _presentTicks.Clear();
                 if (!_stallReported)
                 {
-                    // Game is alive but not presenting — minimised, loading, or fully occluded.
+                    // Game is alive but not presenting - minimised, loading, or fully occluded.
+                    // Raised outside the lock below: subscribers run arbitrary code (the
+                    // controller re-renders under its own lock), and any path back into _gate
+                    // would deadlock the emit timer against the consumer callback.
                     _stallReported = true;
-                    ErrorOccurred?.Invoke("no-presents");
+                    raiseStall = true;
                 }
                 return;
             }
@@ -257,7 +292,7 @@ internal sealed class EtwPresentFpsSource : IFpsSource
 
             if (_presentTicks.Count < 2) return;
 
-            long cutoff = _presentTicks.Last() - (long)(WindowSeconds * freq);
+            long cutoff = _newestPresentTick - (long)(WindowSeconds * freq);
             while (_presentTicks.Count > 2 && _presentTicks.Peek() < cutoff)
                 _presentTicks.Dequeue();
 
@@ -266,7 +301,7 @@ internal sealed class EtwPresentFpsSource : IFpsSource
             // ETW delivers real-time events in buffer-sized batches roughly once a second, which
             // is slower than this timer. Without this guard the same window is recomputed twice
             // and the HUD emits each reading twice in a row.
-            long newest = _presentTicks.Last();
+            long newest = _newestPresentTick;
             if (newest == _lastEmittedTick) return;
             _lastEmittedTick = newest;
 
@@ -277,19 +312,42 @@ internal sealed class EtwPresentFpsSource : IFpsSource
             fps = (_presentTicks.Count - 1) / span;
         }
 
+        }
+        finally
+        {
+            if (raiseStall)
+            {
+                ErrorOccurred?.Invoke("no-presents");
+            }
+        }
+
         FpsUpdated?.Invoke(Math.Round(fps));
     }
 
     private void Cleanup()
     {
+        // An ETW session is a hard-capped, system-wide kernel resource that outlives this
+        // process. Previously the failure paths after a successful StartTrace freed the
+        // properties buffer and zeroed the handle WITHOUT stopping the session, leaving
+        // VaktrFpsSession live with DXGI and D3D9 enabled, filling buffers nobody consumes,
+        // for the rest of the OS boot - and unrecoverable, because StopTracking's guard sees
+        // _sessionHandle == 0 and returns early.
+        if (_sessionHandle != 0 && _properties != IntPtr.Zero)
+        {
+            ControlTrace(_sessionHandle, SessionName, _properties, EventTraceControlStop);
+        }
+
         if (_properties != IntPtr.Zero)
         {
             Marshal.FreeHGlobal(_properties);
             _properties = IntPtr.Zero;
         }
+
         _sessionHandle = 0;
         _traceHandle = InvalidProcessTraceHandle;
-        _callback = null;
+
+        // _callback is deliberately NOT nulled here. It is the only GC root for the native
+        // thunk ETW still holds; see StopTracking.
     }
 
     private static void StopStaleSession()

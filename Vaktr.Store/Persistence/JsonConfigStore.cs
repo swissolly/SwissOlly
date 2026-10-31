@@ -6,6 +6,7 @@ namespace Vaktr.Store.Persistence;
 
 public sealed class JsonConfigStore : IConfigStore
 {
+    private static readonly SemaphoreSlim SaveGate = new(1, 1);
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,
@@ -30,12 +31,51 @@ public sealed class JsonConfigStore : IConfigStore
     public async Task SaveAsync(VaktrConfig config, CancellationToken cancellationToken)
     {
         config = config.Normalize();
-        Directory.CreateDirectory(VaktrConfig.SettingsDirectory);
-        Directory.CreateDirectory(config.StorageDirectory);
+        await SaveGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            Directory.CreateDirectory(VaktrConfig.SettingsDirectory);
+            Directory.CreateDirectory(config.StorageDirectory);
 
-        await using var stream = File.Create(VaktrConfig.GetConfigPath());
-        await JsonSerializer.SerializeAsync(stream, config, JsonOptions, cancellationToken)
-            .ConfigureAwait(false);
+            var destination = VaktrConfig.GetConfigPath();
+            var temporary = $"{destination}.{Guid.NewGuid():N}.tmp";
+            try
+            {
+                await using (var stream = new FileStream(
+                    temporary,
+                    FileMode.CreateNew,
+                    FileAccess.Write,
+                    FileShare.None,
+                    4096,
+                    FileOptions.Asynchronous))
+                {
+                    await JsonSerializer.SerializeAsync(stream, config, JsonOptions, cancellationToken)
+                        .ConfigureAwait(false);
+                    await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
+                    stream.Flush(flushToDisk: true);
+                }
+
+                File.Move(temporary, destination, overwrite: true);
+            }
+            finally
+            {
+                try
+                {
+                    if (File.Exists(temporary))
+                    {
+                        File.Delete(temporary);
+                    }
+                }
+                catch
+                {
+                    // A leftover temporary file is harmless; preserve the original save error.
+                }
+            }
+        }
+        finally
+        {
+            SaveGate.Release();
+        }
     }
 
     private static string ResolveConfigPath()

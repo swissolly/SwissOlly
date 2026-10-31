@@ -47,3 +47,5 @@ installer/Output/
 
 # Publish output
 publish/
+
+artifacts/

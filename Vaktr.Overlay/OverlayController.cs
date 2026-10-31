@@ -25,8 +25,8 @@ public sealed class OverlayController : IDisposable
     private IntPtr _pendingHideHwnd = IntPtr.Zero;
     private double _lastFps = double.NaN;
     private string? _fpsError;
-    private FpsAccuracy _fpsAccuracy = FpsAccuracy.Approximate;
-    private bool _approximateReported;
+    private FpsAccuracy _fpsAccuracy = FpsAccuracy.Unavailable;
+    private bool _fpsUnavailableReported;
     private double _lastCpu = double.NaN;
     private double _lastGpu = double.NaN;
     private double _lastGpuTemp = double.NaN;
@@ -35,8 +35,8 @@ public sealed class OverlayController : IDisposable
     public event Action<string>? StatusMessage;
 
     /// <summary>
-    /// Whether the reading counts the game's present calls or is a compositor-derived estimate.
-    /// Present calls are not correlated with frames confirmed displayed by the monitor.
+    /// Whether the reading counts the game's present calls, is a compositor-derived estimate,
+    /// or is unavailable. Present calls are not correlated with frames confirmed displayed.
     /// </summary>
     public FpsAccuracy FpsAccuracy => _fpsAccuracy;
 
@@ -63,23 +63,26 @@ public sealed class OverlayController : IDisposable
             {
                 "exclusive-fullscreen" => "exclusive",
                 "no-presents" => "idle",
+                "etw-access-denied" => "access",
+                _ when msg.StartsWith("etw-", StringComparison.Ordinal) => "unavailable",
                 _ => "err",
             };
             _lastFps = double.NaN;
             PushRender();
+
+            if (msg.StartsWith("etw-", StringComparison.Ordinal) && !_fpsUnavailableReported)
+            {
+                _fpsUnavailableReported = true;
+                StatusMessage?.Invoke(msg == "etw-access-denied"
+                    ? "FPS unavailable: sign out of Windows and back in so Performance Log Users access takes effect, then restart Vaktr."
+                    : "FPS unavailable: Vaktr could not read this process's Windows present events. Restart Vaktr and check the overlay log.");
+            }
         };
 
         _fps.AccuracyChanged += accuracy =>
         {
             _fpsAccuracy = accuracy;
 
-            // Report the degraded case once per run, not on every game switch.
-            if (accuracy == FpsAccuracy.Approximate && !_approximateReported)
-            {
-                _approximateReported = true;
-                StatusMessage?.Invoke(
-                    "FPS is an estimate from display timing, not the game's frame rate. Exact readings need Performance Log Users membership and a new Windows sign-in; restart Vaktr after signing back in.");
-            }
         };
     }
 

@@ -55,7 +55,7 @@ public sealed partial class ShellWindow
                     {
                         Text = "Starting Vaktr",
                         FontSize = 13,
-                        Foreground = BrushFactory.CreateBrush("#7D9AB6"),
+                        Foreground = ResolveBrush("TextSecondaryBrush", "#C4C8CE"),
                         HorizontalAlignment = HorizontalAlignment.Center,
                     },
                 },
@@ -65,7 +65,7 @@ public sealed partial class ShellWindow
 
         var root = new Grid
         {
-            Background = BrushFactory.CreateBrush("#111315"),
+            Background = ResolveBrush("AppBackdropBrush", "#111315"),
         };
         root.Children.Add(_loadingOverlay);
 
@@ -87,7 +87,7 @@ public sealed partial class ShellWindow
             Background = BrushFactory.CreateBrush("#00FFFFFF"),
             BorderThickness = new Thickness(0),
             CornerRadius = new CornerRadius(0),
-            Padding = new Thickness(12, 12, 12, 18),
+            Padding = new Thickness(0, 12, 0, 12),
             Child = BuildShellStack(),
         };
 
@@ -96,18 +96,24 @@ public sealed partial class ShellWindow
             Background = ResolveBrush("AppBackdropBrush", "#111315"),
         };
         root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
 
         root.Children.Add(_titleBarDragHost);
+        var appHeader = BuildHeader();
+        appHeader.Margin = new Thickness(PageGutter, 4, PageGutter, 8);
+        _appHeader = appHeader;
+        root.Children.Add(appHeader);
+        Grid.SetRow(appHeader, 1);
 
         _shellBorderRef = shellBorder;
         _scrollHost.Content = new Border
         {
-            Margin = new Thickness(16, 4, 16, 16),
+            Margin = new Thickness(PageGutter, 4, PageGutter, 16),
             Child = shellBorder,
         };
         root.Children.Add(_scrollHost);
-        Grid.SetRow(_scrollHost, 1);
+        Grid.SetRow(_scrollHost, 2);
 
         root.Loaded += OnRootLoaded;
         root.SizeChanged += OnRootLayoutSizeChanged;
@@ -116,32 +122,36 @@ public sealed partial class ShellWindow
 
     private StackPanel BuildShellStack()
     {
-        StartupTrace.Write("BuildShellStack // polished-v19");
+        StartupTrace.Write("BuildShellStack // two-view-shell");
+        _overviewView.Children.Add(BuildSummarySurface());
+        _overviewView.Children.Add(BuildBoardSectionBand());
+        _overviewView.Children.Add(_dashboardGrid);
+
+        _settingsView.Children.Add(CreatePrimaryText("Settings", 22, true));
+        _settingsView.Children.Add(BuildControlsSurface());
+
         return new StackPanel
         {
-            Spacing = 22,
+            Spacing = SectionSpacing,
             Children =
             {
-                BuildHeader(),
-                CreateSectionBand("System overview", "Current usage across this PC."),
-                BuildSummarySurface(),
-                BuildBoardSectionBand(),
-                _dashboardGrid,
-                BuildControlsSurface(),
+                _overviewView,
+                _settingsView,
             },
         };
     }
 
     private FrameworkElement BuildHeader()
     {
-        StartupTrace.Write("BuildHeader // polished-v19");
+        StartupTrace.Write("BuildHeader // two-view-shell");
         var heroGrid = new Grid
         {
-            ColumnSpacing = 14,
+            ColumnSpacing = 12,
             Margin = new Thickness(0, 0, 0, 2),
         };
         heroGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         heroGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        heroGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         heroGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         heroGrid.Children.Add(_brandHost);
 
@@ -149,66 +159,75 @@ public sealed partial class ShellWindow
         {
             Text = "Vaktr",
             FontFamily = new FontFamily("Segoe UI Variable Display"),
-            FontSize = 27,
+            FontSize = 23,
             FontWeight = FontWeights.SemiBold,
             Foreground = ResolveBrush("TextPrimaryBrush", "#F2F8FF"),
         };
-        var subtitleText = new TextBlock
-        {
-            Text = "Local system monitor",
-            FontFamily = new FontFamily("Segoe UI Variable Text"),
-            FontSize = 12,
-            Foreground = ResolveBrush("TextMutedBrush", "#7D9AB6"),
-            Margin = new Thickness(1, 1, 0, 0),
-            TextTrimming = TextTrimming.CharacterEllipsis,
-        };
         var titleStack = new StackPanel
         {
-            Spacing = 1,
+            Spacing = 0,
             VerticalAlignment = VerticalAlignment.Center,
             Children =
             {
                 titleText,
-                subtitleText,
             },
         };
         heroGrid.Children.Add(titleStack);
         Grid.SetColumn(titleStack, 1);
 
-        var statusSurface = new Border
+        var navigationSurface = new Border
         {
-            Background = ResolveBrush("SurfaceElevatedBrush", "#222529"),
+            Background = ResolveBrush("SurfaceBrush", "#1C1F22"),
             BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#2C3035"),
             BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(8),
-            Padding = new Thickness(11, 7, 13, 7),
+            CornerRadius = new CornerRadius(10),
+            Padding = new Thickness(3),
             VerticalAlignment = VerticalAlignment.Center,
             Child = new StackPanel
             {
                 Orientation = Orientation.Horizontal,
-                Spacing = 8,
+                Spacing = 3,
                 VerticalAlignment = VerticalAlignment.Center,
                 Children =
                 {
-                    _statusIndicator,
-                    _statusText,
+                    _overviewNavigationButton,
+                    _settingsNavigationButton,
                 },
             },
         };
-        Grid.SetColumn(statusSurface, 2);
+        ToolTipService.SetToolTip(_overviewNavigationButton, "View live system telemetry");
+        ToolTipService.SetToolTip(_settingsNavigationButton, "Configure Vaktr");
+        Grid.SetColumn(navigationSurface, 2);
+        heroGrid.Children.Add(navigationSurface);
+
+        var statusSurface = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 8,
+            // Wider than the TextBlock's own MaxWidth so the text is the constraining element.
+            // When the panel was the narrower of the two it clipped mid-glyph ("41 metr") instead
+            // of letting TextTrimming produce an ellipsis.
+            MaxWidth = 340,
+            VerticalAlignment = VerticalAlignment.Center,
+            Children =
+            {
+                _statusIndicator,
+                _statusText,
+            },
+        };
+        Grid.SetColumn(statusSurface, 3);
         heroGrid.Children.Add(statusSurface);
         return heroGrid;
     }
 
     private Border BuildControlsSurface()
     {
-        StartupTrace.Write("BuildControlsSurface // polished-v19");
+        StartupTrace.Write("BuildControlsSurface // two-view-shell");
         var root = new StackPanel
         {
-            Spacing = 12,
+            Spacing = 16,
             Children =
             {
-                CreateSectionHeader("Settings", "Collection, history, storage, and overlay."),
                 _controlsBodyHost,
             },
         };
@@ -226,30 +245,135 @@ public sealed partial class ShellWindow
         return surface;
     }
 
+    private FrameworkElement BuildThemePicker()
+    {
+        // Eight themes do not fit on one row at the narrow breakpoint, so wrap them four per row.
+        //
+        // Deliberately rows of StackPanels rather than a Grid with star-width columns: this
+        // picker is measured by a parent that offers infinite width, and star columns resolve to
+        // zero under an infinite constraint — which collapsed the entire settings view to a
+        // ~195px sliver. Content-sized panels measure correctly under any constraint.
+        const int columns = 4;
+        var modes = Enum.GetValues<ThemeMode>();
+        var options = new StackPanel { Spacing = PanelSpacing };
+        StackPanel? currentRow = null;
+
+        var slot = 0;
+        foreach (var mode in modes)
+        {
+            if (slot % columns == 0)
+            {
+                currentRow = new StackPanel
+                {
+                    Orientation = Orientation.Horizontal,
+                    Spacing = PanelSpacing,
+                };
+                options.Children.Add(currentRow);
+            }
+
+            var swatchColors = GetThemeSwatch(mode);
+            var swatches = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                Spacing = 3,
+                Children =
+                {
+                    new Border { Width = 18, Height = 16, CornerRadius = new CornerRadius(3), Background = BrushFactory.CreateBrush(swatchColors[0]), BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#2C3035"), BorderThickness = new Thickness(0.6) },
+                    new Border { Width = 18, Height = 16, CornerRadius = new CornerRadius(3), Background = BrushFactory.CreateBrush(swatchColors[1]), BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#2C3035"), BorderThickness = new Thickness(0.6) },
+                    new Border { Width = 18, Height = 16, CornerRadius = new CornerRadius(3), Background = BrushFactory.CreateBrush(swatchColors[2]), BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#2C3035"), BorderThickness = new Thickness(0.6) },
+                },
+            };
+            var choice = new ActionChip
+            {
+                Text = GetThemeLabel(mode),
+                Tag = mode,
+                MinHeight = 36,
+                MinWidth = 104,
+                IsActive = _draftThemeMode == mode,
+                IsFilled = _draftThemeMode == mode,
+            };
+            choice.Click += OnThemeChoiceClick;
+            ToolTipService.SetToolTip(choice, $"Preview {GetThemeLabel(mode)} theme");
+
+            currentRow!.Children.Add(new StackPanel
+            {
+                Spacing = 6,
+                Children = { swatches, choice },
+            });
+            slot++;
+        }
+
+        return options;
+    }
+
+    private static string GetThemeLabel(ThemeMode mode) => mode switch
+    {
+        ThemeMode.Light => "Light",
+        ThemeMode.Midnight => "Midnight",
+        ThemeMode.Ember => "Ember",
+        ThemeMode.Forest => "Forest",
+        ThemeMode.Violet => "Violet",
+        ThemeMode.Nord => "Nord",
+        ThemeMode.Sandstone => "Sandstone",
+        _ => "Dark",
+    };
+
+    // Backdrop / card / accent, mirroring each palette in App.ApplyThemeResources so the
+    // swatch previews what the theme actually looks like.
+    private static string[] GetThemeSwatch(ThemeMode mode) => mode switch
+    {
+        ThemeMode.Light => ["#F2F3F5", "#FFFFFF", "#1769C2"],
+        ThemeMode.Midnight => ["#070B14", "#101728", "#5CC8F5"],
+        ThemeMode.Ember => ["#14100E", "#1F1915", "#F0A04B"],
+        ThemeMode.Forest => ["#0D120F", "#161D19", "#6FD8A4"],
+        ThemeMode.Violet => ["#110E16", "#1C1726", "#B18AF0"],
+        ThemeMode.Nord => ["#2E3440", "#3B4252", "#88C0D0"],
+        ThemeMode.Sandstone => ["#EDE9E3", "#FAF8F5", "#3F6B5C"],
+        _ => ["#111315", "#1C1F22", "#79B8FF"],
+    };
+
+    /// <summary>Themes whose surfaces are light, so XAML controls need the Light base theme.</summary>
+    internal static bool IsLightTheme(ThemeMode mode)
+        => mode is ThemeMode.Light or ThemeMode.Sandstone;
+
     private void RenderControlDeckSummary()
     {
         StartupTrace.Write("RenderControlDeckSummary // polished-v19");
         _controlDeckEditableActive = false;
         var settingsGrid = new Grid
         {
-            ColumnSpacing = 18,
-            RowSpacing = 12,
+            ColumnSpacing = PanelSpacing,
+            RowSpacing = PanelSpacing,
         };
-        settingsGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        settingsGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        settingsGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        var settingsColumns = DetermineSettingsColumns();
+        _lastSettingsColumnCount = settingsColumns;
+        for (var column = 0; column < settingsColumns; column++)
+        {
+            settingsGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        }
 
-        AddStatusField(settingsGrid, 0, 0, "Interval", FormatScrapeInterval(_viewModel.EffectiveScrapeIntervalSeconds), "Sample cadence");
-        AddStatusField(settingsGrid, 0, 1, "Retention", GetRetentionFieldValue(), "History window");
-        AddStatusField(settingsGrid, 0, 2, "Storage", GetStorageFieldTitle(), GetStorageFieldCaption());
+        var statusFields = new[]
+        {
+            ("Interval", FormatScrapeInterval(_viewModel.EffectiveScrapeIntervalSeconds), "Sample cadence"),
+            ("Retention", GetRetentionFieldValue(), "History window"),
+            ("Appearance", GetThemeLabel(_viewModel.SelectedTheme), "Visual theme"),
+            ("Storage", GetStorageFieldTitle(), GetStorageFieldCaption()),
+        };
+        for (var index = 0; index < statusFields.Length; index++)
+        {
+            var field = statusFields[index];
+            AddStatusField(settingsGrid, index / settingsColumns, index % settingsColumns, field.Item1, field.Item2, field.Item3);
+        }
 
         var ov = _viewModel.OverlayConfig;
         var overlaySummary = BuildOverlaySummaryCard(ov);
-        AddCardToGrid(settingsGrid, 1, 0, overlaySummary, columnSpan: 3);
+        var overlayRow = (statusFields.Length + settingsColumns - 1) / settingsColumns;
+        AddCardToGrid(settingsGrid, overlayRow, 0, overlaySummary, columnSpan: settingsColumns);
 
         var actionRow = new Grid
         {
-            ColumnSpacing = 14,
+            ColumnSpacing = PanelSpacing,
             VerticalAlignment = VerticalAlignment.Center,
         };
         actionRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -305,14 +429,25 @@ public sealed partial class ShellWindow
 
         var fieldGrid = new Grid
         {
-            ColumnSpacing = 14,
-            RowSpacing = 12,
+            ColumnSpacing = PanelSpacing,
+            RowSpacing = PanelSpacing,
         };
-        fieldGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        fieldGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        fieldGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        var settingsColumns = DetermineSettingsColumns();
+        _lastSettingsColumnCount = settingsColumns;
+        for (var column = 0; column < settingsColumns; column++)
+        {
+            fieldGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        }
 
         AddCardToGrid(fieldGrid, 0, 0, CreateControlEditorCard(
+            "appearance",
+            "APPEARANCE",
+            GetThemeLabel(_draftThemeMode),
+            "Application appearance",
+            "#79DCE5",
+            BuildThemePicker()), columnSpan: settingsColumns);
+
+        AddCardToGrid(fieldGrid, 1, 0, CreateControlEditorCard(
             "collection",
             "COLLECTION",
             FormatScrapeInterval(GetDraftScrapeIntervalSeconds()),
@@ -342,7 +477,7 @@ public sealed partial class ShellWindow
                 },
             }));
 
-        AddCardToGrid(fieldGrid, 0, 1, CreateControlEditorCard(
+        AddCardToGrid(fieldGrid, 1 + (1 / settingsColumns), 1 % settingsColumns, CreateControlEditorCard(
             "retention",
             "RETENTION",
             GetRetentionFieldValue(_draftRetentionInput),
@@ -373,7 +508,7 @@ public sealed partial class ShellWindow
                 },
             }));
 
-        AddCardToGrid(fieldGrid, 0, 2, CreateControlEditorCard(
+        AddCardToGrid(fieldGrid, 1 + (2 / settingsColumns), 2 % settingsColumns, CreateControlEditorCard(
             "storage",
             "STORAGE PATH",
             GetStorageFieldTitle(_draftStorageDirectory),
@@ -392,20 +527,18 @@ public sealed partial class ShellWindow
             }));
 
         // ── Row 1: full-width overlay card ────────────────────────────────
-        AddCardToGrid(fieldGrid, 1, 0, BuildOverlayEditorCard(), columnSpan: 3);
+        var overlayRow = 1 + ((3 + settingsColumns - 1) / settingsColumns);
+        AddCardToGrid(fieldGrid, overlayRow, 0, BuildOverlayEditorCard(), columnSpan: settingsColumns);
 
         var actionRow = new Grid
         {
-            ColumnSpacing = 14,
+            ColumnSpacing = PanelSpacing,
             VerticalAlignment = VerticalAlignment.Center,
         };
         actionRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         actionRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
         var actionChips = CreateChipRow(
-            CreateActionChip(
-                _draftThemeMode == ThemeMode.Dark ? "Light mode" : "Dark mode",
-                OnThemeQuickToggle),
             CreateActionChip("Cancel", OnCancelSettingsClick),
             CreateActionChip("Apply", OnSaveSettingsClick, filled: true));
         actionRow.Children.Add(actionChips);
@@ -426,14 +559,18 @@ public sealed partial class ShellWindow
 
     private UIElement BuildSummarySurface()
     {
-        StartupTrace.Write("BuildSummarySurface // polished-v19");
-        return new Grid
+        StartupTrace.Write("BuildSummarySurface // quiet-strip");
+        var surface = new Border
         {
-            Children =
-            {
-                _summaryHost,
-            },
+            Background = ResolveBrush("SurfaceBrush", "#1C1F22"),
+            BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#2C3035"),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(8),
+            Padding = new Thickness(3),
+            Child = _summaryHost,
         };
+        _summarySurfaceRef = surface;
+        return surface;
     }
 
     private static void AddControlField(Grid grid, int row, int column, string label, FrameworkElement control, int columnSpan = 1)
@@ -502,7 +639,7 @@ public sealed partial class ShellWindow
             BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E"),
             BorderThickness = new Thickness(0.9),
             CornerRadius = new CornerRadius(8),
-            Padding = new Thickness(16, 14, 16, 14),
+            Padding = new Thickness(16),
             MinHeight = 88,
             Child = new StackPanel
             {
@@ -654,10 +791,10 @@ public sealed partial class ShellWindow
             BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E"),
             BorderThickness = new Thickness(1),
             CornerRadius = new CornerRadius(8),
-            Padding = new Thickness(14),
+            Padding = new Thickness(16),
             Child = new StackPanel
             {
-                Spacing = 14,
+                Spacing = 12,
                 Children =
                 {
                     CreateSectionHeader("STORAGE", "Vaktr keeps telemetry local, so Local App Data is the sensible default instead of Roaming."),
@@ -679,7 +816,7 @@ public sealed partial class ShellWindow
             BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E"),
             BorderThickness = new Thickness(1),
             CornerRadius = new CornerRadius(8),
-            Padding = new Thickness(14),
+            Padding = new Thickness(16),
             Child = new StackPanel
             {
                 Spacing = 12,
@@ -738,10 +875,10 @@ public sealed partial class ShellWindow
             BorderBrush = ResolveBrush(isActive ? "AccentStrongBrush" : "SurfaceStrokeBrush", isActive ? "#B7F7FF" : "#27425E"),
             BorderThickness = new Thickness(1),
             CornerRadius = new CornerRadius(8),
-            Padding = new Thickness(14),
+            Padding = new Thickness(16),
             Child = new StackPanel
             {
-                Spacing = 10,
+                Spacing = 12,
                 Children =
                 {
                     topGrid,
@@ -838,7 +975,7 @@ public sealed partial class ShellWindow
         var stack = new StackPanel
         {
             Orientation = Orientation.Horizontal,
-            Spacing = 10,
+            Spacing = 8,
             HorizontalAlignment = HorizontalAlignment.Right,
         };
 
@@ -904,7 +1041,7 @@ public sealed partial class ShellWindow
             BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E"),
             BorderThickness = new Thickness(1),
             CornerRadius = new CornerRadius(8),
-            Padding = new Thickness(16, 14, 16, 14),
+            Padding = new Thickness(16),
             Child = new StackPanel
             {
                 Spacing = 8,
@@ -941,15 +1078,16 @@ public sealed partial class ShellWindow
 
         grid.Children.Add(new StackPanel
         {
-            Spacing = 3,
+            Spacing = 0,
             Children =
             {
-                CreatePrimaryText("Live telemetry", 17, true),
-                CreateSecondaryText("Performance and activity over time", 12.5),
+                CreatePrimaryText("Performance", 18, true),
             },
         });
 
         var actions = CreateChipRow(
+            _editLayoutButton,
+            _cancelLayoutButton,
             _globalRangeButton,
             _globalResetZoomButton);
         actions.VerticalAlignment = VerticalAlignment.Center;
@@ -1039,7 +1177,7 @@ public sealed partial class ShellWindow
             BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E"),
             BorderThickness = new Thickness(0.9),
             CornerRadius = new CornerRadius(8),
-            Padding = new Thickness(16, 14, 16, 14),
+            Padding = new Thickness(16),
             VerticalAlignment = VerticalAlignment.Stretch,
             Child = contentStack,
         };
@@ -1338,7 +1476,7 @@ public sealed partial class ShellWindow
             CreatePresetChip("↘ BR", _draftOverlayCorner == OverlayCorner.BottomRight,
                 (_, _) => { _draftOverlayCorner = OverlayCorner.BottomRight; QueueEditableControlDeckRender(); }));
 
-        var row3Grid = new Grid { ColumnSpacing = 16 };
+        var row3Grid = new Grid { ColumnSpacing = PanelSpacing };
         row3Grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         row3Grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 
@@ -1358,7 +1496,7 @@ public sealed partial class ShellWindow
         var opacityBox = CreateDeckInlineEntry(_draftOverlayOpacity, "90");
         opacityBox.TextChanged += (_, _) => { _draftOverlayOpacity = opacityBox.Text; };
 
-        var row4Grid = new Grid { ColumnSpacing = 16 };
+        var row4Grid = new Grid { ColumnSpacing = PanelSpacing };
         row4Grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         row4Grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 
@@ -1477,7 +1615,7 @@ public sealed partial class ShellWindow
             BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E"),
             BorderThickness = new Thickness(0.9),
             CornerRadius = new CornerRadius(8),
-            Padding = new Thickness(16, 14, 16, 14),
+            Padding = new Thickness(16),
             MinHeight = 72,
             Child = new StackPanel
             {

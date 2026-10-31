@@ -9,6 +9,8 @@ public sealed class MainViewModel : ObservableObject
 {
     private readonly Dictionary<string, MetricPanelViewModel> _panelLookup = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, int> _panelOrder = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, PanelSizePreset> _panelSizePresets = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, PanelLayout> _panelLayouts = new(StringComparer.OrdinalIgnoreCase);
     private bool _dashboardPanelsDirty = true;
     private bool _panelTogglesDirty = true;
 
@@ -61,6 +63,12 @@ public sealed class MainViewModel : ObservableObject
         [
             new ThemeSelectionOption(ThemeMode.Dark, "Dark"),
             new ThemeSelectionOption(ThemeMode.Light, "Light"),
+            new ThemeSelectionOption(ThemeMode.Midnight, "Midnight"),
+            new ThemeSelectionOption(ThemeMode.Ember, "Ember"),
+            new ThemeSelectionOption(ThemeMode.Forest, "Forest"),
+            new ThemeSelectionOption(ThemeMode.Violet, "Violet"),
+            new ThemeSelectionOption(ThemeMode.Nord, "Nord"),
+            new ThemeSelectionOption(ThemeMode.Sandstone, "Sandstone"),
         ];
 
         SummaryCards =
@@ -68,7 +76,7 @@ public sealed class MainViewModel : ObservableObject
             new SummaryCardViewModel("CPU", "CPU", BrushFactory.CreateBrush("#5DE6FF")),
             new SummaryCardViewModel("GPU", "GPU", BrushFactory.CreateBrush("#7FB4FF")),
             new SummaryCardViewModel("RAM", "Memory", BrushFactory.CreateBrush("#7BF7D0")),
-            new SummaryCardViewModel("Drive", "Drives", BrushFactory.CreateBrush("#FF9B54")),
+            new SummaryCardViewModel("Drive", "Drives", BrushFactory.CreateBrush("#B08BF0")),
         ];
 
         EnsureBaselinePanels();
@@ -230,6 +238,11 @@ public sealed class MainViewModel : ObservableObject
             MinimizeToTray = MinimizeToTray,
             PanelVisibility = visibility,
             PanelOrder = BuildPersistedPanelOrder().ToList(),
+            PanelSizes = BuildPersistedPanelSizes(),
+            PanelLayouts = _panelLayouts.ToDictionary(
+                pair => pair.Key,
+                pair => pair.Value.Clone(),
+                StringComparer.OrdinalIgnoreCase),
             Overlay = _overlayConfig,
         }.Normalize();
     }
@@ -256,6 +269,11 @@ public sealed class MainViewModel : ObservableObject
         LaunchOnStartup = normalized.LaunchOnStartup;
         MinimizeToTray = normalized.MinimizeToTray;
         ApplyPanelOrder(normalized.PanelOrder);
+        _panelSizePresets.Clear();
+        foreach (var (panelKey, size) in normalized.PanelSizes)
+        {
+            _panelSizePresets[panelKey] = size;
+        }
 
         foreach (var toggle in PanelToggles)
         {
@@ -266,8 +284,11 @@ public sealed class MainViewModel : ObservableObject
         {
             panel.SetRetentionWindow(_retentionWindow);
             panel.IsVisible = normalized.PanelVisibility.GetValueOrDefault(panel.PanelKey, panel.IsDashboardPanel);
+            panel.SizePreset = _panelSizePresets.GetValueOrDefault(panel.PanelKey, PanelSizePreset.Standard);
             panel.SelectedRange = MapToRangePreset(normalized.GraphWindowMinutes);
         }
+
+        ApplyPanelLayouts(normalized);
 
         _dashboardPanelsDirty = true;
         _panelTogglesDirty = true;
@@ -427,6 +448,151 @@ public sealed class MainViewModel : ObservableObject
         return true;
     }
 
+    /// <summary>Loads saved geometry. Panels without an entry are filled in at placement time.</summary>
+    private void ApplyPanelLayouts(VaktrConfig normalized)
+    {
+        _panelLayouts.Clear();
+        foreach (var (key, layout) in normalized.PanelLayouts)
+        {
+            _panelLayouts[key] = layout.Clone().Normalize();
+        }
+    }
+
+    /// <summary>
+    /// Guarantees every supplied panel has geometry, then resolves the board.
+    ///
+    /// Called from the render path rather than from ApplyConfig because the dashboard panel list
+    /// is not populated yet when config is applied — doing it there left most panels without a
+    /// layout, and they all collapsed onto cell (0,0).
+    /// </summary>
+    public void EnsureLayoutsFor(IReadOnlyList<string> panelKeys)
+    {
+        if (panelKeys.Count == 0)
+        {
+            return;
+        }
+
+        var missing = panelKeys.Where(k => !_panelLayouts.ContainsKey(k)).ToList();
+        if (missing.Count > 0)
+        {
+            if (_panelLayouts.Count == 0)
+            {
+                // Nothing saved: rebuild the board from the legacy preset + order model so an
+                // existing dashboard upgrades to something recognisable.
+                foreach (var placement in GridLayoutEngine.FromLegacy(
+                    panelKeys,
+                    key => _panelSizePresets.GetValueOrDefault(key, PanelSizePreset.Standard)))
+                {
+                    _panelLayouts[placement.Key] = placement.Layout;
+                }
+            }
+            else
+            {
+                // Panels added after a layout was saved take the first free slot, so they sit
+                // beside existing panels instead of stacking in a column at the bottom.
+                foreach (var key in missing)
+                {
+                    var occupied = _panelLayouts.Select(kv => new PanelPlacement(kv.Key, kv.Value)).ToList();
+                    _panelLayouts[key] = GridLayoutEngine.FindFreeSlot(occupied, 4, 6);
+                }
+            }
+        }
+
+        // Drop geometry for panels that are no longer on the board so hidden panels do not
+        // reserve empty rows.
+        foreach (var stale in _panelLayouts.Keys.Where(k => !panelKeys.Contains(k, StringComparer.OrdinalIgnoreCase)).ToList())
+        {
+            _panelLayouts.Remove(stale);
+        }
+
+        ResolvePanelLayouts();
+    }
+
+    /// <summary>Runs the collision engine over current geometry and writes the result back.</summary>
+    public void ResolvePanelLayouts()
+    {
+        if (_panelLayouts.Count == 0)
+        {
+            return;
+        }
+
+        var ordered = BuildPersistedPanelOrder()
+            .Where(_panelLayouts.ContainsKey)
+            .Concat(_panelLayouts.Keys)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Select(k => new PanelPlacement(k, _panelLayouts[k]));
+
+        foreach (var placement in GridLayoutEngine.Resolve(ordered))
+        {
+            _panelLayouts[placement.Key] = placement.Layout;
+        }
+    }
+
+    public PanelLayout? GetPanelLayout(string panelKey)
+        => _panelLayouts.TryGetValue(panelKey, out var layout) ? layout : null;
+
+    public IReadOnlyDictionary<string, PanelLayout> PanelLayouts => _panelLayouts;
+
+    /// <summary>Snapshot for Cancel in edit mode.</summary>
+    public Dictionary<string, PanelLayout> SnapshotPanelLayouts()
+        => _panelLayouts.ToDictionary(p => p.Key, p => p.Value.Clone(), StringComparer.OrdinalIgnoreCase);
+
+    public void RestorePanelLayouts(Dictionary<string, PanelLayout> snapshot)
+    {
+        _panelLayouts.Clear();
+        foreach (var (key, layout) in snapshot)
+        {
+            _panelLayouts[key] = layout.Clone();
+        }
+    }
+
+    /// <summary>Applies an engine result (from a move or resize) to the stored geometry.</summary>
+    public void ApplyPlacements(IEnumerable<PanelPlacement> placements)
+    {
+        foreach (var placement in placements)
+        {
+            _panelLayouts[placement.Key] = placement.Layout;
+        }
+    }
+
+    public bool SetPanelSizePreset(string panelKey, PanelSizePreset preset)
+    {
+        if (string.IsNullOrWhiteSpace(panelKey) || !Enum.IsDefined(typeof(PanelSizePreset), preset))
+        {
+            return false;
+        }
+
+        if (_panelLookup.TryGetValue(panelKey, out var panel))
+        {
+            if (panel.SizePreset == preset)
+            {
+                return false;
+            }
+
+            panel.SizePreset = preset;
+        }
+
+        _panelSizePresets[panelKey] = preset;
+
+        // Layout now comes from PanelLayouts, so the preset has to translate into geometry or
+        // the Size chip silently stops doing anything. Routing it through the engine also means
+        // neighbours reflow exactly as they will when drag-resize lands.
+        if (_panelLayouts.ContainsKey(panelKey))
+        {
+            var placements = _panelLayouts
+                .Select(kv => new PanelPlacement(kv.Key, kv.Value))
+                .ToList();
+
+            ApplyPlacements(GridLayoutEngine.Resize(
+                placements,
+                panelKey,
+                PanelLayout.WidthFromLegacyPreset(preset),
+                PanelLayout.HeightFromLegacyPreset(preset)));
+        }
+
+        return true;
+    }
+
     public int EffectiveScrapeIntervalSeconds =>
         ParseOptionalInt(ScrapeIntervalInput, VaktrConfig.DefaultScrapeIntervalSeconds, 1, 60);
 
@@ -500,6 +666,7 @@ public sealed class MainViewModel : ObservableObject
         var panel = new MetricPanelViewModel(panelKey, title, category, unit)
         {
             SelectedRange = MapToRangePreset(SelectedWindowMinutes),
+            SizePreset = _panelSizePresets.GetValueOrDefault(panelKey, PanelSizePreset.Standard),
             IsVisible = true,
             IsNewlyCreated = true,
         };
@@ -611,6 +778,17 @@ public sealed class MainViewModel : ObservableObject
             .ThenBy(panel => panel.Title, StringComparer.OrdinalIgnoreCase)
             .Select(panel => panel.PanelKey)
             .ToArray();
+    }
+
+    private Dictionary<string, PanelSizePreset> BuildPersistedPanelSizes()
+    {
+        var sizes = new Dictionary<string, PanelSizePreset>(_panelSizePresets, StringComparer.OrdinalIgnoreCase);
+        foreach (var panel in _panelLookup.Values)
+        {
+            sizes[panel.PanelKey] = panel.SizePreset;
+        }
+
+        return sizes;
     }
 
     private int GetPanelOrderRank(MetricPanelViewModel panel)
@@ -1030,6 +1208,7 @@ public sealed class MetricPanelViewModel : ObservableObject
     private string _emptyStateText = "Waiting for samples";
     private double _chartCeilingValue;
     private bool _isVisible;
+    private PanelSizePreset _sizePreset = PanelSizePreset.Standard;
     private TimeRangePreset _selectedRange = TimeRangePreset.FifteenMinutes;
     private DateTimeOffset _windowStartUtc = DateTimeOffset.UtcNow.AddMinutes(-15);
     private DateTimeOffset _windowEndUtc = DateTimeOffset.UtcNow;
@@ -1127,6 +1306,14 @@ public sealed class MetricPanelViewModel : ObservableObject
     {
         get => _isVisible;
         set => SetProperty(ref _isVisible, value);
+    }
+
+    public PanelSizePreset SizePreset
+    {
+        get => _sizePreset;
+        set => SetProperty(ref _sizePreset, Enum.IsDefined(typeof(PanelSizePreset), value)
+            ? value
+            : PanelSizePreset.Standard);
     }
 
     public TimeRangePreset SelectedRange
@@ -2001,8 +2188,12 @@ public sealed class MetricPanelViewModel : ObservableObject
             MetricCategory.Memory => BrushFactory.ParseColor("#54C99B"),
             MetricCategory.Gpu when index == 0 => BrushFactory.ParseColor("#7FB4FF"),
             MetricCategory.Gpu => index % 2 == 0 ? BrushFactory.ParseColor("#5E96F4") : BrushFactory.ParseColor("#9CC7FF"),
-            MetricCategory.Disk when index == 0 => BrushFactory.ParseColor("#FF9B54"),
-            MetricCategory.Disk => BrushFactory.ParseColor("#FFD166"),
+            // Violet, not amber. Disk previously used #FF9B54/#FFD166, which sit in the same
+            // hue family as WarningBrush (#F2BF66) and CriticalBrush (#FF897D) — so a drive at
+            // 37% and a drive at 86% rendered in indistinguishable orange and the threshold
+            // colouring carried no information on exactly the panels where capacity matters most.
+            MetricCategory.Disk when index == 0 => BrushFactory.ParseColor("#B08BF0"),
+            MetricCategory.Disk => BrushFactory.ParseColor("#C9AEF7"),
             MetricCategory.Network when index == 0 => BrushFactory.ParseColor("#6CC7FF"),
             MetricCategory.Network => BrushFactory.ParseColor("#4C9FE0"),
             MetricCategory.System when index == 0 => BrushFactory.ParseColor("#79C7FF"),

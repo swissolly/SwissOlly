@@ -2,6 +2,7 @@ using Microsoft.UI.Text;
 using Microsoft.UI.Xaml.Automation;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
+using Microsoft.UI.Xaml.Media.Animation;
 using Windows.UI;
 using Vaktr.App.ViewModels;
 
@@ -17,6 +18,7 @@ public sealed class ActionChip : UserControl
     private bool _isFocused;
     private bool _isHovered;
     private bool _isPressed;
+    private readonly ScaleTransform _pressScale = new() { ScaleX = 1d, ScaleY = 1d };
     private string _text = string.Empty;
 
     // Cached brushes to avoid allocating new gradient objects on every hover/state change
@@ -37,6 +39,10 @@ public sealed class ActionChip : UserControl
             Padding = new Thickness(10, 5, 10, 5),
             Background = ResolveBrush("SurfaceElevatedBrush", "#111D2A"),
             BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#243D55"),
+            // Press feedback is a scale, not an opacity dip. RenderTransform keeps it off the
+            // layout path entirely, so repeatedly mashing a range chip costs nothing.
+            RenderTransform = _pressScale,
+            RenderTransformOrigin = new Windows.Foundation.Point(0.5, 0.5),
         };
 
         _glow = new Border
@@ -44,7 +50,7 @@ public sealed class ActionChip : UserControl
             HorizontalAlignment = HorizontalAlignment.Stretch,
             VerticalAlignment = VerticalAlignment.Center,
             Margin = new Thickness(4),
-            CornerRadius = new CornerRadius(9),
+            CornerRadius = new CornerRadius(8),
             Opacity = 0,
             IsHitTestVisible = false,
         };
@@ -201,18 +207,15 @@ public sealed class ActionChip : UserControl
         if (_cachedIdleBg is null || _brushCacheIsLight != isLight)
         {
             _brushCacheIsLight = isLight;
-            if (isLight)
-            {
-                _cachedIdleBg = ResolveBrush("SurfaceElevatedBrush", "#F0F5FB");
-                _cachedHoverBg = ResolveBrush("SurfaceStrongBrush", "#E0EAF4");
-                _cachedAccentBg = ResolveBrush("AccentSoftBrush", "#C8E8F8");
-            }
-            else
-            {
-                _cachedIdleBg = CreateSurfaceGradient("#101A28", "#122031");
-                _cachedHoverBg = CreateSurfaceGradient("#132232", "#17293D");
-                _cachedAccentBg = CreateSurfaceGradient("#18344B", "#122437");
-            }
+
+            // Both themes resolve from the palette. The dark branch used to hardcode a navy
+            // gradient (#101A28/#122031) left over from an older palette, so once the app moved
+            // to neutral surfaces every chip and entry field rendered visibly blue against grey
+            // cards. Resolving from theme resources fixes that drift permanently and is what
+            // lets any new palette apply to these controls without touching this file.
+            _cachedIdleBg = ResolveBrush("SurfaceElevatedBrush", isLight ? "#F0F5FB" : "#222529");
+            _cachedHoverBg = ResolveBrush("SurfaceStrongBrush", isLight ? "#E0EAF4" : "#292D31");
+            _cachedAccentBg = ResolveBrush("AccentSoftBrush", isLight ? "#C8E8F8" : "#294A6B");
         }
 
         _surface.Background = useAccent
@@ -238,10 +241,65 @@ public sealed class ActionChip : UserControl
         _label.Foreground = useAccent || _isHovered
             ? ResolveBrush("TextPrimaryBrush", isLight ? "#0A1824" : "#F2F8FF")
             : ResolveBrush("TextSecondaryBrush", isLight ? "#3C5771" : "#B7CCE1");
-        Opacity = _isPressed ? 0.84 : _isHovered ? 0.97 : 1.0;
+        // 0.97 on hover was below the perceptual threshold — it cost a composition update and
+        // bought nothing. Hover is carried by the background change; press gets a real scale.
+        ApplyPressScale(_isPressed);
         _glow.Background = ResolveBrush("AccentHaloBrush", "#2B8FE6C4");
         _glow.Opacity = _isFocused ? 0.08 : useAccent ? 0.04 : 0;
     }
+
+    /// <summary>
+    /// Press goes down instantly and eases back up. That asymmetry is what makes a button feel
+    /// responsive rather than mushy — the press must land on the same frame as the click, while
+    /// the release can afford to settle.
+    /// </summary>
+    private void ApplyPressScale(bool pressed)
+    {
+        // UpdateVisualState runs on every hover, focus, IsActive/IsFilled change and theme
+        // refresh - eleven call sites. Starting a Storyboard on each one flooded XAML with
+        // animations whenever a chip changed state, which is the same failure class as the
+        // implicit-animation crash this control hit before. Only a real press transition
+        // should animate.
+        if (pressed == _lastAppliedPressed)
+        {
+            return;
+        }
+
+        _lastAppliedPressed = pressed;
+
+        if (!Motion.AnimationsEnabled)
+        {
+            _pressScale.ScaleX = _pressScale.ScaleY = pressed ? 0.96d : 1d;
+            return;
+        }
+
+        if (pressed)
+        {
+            _pressStoryboard?.Stop();
+            _pressScale.ScaleX = _pressScale.ScaleY = 0.96d;
+            return;
+        }
+
+        _pressStoryboard?.Stop();
+        var sb = new Storyboard();
+        foreach (var axis in new[] { "ScaleX", "ScaleY" })
+        {
+            var anim = new DoubleAnimation
+            {
+                To = 1d,
+                Duration = new Duration(TimeSpan.FromMilliseconds(130)),
+                EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
+            };
+            Storyboard.SetTarget(anim, _pressScale);
+            Storyboard.SetTargetProperty(anim, axis);
+            sb.Children.Add(anim);
+        }
+        _pressStoryboard = sb;
+        sb.Begin();
+    }
+
+    private Storyboard? _pressStoryboard;
+    private bool _lastAppliedPressed;
 
     private static Brush ResolveBrush(string key, string fallbackHex) => ThemeVisuals.ResolveBrush(key, fallbackHex);
 

@@ -5,7 +5,8 @@ using Vaktr.Overlay.Rendering;
 
 namespace Vaktr.Overlay.Fps;
 
-// Fallback FPS source, used only when no ETW session can be created (see EtwPresentFpsSource).
+// Experimental compositor-cadence source. It is not used by the game overlay: DWM's cadence is
+// effectively monitor refresh and is not a trustworthy substitute for a game's FPS.
 //
 // DwmFlush() blocks until DWM finishes its next composition frame, so timing successive flushes
 // measures the *compositor's* cadence — effectively the display refresh rate. It is NOT the

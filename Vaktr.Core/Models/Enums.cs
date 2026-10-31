@@ -25,6 +25,32 @@ public enum ThemeMode
 {
     Dark = 0,
     Light = 1,
+
+    /// <summary>Deep blue-black with a cool cyan accent.</summary>
+    Midnight = 2,
+
+    /// <summary>Warm charcoal with an amber accent.</summary>
+    Ember = 3,
+
+    /// <summary>Deep green-grey with a mint accent.</summary>
+    Forest = 4,
+
+    /// <summary>Muted plum with a lavender accent.</summary>
+    Violet = 5,
+
+    /// <summary>Soft blue-grey, lighter than Dark — the classic low-contrast palette.</summary>
+    Nord = 6,
+
+    /// <summary>Warm off-white paper tone with a slate accent.</summary>
+    Sandstone = 7,
+}
+
+public enum PanelSizePreset
+{
+    Compact = 0,
+    Standard = 1,
+    Wide = 2,
+    Large = 3,
 }
 
 public enum TimeRangePreset

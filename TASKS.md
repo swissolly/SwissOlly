@@ -1,403 +1,406 @@
-# Vaktr v1.2.0 — Task List
+# Vaktr — Dashboard Edit Mode
 
-In-game telemetry overlay. Top-most click-through layered window owned by the main Vaktr process; auto-shows when a game has focus, hides otherwise. Three modes (Simple / Advanced / Custom), configurable corner / color / font size / opacity / hotkey. No DLL injection. Vendor-agnostic.
+**Status:** Steps 1-7 implemented. Two fix passes after hands-on feedback (janky/glitchy resize,
+then flicker). The second was an architectural change: the board no longer reflows during a
+gesture at all. Also fixed a crash: `ActionChip` started a Storyboard on every `UpdateVisualState`
+call (11 call sites), flooding XAML whenever a chip changed state — this is what crashed the app
+on "Show processes". Step 8 verification still needs hands-on confirmation.
 
-Full plan: `~/.claude/plans/adaptive-foraging-mist.md` (or read this file end-to-end for the actionable summary).
+Grafana-style layout editing: an **Edit** button on Overview that unlocks free panel
+resize/reposition, with live reflow, then saves positions that stay locked.
 
-## Goals
+## Goal
 
-- Surface FPS + selected metrics on top of running games without alt-tabbing.
-- Configured entirely from the existing settings panel — no second window, exe, taskbar entry, or installer component visible to the user.
-- Anti-cheat-safe (no DLL injection, no DXGI hooks, no game-process memory reads).
-- Resource budget: total Vaktr footprint stays under 3% CPU / 300 MB during active gaming.
-- NVIDIA + AMD + Intel GPUs supported equally.
+- Edit button on the Overview board header. Outside edit mode the board is read-only.
+- In edit mode: drag a panel to move it, drag its edges/corner to resize it.
+- Other panels move out of the way live while dragging.
+- Every panel can be freely sized and pinned to a fixed position.
+- Save persists the layout; Cancel reverts. Saved layouts survive restart and window resize.
+- **Chart drag-to-zoom keeps working after save** — resize handles must not steal those pointer
+  events outside edit mode.
 
----
+## Design decisions
 
-## Step 1 — Project skeleton + rendering primitive
+**Grid.** 12 columns. Divides cleanly by 2/3/4/6, so a third is `W=4`, a half `W=6`, full `W=12`.
+Rows are a fixed `RowUnitPx` so `H` means a real height — today rows are `Auto`, which is why only
+a column *span* is settable and height is whatever the content wants.
 
-- [x] Create `Vaktr.Overlay/Vaktr.Overlay.csproj` (`net8.0-windows10.0.19041.0`, references `Vaktr.Core`)
-- [x] Add the project to `Vaktr.sln`
-- [x] Add `<ProjectReference>` from `Vaktr.App/Vaktr.App.csproj` to `Vaktr.Overlay`
-- [x] `Vaktr.Overlay/Rendering/Win32Interop.cs` — P/Invoke surface: `CreateWindowEx`, `DestroyWindow`, `UpdateLayeredWindow`, `SetWindowPos`, `GetDpiForWindow`, `GetMonitorInfo`, `MonitorFromWindow`, `SetThreadDpiAwarenessContext`, message-loop primitives
-- [x] `Vaktr.Overlay/Rendering/LayeredOverlayWindow.cs` — owns the HWND lifecycle. Window styles: `WS_POPUP` + `WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW`. Methods: `Show`, `Hide`, `UpdateBitmap(Bitmap)`, `Reposition(corner, monitor)`. Re-asserts topmost on a 2-second timer while visible.
-- [x] `Vaktr.Overlay/Rendering/OverlayBitmapRenderer.cs` — GDI+ text → premultiplied BGRA bitmap. Cache static lines; only re-rasterize when values change. Layout text vertically with consistent padding. Apply per-line color and global opacity.
-- [ ] **Smoke test**: write a tiny scratch host that creates a window, renders hardcoded `"FPS: 60\nCPU: 50%\nGPU: 70%"`, and parks it in the top-right corner of the primary monitor. Verify it appears on top of Notepad maximized and is click-through.
+**Panel geometry** is `{X, Y, W, H}` in grid units, replacing `PanelSizePreset` + flow order.
+Order-based flow cannot express "pinned at row 3, column 5", which is the whole ask.
 
-## Step 2 — Config model + persistence + tests
+**Collision** uses Grafana's rule: a moved panel displaces others *downward*, never sideways, then
+the board compacts upward to close gaps. Predictable and stable under repeated drags.
 
-- [x] `Vaktr.Overlay/OverlayMode.cs` — enum `Simple | Advanced | Custom`
-- [x] `Vaktr.Overlay/OverlayCorner.cs` — enum `TopLeft | TopRight | BottomLeft | BottomRight`
-- [x] `Vaktr.Core/Models/VaktrConfig.cs` — add nested class `OverlayConfig` (mutable, auto-properties; same shape as the existing class). Properties: `Enabled`, `Mode`, `Corner`, `TextColor` (`#RRGGBB`), `FontSizePx` (10–32), `Opacity` (0.3–1.0), `HotkeyGesture` (e.g. `"Ctrl+Shift+F11"`), `CustomMetrics` (subset of `["fps","cpu","gpu","gpu-temp","memory"]`).
-- [x] `OverlayConfig.Normalize()` — clamp numerics, validate hex via `ColorTranslator.FromHtml` with fallback, validate hotkey via `GlobalHotkeyService.TryParse` with fallback, ensure Custom has at least one metric (else fallback to FPS).
-- [x] `VaktrConfig.Overlay` property; `VaktrConfig.Normalize()` ends with `Overlay = (Overlay ?? new OverlayConfig()).Normalize();`
-- [x] `Vaktr.Tests/VaktrConfigTests.cs` — add five tests:
-  - Font size out of range → clamped to default
-  - Malformed hex → fallback to default `#66E7FF`
-  - Invalid hotkey gesture → fallback to default `Ctrl+Shift+F11`
-  - JSON round-trip preserves all properties
-  - `VaktrConfig.Overlay == null` after deserialize reconstructs default
-- [x] All 31 existing tests still pass; new tests pass: `dotnet test Vaktr.Tests/Vaktr.Tests.csproj -c Release` (47/47 pass)
-
-## Step 3 — OverlayController consuming MetricSnapshot
-
-- [x] `Vaktr.Overlay/OverlayController.cs` — owns state machine (`Hidden | ShownByGame | ShownByHotkey | Suspended`). Subscribes to `CollectorService.SnapshotCollected` (via tee from `ShellWindow.OnSnapshotCollected`). Extracts CPU%, GPU%, GPU temp, memory% from snapshot. Pushes formatted text to `LayeredOverlayWindow` through the renderer.
-- [x] Metric extraction helpers (private inside controller):
-  - CPU%: `samples.First(s => s.PanelKey == "cpu-total" && s.SeriesKey == "usage").Value`
-  - GPU%: `panelKey == "gpu-total"`, `seriesKey == "usage"`
-  - GPU temp: `panelKey == "gpu-temperature"`, `seriesKey == "temperature"`
-  - Memory%: from `panelKey == "memory"` series `used-gb` / `total-gb`
-- [x] Wire in `Vaktr.App/ShellWindow.Polished.cs` `OnSnapshotCollected` (line 923-933): tee to `_overlayController.OnSnapshot(snapshot)` on the same Low-priority dispatch.
-- [ ] **Test (always-on mode)**: with `Enabled=true` and no foreground detection yet, verify the overlay shows live CPU/GPU/memory (no FPS) on top of Notepad maximized.
-
-## Step 4 — Foreground detection and auto-show/hide
-
-- [x] ~~`Vaktr.Overlay/Detection/ForegroundWatcher.cs` — `SetWinEventHook(EVENT_SYSTEM_FOREGROUND, ...)`~~ — superseded and deleted. Replaced by a 500 ms foreground poll in `OverlayController.PollForeground`, which needs no hook and gets the Alt-Tab debounce for free via its two-poll hide confirmation.
-- [x] `Vaktr.Overlay/Detection/GameProcessClassifier.cs` — combines: (a) foreground HWND covers an entire monitor (`GetWindowRect` vs `MonitorFromWindow` + `GetMonitorInfo`), (b) PID's main module is not in deny-list (`explorer.exe`, `dwm.exe`, `Vaktr.exe`, `ApplicationFrameHost.exe`, `SearchHost.exe`, `StartMenuExperienceHost.exe`, `ShellExperienceHost.exe`, `TextInputHost.exe`). Return `bool IsLikelyGame(IntPtr hwnd)`.
-- [x] `OverlayController` subscribes to `ForegroundWatcher`, calls classifier, transitions state. Stores currently-tracked PID for the FPS source (Step 6).
-- [ ] **Test**: verify overlay hides when Notepad maximized is foreground; appears when a borderless game is focused (or any non-deny-list fullscreen-sized exe for now).
-
-## Step 5 — Global hotkey
-
-- [x] `Vaktr.Overlay/Hotkeys/GlobalHotkeyService.cs` — parses gesture string (`"Ctrl+Shift+F11"` → `MOD_CONTROL | MOD_SHIFT`, `VK_F11`); calls `RegisterHotKey` against the main Vaktr window HWND. Supports `Ctrl`, `Alt`, `Shift`, `Win` modifiers + letter / function / punctuation key.
-- [x] In `Vaktr.App/ShellWindow.Polished.cs`: get the shell HWND via `WinRT.Interop.WindowNative.GetWindowHandle(this)`; install a `SetWindowSubclass` callback (mirroring the existing `ResizeInterop` pattern); forward `WM_HOTKEY` (0x0312) to `_overlayController.OnHotkeyPressed`.
-- [x] Hotkey toggles overlay between forced-shown (`ShownByHotkey`) and auto (`ShownByGame` or `Hidden` depending on foreground).
-- [x] On `RegisterHotKey` failure (gesture conflict): write a friendly status message via the existing `_viewModel.StatusText` channel; do not crash.
-- [ ] **Test**: with no game in focus and overlay disabled, press hotkey → overlay appears with current metrics; press again → hides.
-
-## Step 6 — FPS source
-
-> **History**: this step first shipped an ETW DXGI source built on
-> `Microsoft.Diagnostics.Tracing.TraceEvent`, then swapped to `DwmFpsSource` to shed the admin
-> requirement and the package's native ARM64 dependency. That swap traded away correctness:
-> `DwmFlush` timing measures the **compositor's** cadence — the display refresh rate — and is
-> attributed to no process at all (its `pid` argument was unused). A game running 45 fps on a
-> 144 Hz panel reported 144. It only ever read correctly when the game happened to be v-synced
-> to the refresh rate.
->
-> Resolved by returning to present-based measurement, but written against the raw Win32 ETW
-> APIs instead of the `TraceEvent` package — those are plain `advapi32` entry points, so the
-> ARM64 concern that motivated the original swap does not apply. The admin requirement is
-> handled at install time instead of runtime (Step 6b).
-
-- [x] `Vaktr.Overlay/Fps/IFpsSource.cs` — `StartTracking(uint pid)`, `StopTracking()`, `FpsUpdated`, `ErrorOccurred`, and `FpsAccuracy Accuracy` so callers can tell an exact reading from an approximate one.
-- [x] `Vaktr.Overlay/Fps/EtwInterop.cs` — hand-rolled ETW consumer P/Invoke (`StartTrace`, `EnableTraceEx2`, `OpenTrace`, `ProcessTrace`, `ControlTrace`, `CloseTrace`) plus faithful `EVENT_TRACE_PROPERTIES` / `EVENT_TRACE_LOGFILE` / `EVENT_RECORD` layouts. No NuGet dependency, identical on x64 and ARM64.
-- [x] `Vaktr.Overlay/Fps/EtwPresentFpsSource.cs` — real-time session over `Microsoft-Windows-DXGI` (+ `Microsoft-Windows-D3D9` for older titles), counting present-start events attributed to the tracked PID. Rolling 1s window, emits at ≤2Hz, suppresses duplicate emits when ETW's ~1s buffer flush is slower than the emit timer, and reports a stall when a tracked game stops presenting.
-- [x] Recovers from a stale session left by a crashed process (`ERROR_ALREADY_EXISTS` → stop → retry once).
-- [x] `Vaktr.Overlay/Fps/AdaptiveFpsSource.cs` — probes ETW availability once, uses `EtwPresentFpsSource` when permitted and falls back to `DwmFpsSource` otherwise, raising `AccuracyChanged` so the UI can say which is live.
-- [x] `DwmFpsSource` retained as the documented fallback, with its comment corrected to state plainly that it measures refresh rate and not the game.
-- [x] **ARM64**: builds clean; no architecture-specific binary dependency.
-- [x] **Struct layout verified** against documented x64 offsets — all sizes and the fields ETW reads (`EVENT_TRACE_LOGFILE.EventRecordCallback` @ 424, `EVENT_HEADER.ProcessId` @ 12, etc.) confirmed correct.
-- [x] **Verified live**: two processes tracked simultaneously on one 144 Hz display reported genuinely different rates (VS Code GPU process steady at 144, Edge GPU process varying 43–100). The DWM source reports 144 for both, which is the bug this fixes.
-- [ ] **Test on a real game**: launch a game, verify FPS appears, matches an independent counter (Steam overlay / RTSS), and updates smoothly.
-
-## Step 6b — Install-time privilege grant
-
-- [x] `installer/vaktr-setup.iss` — at `ssPostInstall`, add the installing user to the built-in **Performance Log Users** group (by SID `S-1-5-32-559`, so it works on localised Windows). Setup already runs elevated, so this needs no extra prompt and Vaktr itself still runs unelevated.
-- [x] Non-fatal on failure: already-a-member and not-permitted both fall through to the approximate source rather than blocking install.
-- [x] `OverlayController` surfaces a one-time control-deck message when FPS is approximate, explaining that sign-out/sign-in is needed for the group to take effect.
-- [ ] **Test**: install on a machine whose user is not in the group → approximate FPS + status message; sign out and back in → exact FPS.
-- [ ] **Test**: portable/build-from-source run with no group membership → falls back cleanly, no crash, no elevation prompt.
-
-## Step 7 — Settings UI (Control Deck expansion)
-
-- [x] `Vaktr.App/Controls/IconFactory.cs` — add `"overlay"` icon glyph
-- [x] `Vaktr.App/ShellWindow.Polished.UI.cs` `RenderEditableControlDeck()` — add a second row to the existing 3-column grid containing one full-width-spanning OVERLAY card built via `CreateControlEditorCard()`. Header: icon `"overlay"`, title `"OVERLAY"`, summary value (dynamic), sub-caption (dynamic), accent color `"#7CE38B"`.
-- [x] Inside the card, top-to-bottom rows:
-  - **Row 1** — enable toggle + segmented `Simple / Advanced / Custom` mode chips + helper text
-  - **Row 2** (only when `Mode = Custom`) — five toggle chips: `FPS`, `CPU%`, `GPU%`, `GPU temp`, `Memory%`
-  - **Row 3** — left half: 4-chip corner picker (`↖ TL`, `↗ TR`, `↙ BL`, `↘ BR`); right half: hex-color `InlineTextEntry` with live validation
-  - **Row 4** — left half: font-size `InlineTextEntry` (10–32) + preset chips `12 / 14 / 16 / 20`; right half: opacity `InlineTextEntry` (30–100%) + preset chips `60% / 75% / 90% / 100%`
-  - **Row 5** — full-width hotkey `InlineTextEntry` + right-aligned `Reset` chip
-- [x] Add three helper functions in the same file:
-  - `CreateSegmentedChips<TEnum>(TEnum currentValue, params (TEnum value, string label)[] options)` — emits an array of `ActionChip` with one marked `IsActive`. Used for Mode and Corner.
-  - `CreateMultiSelectChips(IList<string> selectedKeys, params (string key, string label)[] options)` — used for Custom mode field picker.
-  - `CreateColorSwatch(string hex)` — small circular Border with parsed color background, used in summary view.
-- [x] Summary view (when control deck is collapsed): status line (`Off` or `On — Advanced @ Top Right`), hotkey line, color swatch.
-- [x] Add `_draftOverlay*` fields and OnChange handlers following the existing `_draftScrapeIntervalInput` pattern.
-- [x] Save flow: `OnSaveSettingsClick` validates → `_viewModel.ApplyConfig` → `_configStore.SaveAsync` → `ApplyRuntimeSettingsAsync` propagates to `_overlayController.ApplyConfig(config.Overlay)`.
-- [x] `_overlayController.ApplyConfig` diffs and only restarts subsystems that need it (re-register hotkey only on gesture change; restart PresentMon only on `Enabled` flip; etc.).
-
-## Step 8 — Multi-monitor + DPI hardening
-
-- [x] In `LayeredOverlayWindow`: call `SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)` immediately before `CreateWindowEx`. Handle `WM_DPICHANGED` by recalculating bitmap dimensions and re-rendering. Handle `WM_DISPLAYCHANGE` to reposition when monitors are added/removed.
-- [x] When a foreground game is detected, place the overlay on the same monitor as the game window: `MonitorFromWindow(gameHwnd, MONITOR_DEFAULTTONEAREST)` → use that monitor's work area for corner positioning.
-- [ ] **Test**: drag the main Vaktr window across monitors at different DPI; launch game on first monitor → overlay scales correctly; disconnect second monitor mid-session → overlay survives without crash.
-
-## Step 9 — Documentation + release prep
-
-- [x] `README.md` — add a short "Overlay" subsection under Features; state plainly that FPS is present-counted and document the sign-out/sign-in step
-- [x] `ROADMAP.md` — move "in-game overlay" from Roadmap to Done; correct the FPS description; carry HDR rendering and the UI/UX polish pass into v1.3.0
-- [x] Verify `dotnet build Vaktr.sln -c Release -p:Platform=x64` clean
-- [x] Verify `dotnet build Vaktr.sln -c Release -p:Platform=ARM64` clean
-- [x] All tests pass: `dotnet test Vaktr.Tests/Vaktr.Tests.csproj -c Release` (47/47)
-- [ ] Manual smoke matrix:
-  - Borderless-fullscreen modern game (Steam, Unreal/Unity title)
-  - Exclusive-fullscreen with FSO enabled (default)
-  - FSO-disabled game → overlay does not appear; tray tooltip warns
-  - Anti-cheat-protected (Valorant or CS2) — confirm game launches normally
-  - HDR game (note: overlay renders dim — known v1.2.0 limitation)
-  - Multi-monitor mixed-DPI: game on secondary monitor, overlay scales correctly
-  - [x] **FPS cross-check** — verified against Overwatch: the overlay read 143 FPS while Overwatch's own built-in performance counter read 143 in the opposite corner of the same frame. Also confirms the overlay paints correctly over a borderless anti-cheat-protected title (Overwatch runs Defence Matrix) with the game running normally.
-  - Repeat the cross-check on an **uncapped** title where the frame rate sits away from the refresh rate — Overwatch at 143 on a 144 Hz panel is close enough to the refresh rate that it does not by itself distinguish the ETW source from the old compositor-based one.
-  - **Uncapped frame rate**: confirm the reading tracks the game rather than pinning to the refresh rate — this is the specific failure the ETW source exists to fix
-  - **Frame-limited game** (cap set below refresh, e.g. 60 on a 144 Hz panel) → reads 60, not 144
-  - **D3D9-era title** → present events arrive on the D3D9 provider and FPS appears
-  - Alt-tab out and back repeatedly → FPS recovers each time, never sticks at `--`
-  - Two games running, focus switching between them → tracked PID follows focus
-- [ ] Resource budget: idle <250 MB / <2% CPU; gaming with overlay active <300 MB / <3% CPU
-- [ ] Tag `v1.2.0`, push, verify CI builds both x64 and ARM64 installers, draft GitHub Release populates with both `.exe` files
-
-## Known limitations shipping in v1.2.0
-
-- Exclusive fullscreen isn't supported — by design. Vaktr targets borderless and windowed-fullscreen games, which keeps the overlay from ever needing code-signing or elevated UIAccess.
-- HDR games render the overlay in SDR — appears dim. Defer HDR-aware rendering to v1.3.0.
-- Exact FPS needs Performance Log Users membership. The installer grants it, but Windows only picks up group changes in a freshly built logon token, so the **first session after install falls back to approximate FPS** until the user signs out and back in. The overlay says so in the control deck rather than showing a wrong number silently.
-- Portable / build-from-source runs get approximate FPS unless the user joins the group manually.
-- ETW real-time delivery is buffered, so the FPS reading trails live by roughly a second. Fine for a readout; not suitable for frame-time analysis. Injection-based overlays (RTSS) are lower latency by nature.
-- Present counting assumes one swapchain per frame. An application presenting multiple swapchains per frame would over-report; this is normal for browsers and compositors but rare for games.
-- ~~ARM64 FPS depends on PresentMon ARM64 build availability~~ — resolved. The hand-rolled ETW layer uses only `advapi32` entry points.
-- ~~No color picker control in v1.2.0 — hex input only~~ — resolved. Color picker with quick presets shipped.
-- ~~FPS reads the refresh rate rather than the game's frame rate~~ — resolved in Step 6.
-- ~~Overlay latches to `FPS: --` after any transient FPS error and never recovers~~ — resolved; a live reading now clears the error state.
+**Responsive.** Saved `W` is honoured at full width; below breakpoints panels are clamped wider
+(half, then full) so a narrow window stacks instead of producing unreadable slivers.
 
 ---
 
-# Step 10 — UI/UX polish and smoothness pass
+## Step 1 — Geometry model and persistence
 
-The functional surface of v1.2.0 is complete. This step is about how the app *feels*: nothing
-should snap, stutter, jump, or leave the user guessing what a control does. Every task below is
-anchored to code that exists today.
+- [x] `Vaktr.Core/Models/PanelLayout.cs` — `{ X, Y, W, H }` with clamping. Width clamps before X
+      so an over-wide panel shrinks rather than being shoved off the left edge.
+- [x] `VaktrConfig.PanelLayouts: Dictionary<string, PanelLayout>`; normalizes invalid entries.
+- [x] Migration via `GridLayoutEngine.FromLegacy` — runs at placement time, not in `ApplyConfig`,
+      because the panel list is not populated yet when config is applied.
+- [x] Tests: clamping, legacy packing (3 standard panels per row), free-slot search.
 
-Ordering note: 10.1 and 10.2 are the two the user actually feels every session. Do those first.
+## Step 2 — Layout engine
 
-## 10.1 — Value motion (no more snapping)
+- [x] `Vaktr.Core/Models/GridLayoutEngine.cs` — pure, no XAML (lives in Core so it is directly
+      testable): `Resolve`, `Move`, `Resize`, `FindFreeSlot`, `FromLegacy`. Push-down displacement
+      then upward compaction; the dragged panel is pinned first so it keeps the cell it was
+      dropped on.
+- [x] 12 engine tests: push down not sideways, compaction, determinism/stability, move displaces
+      occupant, resize clamping, and 14 panels dropped on one cell (the push-down loop's
+      pathological case).
 
-Numbers and gauges currently jump straight to their new value. `TelemetryPanelCard` already has a
-full easing vocabulary (28 `DoubleAnimation` uses); the gauges and readouts never got the same
-treatment.
+## Step 3 — Render fixed geometry
 
-- [x] `Vaktr.App/Controls/Motion.cs` — shared motion primitives. `MotionTicker` holds exactly one
-  process-wide `CompositionTarget.Rendering` subscription, attaching on the first active animator
-  and detaching when the last one settles, so a static dashboard costs nothing. `AnimatedDouble`
-  eases toward a target and retargets mid-flight from its current value rather than restarting.
-- [x] `UsageGauge` — the value arc now eases over 300 ms with ease-out-cubic instead of snapping.
-- [x] `UsageGauge` — retained geometry. `Redraw` used to `Children.Clear()` and allocate a fresh
-  `Path` + `PathGeometry` + `PathFigure` + `ArcSegment` pair every call; the arcs are now built
-  once per size/theme change and the value arc mutates its existing `ArcSegment`. This is what
-  makes 60 fps animation affordable — the per-frame path is allocation-free.
-- [x] Animation duration (300 ms) stays well under the fastest scrape interval (1 s), so a gauge
-  is never permanently mid-flight.
-- [x] Numeric readout tweens with the arc, and the format moved from `0.#` to integer percent —
-  the old format alternated between `45%` and `45.3%` as the fraction crossed zero, which jittered
-  a centred readout and would have done so every frame once animated.
-- [x] Zero-value arcs collapse instead of painting a stray round-cap dot at the 135° origin.
-- [x] Respect the OS reduce-motion setting via `UISettings.AnimationsEnabled` — when off,
-  `AnimatedDouble` degrades to an immediate snap.
-- [x] `SetRenderingSuspended` and `Unloaded` stop the animator so a frozen or removed gauge can't
-  hold the render tick open.
-- [ ] Extend the same treatment to the panel-card current-value readouts.
+- [x] `_dashboardGrid`: 12 star columns, fixed 48px rows.
+- [x] Cards placed by `Grid.SetColumn/Row/ColumnSpan/RowSpan` from resolved geometry.
+- [x] Responsive clamping derived from measured width (the breakpoint *count* is 0 on first
+      placement and forced everything full width).
+- [x] Card `MinHeight` 320 → 140 and `VerticalAlignment` Stretch so height comes from `H`.
+- [x] Fixed a rebuild loop: `ReorderDashboardPanelsInPlace` compared the grid's column count
+      against the responsive breakpoint count (1-3), which never matches 12, so every reorder
+      queued a rebuild that queued another.
+- [x] Kept the existing **Size** chip working by translating presets into geometry through the
+      engine — otherwise it silently became a no-op.
+- [ ] Verify small `H`: charts/gauges/process tables at the minimum allowed height.
 
-## 10.2 — Chart interaction smoothness
+## Step 4 — Edit mode shell
 
-> **Correction**: an earlier draft of this section claimed drag-zoom caused a full XAML teardown
-> per pointer move, and that hover used a linear point scan. Both were wrong — reading the code
-> showed the selection rectangle already lives on its own retained `_interactionCanvas` and never
-> triggers a chart redraw, and `FindNearestPoint` is already a binary search. The real cost was
-> event *frequency*, not per-event work.
+- [x] `Edit layout` / `Done` + `Cancel` chips in the board section header.
+- [x] `_isLayoutEditMode` gates everything; geometry snapshotted on entry for Cancel.
+- [x] Edit affordances: accent card borders and a visible corner handle. Verified by screenshot.
+- [x] **Critical gate done:** the handle layer is `Visibility.Collapsed` *and*
+      `IsHitTestVisible = false` outside edit mode, `_chart.IsHitTestVisible` is restored, and the
+      header drag returns early. Verified the handles disappear on Done.
+- [ ] Still to prove by hand: chart drag-to-zoom after saving a layout.
+- [ ] Nice-to-have: grid overlay while editing, so target cells are visible.
 
-- [x] Coalesce pointer moves to one visual update per rendered frame. A 1000 Hz mouse raises
-  `PointerMoved` far more often than the compositor draws, and every hover update rebuilt the
-  tooltip string and ran a `Measure()` layout pass. Cheap state (`_selectionCurrentX`) is still
-  written synchronously so `CompleteSelection` always sees the true release position; only the
-  expensive visual work is deferred.
-- [x] Cancel the queued flush on `PointerExited`, `Unloaded`, and selection completion so a chart
-  can't leak a render-tick subscription.
-- [x] ~~Separate the interaction overlay onto its own canvas~~ — already the case.
-- [x] ~~Replace the linear hover scan~~ — already a binary search.
-- [ ] Profile a drag-zoom on a busy panel (per-core CPU, all series visible) and record before/after
-  frame times. The coalescing change is sound in principle but is currently unmeasured.
-- [ ] Retain and mutate the data-layer `Path`/`PathGeometry` objects across redraws instead of
-  clearing and reallocating. This is per *scrape*, not per pointer move, so it is a lower priority
-  than it first appeared — but it still allocates a full path set every 2 s per panel.
-- [ ] Animate zoom range changes (including preset-range clicks and double-click reset) so the
-  viewport eases rather than cutting.
+## Step 5 — Drag to move
 
-## 10.3 — Overlay HUD polish
+- [x] Pointer capture + render-transform translation already existed from the legacy reorder.
+- [x] Drop converts the card's pixel `DragOffset` into grid cells and calls `GridLayoutEngine.Move`.
+- [x] Legacy swap-reorder suppressed in edit mode so the two cannot disagree about one gesture.
+- [ ] **Untested by hand.** Displaced panels currently snap to their new cells rather than
+      animating — add the reflow animation once the gesture is confirmed correct.
+- [ ] Live preview while dragging (the move is currently only applied on drop).
 
-Grounded in `Vaktr.Overlay/Rendering/OverlayBitmapRenderer.cs` and `OverlayController.BuildLines`.
+## Step 6 — Drag to resize
 
-- [x] **Column alignment**: `OverlayLine` (label / value / colour) replaces the pre-joined string,
-  and the renderer measures the widest label once per pass to fix the column every value starts at.
-  Values no longer sit ragged behind labels of wildly different widths.
-- [x] **Label / value hierarchy**: labels draw at 72 % alpha of the configured colour, values at
-  full strength, so the numbers read first.
-- [x] **Colour-coded thresholds**: CPU / GPU / memory use the dashboard's exact `WarningBrush`
-  (#F0C968, >75 %) and `CriticalBrush` (#FF9761, >90 %) values; GPU temperature uses 75 °C / 85 °C
-  bands. Verified by rendering the HUD over a mixed bright/dark backdrop.
-- [ ] **Fade in/out**: `LayeredOverlayWindow.Show()` / `Hide()` pop instantly. Ramp
-  `UpdateLayeredWindow`'s `SourceConstantAlpha` over ~150 ms so the HUD arrives and leaves softly.
-  Note `UpdateLayeredWindow` accepts a null source DC to change blend alone, so the fade does not
-  need a full DIB re-blit per step — this needs an interop overload that passes `IntPtr.Zero`.
-- [ ] **Metric cadence**: FPS refreshes at 2 Hz but CPU/GPU/memory come from `CollectorService` at
-  the scrape interval (2 s default), so half the HUD is visibly stale. Either give the overlay its
-  own lightweight faster sampler for the three cheap counters, or interpolate between snapshots.
-  Decide explicitly — do not leave the mismatch.
-- [ ] **Optional scrim**: outlined text is unreadable over high-contrast, high-detail scenes. Add
-  an opt-in subtle rounded background at low alpha; keep "none" the default so the current clean
-  look is preserved.
-- [ ] **Live preview in the control deck**: render the actual overlay bitmap into the OVERLAY card
-  so corner, colour, size, and opacity changes are visible without launching a game. The renderer
-  is already decoupled enough to call directly — the scratch harness used during this step rendered
-  it straight to a PNG.
+- [x] **All 8 handles**: 4 edges + 4 corners, each with the correct cursor. Edges are inset by the
+      corner size so a corner hotspot is reachable along its whole length — previously the edge
+      handles covered the corners and the diagonal cursors only appeared in stray pixels.
+- [x] Corner grips render at 32% opacity in edit mode, 95% on hover. Invisible-until-hover hides
+      the affordance: you have to already know the grip is there to find it.
+- [x] Left/top edges move position and size together, so the opposite edge stays anchored.
+- [x] Min/max enforced by `PanelLayout.Normalize`, with left/top clamped before applying so a
+      panel cannot invert through its own minimum.
 
-## 10.4 — Control deck intuitiveness
+### Fix pass 1 — compounding, thrash, and edge expression
 
-- [ ] Settings currently apply only on Save. Live-preview colour, font size, and opacity as the
-  user edits them, reverting on Cancel — editing a HUD you cannot see is the least intuitive part
-  of the current flow.
-- [ ] Show the resolved FPS source state (`OverlayController.FpsAccuracy`) in the OVERLAY card, with
-  the sign-out/sign-in remedy inline when it reads Approximate. Today that only appears as a
-  transient status line.
-- [ ] Validation is currently pass/fail on Save. Show inline, per-field validation as the user
-  types, with the acceptable range stated next to the field rather than discovered by failing.
-- [ ] Hotkey capture: let the user press the combination to record it instead of typing
-  `"Ctrl+Shift+F11"` as free text, and flag conflicts at capture time rather than at registration.
-- [ ] Make the disabled state legible — when the overlay is off, visibly de-emphasise the rest of
-  the card instead of leaving live-looking controls that do nothing.
+1. **Compounding deltas (the glitching).** The handle reports a delta absolute from pointer-down,
+   but the shell added it to the *live* geometry it had already been mutating. Move one cell →
+   `W=5`; move two → `W=5+2=7` instead of 6. Fixed by capturing geometry at drag start. Covered by
+   `Apply_Repeated_Growth_Does_Not_Compound`.
+2. **`Resize` could not express an edge drag.** Dragging a left edge changes X *and* W together.
+   Added `GridLayoutEngine.Apply(key, layout)`; `Move`/`Resize` are now wrappers over it.
+3. **Missing corner cursors.** Only 3 handles existed, and the edge handles covered the corners so
+   diagonal cursors appeared in stray pixels. Now 8 handles with edges inset by the corner size.
 
-## 10.5 — Window and layout transitions
+### Fix pass 2 — the flicker (architectural)
 
-- [ ] Panel reflow between the 1/2/3-column breakpoints currently cuts. Animate position and size
-  through the reflow so a window resize reads as continuous.
-- [ ] Panel drag-reorder: add a clear drop-target indicator and animate the displaced panel into
-  its new slot rather than swapping instantly.
-- [ ] Theme switch is instant; cross-fade brush changes over ~200 ms.
-- [ ] Audit first-paint: confirm the loading sequence hands off to the dashboard without a flash of
-  unstyled or empty panels.
+Coalescing reflow to one per frame was not enough: **reflowing the real grid during a gesture at
+all** is the wrong model. Re-spanning grid cells re-measures the dragged card, its chart, and all
+13 siblings on every update.
 
-## 10.6 — Accessibility and input
+Replaced with the standard editor pattern (react-grid-layout, Grafana):
 
-- [ ] Keyboard-drive the whole control deck: tab order, visible focus rings on `ActionChip` and
-  `InlineTextEntry`, Enter/Escape to commit/cancel.
-- [ ] Chips currently read as generic elements to a screen reader — set `AutomationProperties.Name`
-  and a toggle-appropriate control pattern on `ActionChip`.
-- [ ] Verify WCAG AA contrast still holds for any new state colours added in 10.3/10.4, in both
-  themes. v1 claimed AA compliance; keep it true.
-- [ ] Charts convey series only by colour — add a non-colour affordance (dash pattern or marker)
-  for colour-blind users.
+- [x] The dragged card leaves grid layout for the gesture: explicit pixel size, pinned top-left,
+      raised z-index, so it grows over neighbours without moving them.
+- [x] Size feedback is **continuous and un-snapped** — the panel tracks the pointer exactly.
+      Snapping the card itself is what made it feel steppy.
+- [x] A cheap `Border` placeholder (no chart, no text) shows the snapped destination cell. Only
+      the placeholder moves through the grid during the gesture.
+- [x] Chart and gauge rendering suspended on the dragged card — redrawing mid-gesture is wasted
+      work and the most visible flicker source.
+- [x] Exactly **one** layout pass, on release.
+- [x] Drag-to-move gets the same placeholder preview.
+- [x] Leaving edit mode mid-gesture restores a stranded card rather than leaving it floating.
 
-## 10.7 — Perf guardrails
+This matches Apple's HIG split between **direct manipulation** (immediate, visible, proportional
+response — the card follows the pointer exactly) and **feedback** (communicating the result —
+the placeholder shows where it will land).
 
-- [ ] Measure idle and gaming CPU/memory after 10.1–10.3 and confirm the v1.2.0 budget still holds
-  (idle < 250 MB / < 2 %; gaming < 300 MB / < 3 %). Animation work cuts directly against this —
-  measure, don't assume. **Not yet measured.**
-- [x] Motion is architecturally guaranteed to settle: `MotionTicker` detaches its
-  `CompositionTarget.Rendering` handler when the last animator finishes, so a dashboard showing
-  static values has no render subscription at all. Still worth confirming empirically above.
-- [ ] Add the ETW struct-layout assertions to a real test project so the interop ABI is locked
-  down permanently. Requires bumping `Vaktr.Tests` to `net8.0-windows10.0.19041.0` and adding a
-  `Vaktr.Overlay` project reference (verified during Step 6 with a scratch harness, but not yet a
-  standing test).
+## Step 7 — Save / Cancel
 
-## 10.8 — Visual density pass (nested boxes)
+- [x] `Done` writes `PanelLayouts` through the debounced persist path — verified, 14 entries.
+- [x] `Cancel` restores the entry snapshot and re-renders.
+- [x] Leaving edit mode re-enables chart interaction.
+- [ ] Cancel untested by hand (needs a real drag to revert).
 
-The dominant reason the dashboard read as busy rather than sleek: almost every element drew its
-own outline, so a chart appeared as a rectangle inside a rectangle inside a card inside a panel.
-Fixing density is mostly deletion — the spacing and colour work was already sound.
+## Step 8 — Verify
 
-- [x] **Legend rows** (`TelemetryPanelCard.CreateLegendRow`) — were an inset fill + 0.8px outline
-  + radius 11 each. A 16-core CPU panel drew 16 of them, which is what made that card look like a
-  stack of boxes. Now transparent and borderless, with a subtle hover fill as the only affordance.
-  Click-to-isolate still works; focus state was always carried by `Row.Opacity`, not the border.
-- [x] **Chart plot outline** (`TelemetryChart._plotFrame`) — stroke removed. The inset fill alone
-  separates plot from card.
-- [x] **Chart frame** (`TelemetryPanelCard._chartFrame`) — border removed; it was drawing a second
-  rounded rectangle a few pixels outside the plot surface's own.
-- [x] **Range / sort chips** (`ActionChip`) — inactive chips keep their surface fill but lose their
-  outline, so `1m / 5m / 15m / 1h` reads as one segmented control with the selection bordered and
-  filled, rather than four competing buttons. Inactive labels drop to secondary text weight so the
-  active range is obvious at a glance. Focus ring is preserved unconditionally.
-- [x] **Scale caption** (`_scalePill`) — "100% ceiling · 100.8k handles" is a caption, never
-  clickable; unboxed so it stops competing with the real controls beside it.
-- [x] **Single-series legends** — a one-row legend repeating the header value is removed, along
-  with its divider. Affects CPU Total, Memory, GPU Memory, GPU Temperature, and both drive panels.
-- [x] **Footer replay caption** — hidden unless zoomed. Unzoomed it said "1h replay", duplicating
-  the highlighted range chip; zoomed it reports the real span, which nothing else shows.
-- [x] **Section filler text** — "Current node snapshot." / "Real-time telemetry panels." dropped;
-  the eyebrow already names the section and the cards below show what they are.
-- [x] Process rows examined and **deliberately left alone** — they already use a 0.4px bottom
-  hairline with a Grafana-style gradient meter fill, which is good design, not clutter.
+- [ ] Resize the window across all breakpoints with a saved layout — no overlap, no clipping.
+- [ ] Restart: layout restored exactly.
+- [ ] **Chart drag-zoom works after saving a layout** (the regression this feature most risks).
+- [ ] Reduced-motion honoured for reflow animation.
+- [ ] Panel reflow stays smooth with 14 panels; no layout thrash during drag.
 
-**Verified in the running app** (captured with `PrintWindow`, no focus steal): legend rows, chart
-outlines, segmented chips, and single-series legend removal all confirmed visually against the
-previous `Assets/dashboard.png`. The scale caption, chart frame, footer caption, and section-filler
-changes are built and tested but **not yet seen running** — they are the same class of change as
-the verified ones, but should be eyeballed on next launch.
+---
 
-### Still open after this pass
+## Picking this up
 
-- [ ] **Dead vertical space**: cards stretch to match the tallest in their row, so panels without a
-  process table (GPU Memory, the drive panels) show a large empty region. Either let cards size
-  independently or give the short panels something to fill with. Biggest remaining layout problem.
-- [ ] **Header block**: logo + "Vaktr" + "SYSTEM TELEMETRY DASHBOARD" consumes a lot of vertical
-  space above the fold for little information.
-- [ ] **Process table chrome**: section label + sort chips + PROCESS/DETAILS/VALUE header is three
-  rows of furniture above a simple list.
-- [ ] A stray horizontal scrollbar artifact appears under the process list at some widths.
+**State:** builds clean on x64 + ARM64, 71/71 tests. Board renders from saved geometry; the Size
+chip still works. Nothing is worse than before this feature started.
 
-## 10.9 — Design pass (making it look designed, not plotted)
+### Where things are
 
-10.8 removed clutter but the result still read as generic: decluttering is subtraction, and nothing
-had been added back. Three things were actually making it look basic.
+| Thing | File |
+|---|---|
+| Geometry model | `Vaktr.Core/Models/PanelLayout.cs` |
+| Collision engine (pure, testable) | `Vaktr.Core/Models/GridLayoutEngine.cs` |
+| Engine tests | `Vaktr.Tests/GridLayoutEngineTests.cs` |
+| Geometry state + migration | `DashboardViewModels.EnsureLayoutsFor` / `ApplyPlacements` |
+| Placement into the grid | `ShellWindow.Polished.cs` → `PlaceDashboardPanels` |
+| Drag-to-reorder (existing, pre-dates this) | `TelemetryPanelCard` drag handlers |
 
-### Strokes were wireframe, not hairline
+### The engine already does the hard part
 
-The dark palette's strokes were saturated mid-blues at high contrast — `#28445E` shell, `#315274`
-surface, `#426A8C` grid. Every card, chip, and gridline therefore drew a *visible outline*, which
-is what made the dashboard look like a technical diagram rather than a designed surface.
+`Move(panels, key, x, y)` and `Resize(panels, key, w, h)` return a fully resolved board with the
+dragged panel pinned to its target cell. Step 5/6 only need to convert pointer position into grid
+units, call these, and animate cards to the result. Do **not** re-implement collision in the UI
+layer — it is the part that is already proven.
 
-- [x] `SurfaceStroke` `#315274` → `#1E2835`, `ShellStroke` `#28445E` → `#18212D`. Separation now
-  comes from surface elevation; the stroke only catches the edge.
-- [x] `SurfaceGrid` `#426A8C` → `#1A222D`. Gridlines should be felt, not read.
-- [x] `TextMuted` `#8098B2` → `#7C8B9E` — slightly desaturated so metadata stops competing.
-- [x] Light theme matched: strokes `#C8D2DE` → `#E3E9F0`, `#CAD4DF` → `#DFE6EE`, grid `#C7D2DE` →
-  `#E7ECF2`.
+Pixel to grid: `col = round(pointerX / (gridWidth / 12))`, `row = round(pointerY / 48)`.
 
-### Type hierarchy had no focal point
+### Traps already hit — do not re-learn these
 
-Card title was 15.5px against a 28px value — only **1.8x** apart. Nothing dominated, so every panel
-read as a wall of similarly-weighted text.
+- **Never compare `_dashboardGrid.ColumnDefinitions.Count` against `DetermineDashboardColumns()`.**
+  The grid is always 12; that helper returns the responsive breakpoint count (1-3). Mismatching
+  them caused an infinite rebuild loop.
+- **Responsive clamping must read measured width**, not the breakpoint count — the count is 0 on
+  first placement and forces every panel full width.
+- **Do not assign geometry in `ApplyConfig`.** The dashboard panel list is not populated yet.
+  `EnsureLayoutsFor` runs from the render path for this reason.
+- **Writing a bad layout poisons the config.** `%LocalAppData%\Vaktr\vaktr-settings.json` →
+  delete the `panelLayouts` key to reset the board while iterating.
 
-- [x] Title demoted to an eyebrow: 10.5px SemiBold, `CharacterSpacing` 95, uppercased
-  ("CPU Total" → "CPU TOTAL"), secondary text colour, single line. It identifies the panel and
-  gets out of the way.
-- [x] Value promoted to hero: 28px → **36px**, `CharacterSpacing` -12 → **-28**. Negative tracking
-  on large numerals is the detail that separates a designed readout from a big default font size.
-- [x] Ratio is now ~3.4x. There is a clear focal point per card.
+### Step 4's real risk
 
-### Charts were washed out
+Chart drag-zoom shares the pointer with any move/resize affordance. Handles must be
+`IsHitTestVisible = false` outside edit mode — not merely invisible. Verify by dragging a time
+range on a chart *after* saving a layout; that is the regression this feature most likely causes.
 
-The area gradient topped out at alpha 64 and was then multiplied by a 0.7 layer opacity — landing
-near 18%, enough to tint the plot bed but too weak to give the trace any body.
+### Verifying UI changes in this repo
 
-- [x] Gradient richer at the crest and falling away faster: `64→12→0` at offsets `0/0.7/1` becomes
-  `120→38→0` at `0/0.45/1`.
-- [x] Single-series fills render at full opacity (was 0.7); multi-series drop to 0.45 so
-  overlapping fills don't turn to mud.
-- [x] Stroke weight up for sparse series: `2.0/1.7/1.35` → `2.4/1.9/1.4`.
+`dotnet` is not on PATH — use `C:\Program Files\dotnet\dotnet.exe`. Kill `Vaktr.exe` before
+building or the DLL copy fails.
 
-**Status: built clean on x64 + ARM64, 47/47 tests pass, but NOT yet seen running.** This is a
-larger visual change than 10.8 and the type hierarchy in particular should be eyeballed — the
-36px hero value with `NoWrap` + ellipsis needs checking against the longest strings
-("27.2 GiB used", "Drive C: Capacity") at the narrow 1-column breakpoint.
+Screenshot without stealing focus (the user games on this machine — never force foreground):
+`PrintWindow(hwnd, hdc, 2)` against the `WinUIDesktopWin32WindowClass` window. Synthesised clicks
+(`mouse_event`, `SendInput`, UIA) have been unreliable here; prefer a temporary env-var flag that
+drives the app into the state you need, then capture.
 
-### Still open
+When layout looks wrong but `ActualWidth` looks right, paint container backgrounds a solid colour
+and screenshot — that localised the ScrollViewer zoom bug in one step after a long hunt.
 
-- [ ] **Card depth.** Cards are flat fills with a hairline. Real elevation — a soft shadow under
-  each card — is the remaining lever for making them feel like objects rather than regions.
-  WinUI `ThemeShadow` + `Translation` is the mechanism; `TelemetryPanelCard` already animates
-  `Translation` on hover, so the hook exists.
-- [ ] **Backdrop depth.** The shell is a flat fill. A very subtle radial gradient behind the
-  content would stop the background reading as a void.
-- [ ] Dead vertical space, header block, and process-table chrome (carried from 10.8).
+---
+
+# UI/UX Audit
+
+A deliberate pass over the whole surface rather than spot fixes. Items below are grounded in
+things actually observed in this codebase — not a generic checklist.
+
+## A — Button and control organisation
+
+- [ ] **Card header is the busiest element left.** Every panel carries `Processes | Size | 15m` as
+      three separate pills. Decide: collapse into one overflow menu (Grafana-style kebab), make
+      them icon-only, or show them on hover. Three equal-weight pills per card × 14 cards is the
+      single largest source of visual noise.
+- [ ] Audit chip *grouping* semantics: range chips are a segmented control (one choice of four),
+      but `Processes` is a toggle and `Size` opens a picker. Three different behaviours currently
+      share one visual treatment.
+- [ ] Decide where global vs per-panel controls live. The global range chip sits in the section
+      header while per-panel range sits in each card — confirm that reads as a hierarchy.
+- [ ] Settings "Edit" button placement and label consistency against the new board Edit button.
+
+## B — Startup animation
+
+- [ ] Re-time after the Step 1-3 grid change: the cascade was tuned for flowing rows, and fixed
+      geometry may want a different order (top-left outward rather than list order).
+- [ ] Decide whether summary cards and panels should share one cascade or read as two groups.
+- [ ] Confirm the loading screen → dashboard handoff has no flash of unstyled/empty panels.
+- [ ] Verify `UISettings.AnimationsEnabled` is respected on *every* animated path, not just
+      `Motion` (panel card Storyboards and the new drop settle included).
+
+## C — Hover and focus
+
+- [ ] Sweep for any remaining hover handler that touches a layout property. `BorderThickness` was
+      fixed in three places; audit `Margin`, `Padding`, `Width`, `FontSize` for the same mistake.
+- [ ] Unify hover vocabulary. Cards lift 1px, chips scale on press, legend rows change background,
+      process rows brighten a gradient — four different idioms. Pick a system.
+- [ ] Focus rings: `ActionChip` has one; confirm `InlineTextEntry`, legend rows, process rows and
+      nav buttons are all keyboard-reachable and visibly focused.
+- [ ] Hit targets: verify chips and rows meet a sensible minimum height for pointer accuracy.
+
+## D — Panel dragging
+
+- [ ] Drag affordance is currently invisible until you try it. Needs a grip cue (on hover, or in
+      edit mode once Step 4 lands).
+- [ ] Drop target indication: confirm where a panel will land *before* releasing.
+- [ ] Verify the drop settle animation tuning once drag is exercised by hand (untested).
+- [ ] Decide whether dragging stays available outside edit mode or becomes edit-only — currently
+      reorder-drag and the new edit mode would overlap.
+
+## E — Charts
+
+- [ ] **Cold start looks broken.** On first launch the plot is empty across most of its width
+      until history accumulates. Either clamp the axis to available data or show an explicit
+      "collecting" state — this is the first thing a new user sees.
+- [ ] Last-point marker: 14px glow ellipse at 0.22 opacity plus a 5.5px dot. Review whether the
+      glow still reads correctly against the richer gradient fill (now `120→38→0`).
+- [ ] Review area fill opacity for multi-series panels (CPU Cores, 16 overlapping fills at 0.45) —
+      check it does not turn to mud.
+- [ ] Gridlines are now near-invisible hairlines; confirm they still orient the eye at large `H`.
+- [ ] Series colour palette is blue-heavy (CPU cyan, GPU blue, Network blue, System blue). Disk
+      moved to violet for threshold reasons; consider whether the rest needs separating.
+- [ ] Non-colour series differentiation for colour-blind users (dash pattern or marker).
+
+## F — Typography
+
+- [ ] The eyebrow/hero treatment (10.5px tracked label over a 36px tight value) was applied to
+      panel cards only. Audit summary cards, settings cards and section headers for the same
+      hierarchy — right now they each set their own sizes.
+- [ ] Consolidate the type scale. Sizes currently range across 9.5/10/10.5/11/11.5/12.5/13/15.5/
+      22/36 set ad hoc at call sites; define a small named scale and use it.
+- [ ] Mixed font families: `Bahnschrift` for numerals, `Segoe UI Variable Text/Display` for UI.
+      Confirm that is intentional and applied consistently.
+- [ ] Verify tabular figures everywhere a number updates live, so values do not reflow.
+
+## G — Consistency and theming
+
+- [ ] Audit all 8 themes, not just Dark. Sweep for remaining hardcoded hex fallbacks that drift
+      when the palette changes (this already bit `ActionChip` and `InlineTextEntry`).
+- [ ] Verify WCAG AA contrast for text and threshold colours in every theme — `Nord` and
+      `Sandstone` are the lowest-contrast and most likely to fail.
+- [ ] Corner radius inventory: 3/8/9/10/11/14/16/20 appear across controls. Reduce to a scale.
+- [ ] Spacing inventory: confirm padding and gaps come from shared constants rather than literals.
+- [ ] Confirm threshold colours are reserved for thresholds everywhere (the Disk accent collision
+      was one instance; check gauges, summary bars and the overlay agree).
+- [ ] Empty, loading and error states: give them the same care as the populated state.
+
+---
+
+# Audit findings
+
+Two read-only audits (performance/correctness, and UI/UX against Apple's HIG). Items marked `[x]`
+were fixed in this pass; the rest are ranked and ready to pick up.
+
+## P0 — fixed
+
+- [x] **Crash on "Show processes."** `ActionChip.ApplyPressScale` ran from all 11 `UpdateVisualState`
+      call sites, starting a Storyboard on every hover, focus, `IsActive`/`IsFilled` change and
+      theme refresh. One click cascaded into a storyboard flood across every chip. Now only
+      animates on a real press transition. Verified with 40 rapid toggles.
+- [x] **UI-thread deadlock on close.** `OnWindowClosed` blocked on `_pendingHistoryLoad`, whose
+      continuation was posted back to the very `DispatcherQueue` it was blocking. Closing during a
+      long-retention history load hung the process with no window and no exit. Now
+      `ConfigureAwait(false)` + an explicit marshal back, and the close wait is bounded to 2s.
+- [x] **Leaked kernel ETW session.** Every failure path after a successful `StartTrace` freed the
+      properties buffer and zeroed the handle without stopping the session, leaving
+      `VaktrFpsSession` live with DXGI+D3D9 enabled for the rest of the OS boot — and
+      unrecoverable, since `StopTracking` then early-returns. `Cleanup` now stops first.
+- [x] **Native callback could be collected mid-trace.** The delegate field is the only GC root for
+      the thunk ETW holds; it was nulled after a 2s join timeout even if `ProcessTrace` had not
+      returned. Next event → access violation on the consumer thread. Root is now kept unless the
+      consumer demonstrably exited (join raised to 5s).
+- [x] **Off-screen panel gate never engaged.** `EffectiveViewport` is in the element's own
+      coordinate space, so `Width > 0 && Height > 0` was true even for panels scrolled far away —
+      all 14 panels kept redrawing charts when four were visible. Now an intersection test.
+- [x] **Zombie cards.** `TelemetryPanelCard` never unsubscribed from its view model, and the view
+      models are permanent — every toggled-off panel stayed alive redrawing its chart forever.
+      Added `Unloaded` detach.
+- [x] **Blocking file I/O per overlay frame, during gameplay.** `OverlayLog.Write` did a
+      synchronous open/append/close on the overlay message-loop thread 2-3×/second while gaming,
+      from four threads, unbounded in size. Now off by default (`VAKTR_OVERLAY_LOG=1`), queued,
+      single background writer, size-capped.
+- [x] **Panels could be resized into overlap.** `ApplySizePreset` forced `MinHeight` 280-392px
+      while the grid reserved only `MinHeight = 3` rows (144px). Grid floor raised to 7 rows
+      (336px) and the per-preset override removed, so the two floors agree.
+- [x] **Wrong-axis clamp.** `UpdateResizePreview` clamped *width* with `MinHeight / 2`.
+- [x] **Two contradictory drop previews.** A proximity swap highlighted a neighbour ("I'll swap
+      with this") while the authoritative placeholder said otherwise — and the swap was discarded
+      in edit mode anyway, so the louder preview was simply wrong. Dead path removed entirely.
+- [x] **Hover erased the edit affordance.** `SetHoverState` was not gated on edit mode, so moving
+      the pointer toward a panel wiped the accent border telling you it was draggable.
+- [x] **`MotionTicker` had no per-callback exception isolation.** One throwing animator aborted
+      the whole frame, was never removed, and threw again at 60Hz forever.
+
+## P1 — performance, not yet done
+
+- [ ] **`TelemetryChart.Redraw` rebuilds ~4,400 XAML objects per scrape** (~9,000/s at a 1s
+      interval). One `LineSegment` *per point*, twice when a fill is drawn, plus a full grid
+      rebuild even when only data changed. Two fixes: a single `PolyLineSegment` with a mutable
+      `PointCollection` (N→1 objects, and retainable the way `UsageGauge` already retains its
+      `ArcSegment`), and a separate dirty flag for the grid. **Highest-value remaining item.**
+- [ ] Summary-card meter sets `Width` every snapshot — use `ScaleTransform.ScaleX`.
+- [ ] `GridLayoutEngine.Compact` is O(n²·Y) walking one row at a time with a clone per step
+      (~15,000 overlap tests per drop). A per-column skyline makes it O(n·W).
+- [ ] Hover tooltip rebuilds strings and re-measures every frame; cache on anchor timestamp.
+- [ ] Collector: `CollectAsync` is synchronous so its timeout can never fire; shutdown disposes
+      the collector without awaiting the loop task (races the PDH buffer).
+- [ ] The 5s resize safety timer is never cancelled and can abort a second resize mid-gesture.
+- [ ] `ThemeVisuals.ResolveBrush` does a `ResourceDictionary` probe ~150×/scrape; cache it.
+- [ ] Snapshot handoff fields are cross-thread without `volatile`/`Interlocked`.
+- [ ] GDI handles leak on the overlay's exception path (no try/finally); `Dispose` never calls
+      `DestroyWindow`.
+- [ ] `Marshal.GetLastWin32Error()` read from P/Invokes declared without `SetLastError = true` —
+      the reported codes are garbage and will mislead the next ETW/ULW investigation.
+
+## P1 — UI/UX, not yet done
+
+- [ ] **Promote `Motion.cs` to a real token set** (durations + 2 easings) and route hover, edit-mode
+      entry, process expand/collapse, legend dim, threshold colour and view switching through it.
+      The app currently has **7 animations total**; nearly every deliberate state change snaps.
+      This is the bulk of the "extremely smooth" gap.
+- [ ] Reduced motion is honoured in only 3 of 7 animations, and `AnimationsEnabled` caches once
+      per process and never refreshes.
+- [ ] `InlineTextEntry` simulates a text box: no caret, selection, arrow keys, Ctrl+A/C/V, IME or
+      undo — and it governs every settings field. Biggest interaction-correctness debt.
+- [ ] Status text is the only feedback channel: one truncating 300px caption with severity decided
+      by substring-matching English prose. Edit-mode instructions overflow it.
+- [ ] View switching is a hard cut and discards scroll position (HIG: preserve context).
+- [ ] Card border thickness drifts across five code paths, each a layout pass — contradicting the
+      comment that says it must stay constant. `ActionChip` does the same on focus.
+- [ ] The 30px live value has no tabular figures, so the headline number reflows every tick.
+      Two numeral typefaces in one card.
+- [ ] Threshold colour has no hysteresis (flickers at 74.8/75.2) and is percent-only, so
+      temperature panels — the hottest readings in the app — never turn amber or red.
+- [ ] Keyboard support is one `if`: Enter/Space on `ActionChip`. No accelerators, no Escape from
+      edit mode, resize handles aren't tab stops, chart gestures are pointer-only.
+- [ ] Contrast failures, all from stacking `Opacity` on already-muted brushes: process column
+      headers measure **2.2-2.6:1** in every theme (AA needs 4.5). Use the semantic text brushes.
+- [ ] Focus is conflated with hover — `GotFocus` sets `_isHovered = true`.
+- [ ] Hit targets are 22-36px across five sizes, below both HIG (44pt) and Windows (32px).
+- [ ] Dead UI: `_perProcessChartButton` is fully wired but never added to the tree; `_edgeGlow`
+      can never render; three of four arms of `AddStatusField`'s accent switch are unreachable.
+- [ ] Legacy cyan hardcoded into settings cards bypasses the palette, so Sandstone/Ember/Violet
+      still show cyan icons. Off-palette resource *fallbacks* compound it.
+- [ ] Scale inventories to consolidate: **19 font sizes**, **8 corner radii**, **8 border weights**.
+- [ ] Chart has three gestures (drag-zoom, click-pin, double-click-reset) with no cursor, tooltip
+      or hint.
+
+## Security and robustness
+
+- [ ] Audit the Performance Log Users grant — it permits system-wide trace collection, not just
+      Vaktr's. Confirm it is documented honestly and that declining degrades cleanly (it does).
+- [ ] Installer uses `powershell -ExecutionPolicy Bypass` from an elevated context; prefer a
+      direct API or `net localgroup` by SID.
+- [ ] Validate the user-configurable storage path (reject outside-profile and UNC paths).
+- [ ] Prove the "no network calls" README claim with a static check or blocked-egress run.
+- [ ] Confirm a corrupt/partial config fails safe to defaults.
+- [ ] Review the `HKCU\...\Run` auto-launch write for quoting/path injection.

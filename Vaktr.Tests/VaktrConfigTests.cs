@@ -141,12 +141,84 @@ public sealed class VaktrConfigTests
     }
 
     [Fact]
+    public void Normalize_Cleans_PanelSizes_And_Uses_Standard_For_Invalid_Values()
+    {
+        var config = new VaktrConfig
+        {
+            PanelSizes = new Dictionary<string, PanelSizePreset>
+            {
+                ["cpu-total"] = PanelSizePreset.Wide,
+                ["memory"] = (PanelSizePreset)99,
+                [" "] = PanelSizePreset.Large,
+            },
+        };
+
+        config.Normalize();
+
+        Assert.Equal(PanelSizePreset.Wide, config.PanelSizes["CPU-TOTAL"]);
+        Assert.Equal(PanelSizePreset.Standard, config.PanelSizes["memory"]);
+        Assert.DoesNotContain(" ", config.PanelSizes.Keys);
+    }
+
+    [Fact]
+    public void VaktrConfig_JsonRoundTrip_Preserves_Theme_And_PanelSizes()
+    {
+        var original = new VaktrConfig
+        {
+            Theme = ThemeMode.Light,
+            PanelSizes = new Dictionary<string, PanelSizePreset>
+            {
+                ["cpu-total"] = PanelSizePreset.Large,
+                ["memory"] = PanelSizePreset.Compact,
+            },
+        };
+
+        var restored = JsonSerializer.Deserialize<VaktrConfig>(JsonSerializer.Serialize(original))!;
+        restored.Normalize();
+
+        Assert.Equal(ThemeMode.Light, restored.Theme);
+        Assert.Equal(PanelSizePreset.Large, restored.PanelSizes["cpu-total"]);
+        Assert.Equal(PanelSizePreset.Compact, restored.PanelSizes["memory"]);
+    }
+
+    [Fact]
+    public void Normalize_Resets_Undefined_Theme_Value_To_Dark()
+    {
+        // 2 used to be the removed OLED theme and was the sentinel here; it is now a real
+        // palette (Midnight), so this guards an value no ThemeMode defines instead.
+        var config = new VaktrConfig { Theme = (ThemeMode)99 };
+
+        config.Normalize();
+
+        Assert.Equal(ThemeMode.Dark, config.Theme);
+    }
+
+    [Theory]
+    [InlineData(ThemeMode.Dark)]
+    [InlineData(ThemeMode.Light)]
+    [InlineData(ThemeMode.Midnight)]
+    [InlineData(ThemeMode.Ember)]
+    [InlineData(ThemeMode.Forest)]
+    [InlineData(ThemeMode.Violet)]
+    [InlineData(ThemeMode.Nord)]
+    [InlineData(ThemeMode.Sandstone)]
+    public void Normalize_Preserves_Every_Defined_Theme(ThemeMode theme)
+    {
+        var config = new VaktrConfig { Theme = theme };
+
+        config.Normalize();
+
+        Assert.Equal(theme, config.Theme);
+    }
+
+    [Fact]
     public void Normalize_Initializes_Null_Collections()
     {
-        var config = new VaktrConfig { PanelVisibility = null!, PanelOrder = null! };
+        var config = new VaktrConfig { PanelVisibility = null!, PanelOrder = null!, PanelSizes = null! };
         config.Normalize();
         Assert.NotNull(config.PanelVisibility);
         Assert.NotNull(config.PanelOrder);
+        Assert.NotNull(config.PanelSizes);
     }
 
     // ── OverlayConfig tests ────────────────────────────────────────────────

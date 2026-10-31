@@ -91,8 +91,19 @@ public sealed class App : Application
 
     private void ApplyThemeResources(ThemeMode mode)
     {
-        var palette = mode == ThemeMode.Light
-            ? new ThemePalette(
+        // Palette field order (matches the ThemePalette record):
+        //   AppBackdrop, ShellBackground, ShellStroke, Surface, SurfaceElevated, SurfaceStrong,
+        //   SurfaceInset, SurfaceStroke, SurfaceHighlight, PanelOverlay, SurfaceGrid,
+        //   TextPrimary, TextSecondary, TextMuted, Accent, AccentStrong, AccentSoft,
+        //   AccentHalo, WarningHalo, Warning, Critical, OverlayScrim
+        //
+        // Every theme keeps the same structural relationships — backdrop darkest, cards lifted
+        // one step, strokes as hairlines, muted text well clear of the AA contrast floor — so
+        // adding a palette is a recolour, never a re-layout. Warning/Critical stay in the
+        // amber/red family across all of them because those encode threshold meaning, not style.
+        var palette = mode switch
+        {
+            ThemeMode.Light => new ThemePalette(
                 "#F2F3F5",     // AppBackdrop
                 "#FFFFFF",     // ShellBackground
                 "#E4E6E9",     // ShellStroke
@@ -114,8 +125,51 @@ public sealed class App : Application
                 "#18C08326",   // WarningHalo
                 "#A96500",     // Warning
                 "#C7463B",     // Critical
-                "#80E7E8EA")   // OverlayScrim
-            : new ThemePalette(
+                "#80E7E8EA"),  // OverlayScrim
+
+            ThemeMode.Sandstone => new ThemePalette(
+                "#EDE9E3", "#FAF8F5", "#E0DAD1", "#FAF8F5", "#F5F2EC", "#EDE8E0",
+                "#F0ECE5", "#E2DCD3", "#C8FFFFFF", "#EFEBE4", "#E4DED5",
+                "#241F1A", "#4A443C", "#7B7369",
+                "#3F6B5C", "#2C5347", "#DDE9E4",
+                "#1A3F6B5C", "#18C08326", "#9A6212", "#BE4A3C", "#80E2DCD3"),
+
+            ThemeMode.Midnight => new ThemePalette(
+                "#070B14", "#0C1220", "#182033", "#101728", "#17203A", "#1E294A",
+                "#0A0F1C", "#1F2A42", "#2BFFFFFF", "#141C30", "#1E2840",
+                "#EEF2FA", "#BCC7DD", "#7F8AA3",
+                "#5CC8F5", "#A5E2FA", "#1B3A58",
+                "#245CC8F5", "#20E6A34B", "#F2BF66", "#FF897D", "#B0060A12"),
+
+            ThemeMode.Ember => new ThemePalette(
+                "#14100E", "#1A1512", "#2A221D", "#1F1915", "#261E19", "#2E251F",
+                "#17120F", "#312822", "#2BFFFFFF", "#241C17", "#2F2620",
+                "#F7F2EC", "#D2C6BA", "#95877A",
+                "#F0A04B", "#FFC888", "#4A3321",
+                "#24F0A04B", "#20E6A34B", "#F2BF66", "#FF897D", "#B00F0C0A"),
+
+            ThemeMode.Forest => new ThemePalette(
+                "#0D120F", "#121815", "#1E2A23", "#161D19", "#1C2520", "#232E27",
+                "#0F1411", "#26322B", "#2BFFFFFF", "#1A231E", "#243029",
+                "#EFF5F1", "#C2D0C7", "#828F87",
+                "#6FD8A4", "#A8EFC9", "#1E4433",
+                "#246FD8A4", "#20E6A34B", "#F2BF66", "#FF897D", "#B00A0F0C"),
+
+            ThemeMode.Violet => new ThemePalette(
+                "#110E16", "#17131E", "#271F33", "#1C1726", "#231D2F", "#2B2439",
+                "#13101A", "#2E2640", "#2BFFFFFF", "#211B2C", "#2C2440",
+                "#F3EFF8", "#CBC2DA", "#8B819C",
+                "#B18AF0", "#D4BDFF", "#38295C",
+                "#24B18AF0", "#20E6A34B", "#F2BF66", "#FF897D", "#B00C0A12"),
+
+            ThemeMode.Nord => new ThemePalette(
+                "#2E3440", "#333B48", "#434C5E", "#3B4252", "#434C5E", "#4C566A",
+                "#2B313C", "#4A5467", "#2BFFFFFF", "#3E4657", "#49536A",
+                "#ECEFF4", "#D8DEE9", "#9BA6B8",
+                "#88C0D0", "#B4DAE5", "#3B5A68",
+                "#2488C0D0", "#20E6A34B", "#EBCB8B", "#E8909C", "#B0242933"),
+
+            _ => new ThemePalette(
                 "#111315",
                 "#17191C",
                 "#202327",
@@ -137,7 +191,8 @@ public sealed class App : Application
                 "#20E6A34B",
                 "#F2BF66",
                 "#FF897D",
-                "#B0080A0C");
+                "#B0080A0C"),
+        };
 
         SetBrushResource("AppBackdropBrush", palette.AppBackdrop);
         SetBrushResource("ShellBackgroundBrush", palette.ShellBackground);

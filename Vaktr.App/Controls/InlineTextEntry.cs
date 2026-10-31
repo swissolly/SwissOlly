@@ -40,7 +40,7 @@ public sealed class InlineTextEntry : UserControl
             Background = CreateSurfaceGradient("#101B2A", "#142335"),
             BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E"),
             BorderThickness = new Thickness(0.8),
-            CornerRadius = new CornerRadius(10),
+            CornerRadius = new CornerRadius(8),
             Padding = new Thickness(12, 8, 12, 8),
             MinHeight = 40,
         };
@@ -50,7 +50,7 @@ public sealed class InlineTextEntry : UserControl
             HorizontalAlignment = HorizontalAlignment.Stretch,
             VerticalAlignment = VerticalAlignment.Center,
             Margin = new Thickness(4),
-            CornerRadius = new CornerRadius(10),
+            CornerRadius = new CornerRadius(8),
             Opacity = 0,
             IsHitTestVisible = false,
         };
@@ -219,9 +219,12 @@ public sealed class InlineTextEntry : UserControl
             }
             else
             {
-                _cachedIdleBg = CreateSurfaceGradient("#101B2A", "#142335");
-                _cachedHoverBg = CreateSurfaceGradient("#142438", "#1A2C42");
-                _cachedFocusBg = CreateSurfaceGradient("#173247", "#122739");
+                // Was a hardcoded navy gradient from a superseded palette, which left entry
+                // fields reading blue against neutral grey cards. Palette-driven like the
+                // light branch, so every theme applies here for free.
+                _cachedIdleBg = ResolveBrush("SurfaceInsetBrush", "#141619");
+                _cachedHoverBg = ResolveBrush("SurfaceElevatedBrush", "#222529");
+                _cachedFocusBg = ResolveBrush("SurfaceStrongBrush", "#292D31");
             }
         }
 
@@ -230,7 +233,10 @@ public sealed class InlineTextEntry : UserControl
             : _isHovered ? _cachedHoverBg : _cachedIdleBg;
         _surface.BorderBrush = ResolveBrush(_isFocused ? "AccentStrongBrush" : "SurfaceStrokeBrush",
             _isFocused ? (isLight ? "#04506E" : "#B7F7FF") : isLight ? "#C0CEDC" : "#27425E");
-        _surface.BorderThickness = new Thickness(_isFocused ? 1.2 : _isHovered ? 1.0 : 0.8);
+        // Constant thickness: varying it on hover/focus invalidated layout and nudged the
+        // caret and text. Focus is signalled by the accent brush and glow instead, which is
+        // just as visible and costs nothing.
+        _surface.BorderThickness = new Thickness(1);
         Opacity = _isPressed ? 0.96 : _isHovered ? 0.99 : 1.0;
         _glow.Background = ResolveBrush("AccentHaloBrush", "#1B68DAFF");
         _glow.Opacity = _isFocused ? 0.06 : _isHovered ? 0.02 : 0;

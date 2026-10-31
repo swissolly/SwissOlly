@@ -32,6 +32,15 @@ public sealed class VaktrConfig
 
     public List<string> PanelOrder { get; set; } = [];
 
+    public Dictionary<string, PanelSizePreset> PanelSizes { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Explicit panel geometry on the 12-column dashboard grid. Supersedes
+    /// <see cref="PanelSizes"/> + <see cref="PanelOrder"/>, which could only express a column
+    /// span and a flow position. Those two are still read so an existing board migrates once.
+    /// </summary>
+    public Dictionary<string, PanelLayout> PanelLayouts { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
     public OverlayConfig? Overlay { get; set; }
 
     [JsonIgnore]
@@ -159,10 +168,38 @@ public sealed class VaktrConfig
 
         PanelVisibility ??= new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
         PanelOrder ??= [];
+        PanelSizes ??= new Dictionary<string, PanelSizePreset>(StringComparer.OrdinalIgnoreCase);
         PanelOrder = PanelOrder
             .Where(key => !string.IsNullOrWhiteSpace(key))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
+
+        var normalizedPanelSizes = new Dictionary<string, PanelSizePreset>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (key, size) in PanelSizes)
+        {
+            if (string.IsNullOrWhiteSpace(key) || normalizedPanelSizes.ContainsKey(key))
+            {
+                continue;
+            }
+
+            normalizedPanelSizes[key] = Enum.IsDefined(typeof(PanelSizePreset), size)
+                ? size
+                : PanelSizePreset.Standard;
+        }
+        PanelSizes = normalizedPanelSizes;
+
+        PanelLayouts ??= new Dictionary<string, PanelLayout>(StringComparer.OrdinalIgnoreCase);
+        var normalizedLayouts = new Dictionary<string, PanelLayout>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (key, layout) in PanelLayouts)
+        {
+            if (string.IsNullOrWhiteSpace(key) || layout is null || normalizedLayouts.ContainsKey(key))
+            {
+                continue;
+            }
+
+            normalizedLayouts[key] = layout.Normalize();
+        }
+        PanelLayouts = normalizedLayouts;
 
         Overlay = (Overlay ?? new OverlayConfig()).Normalize();
 

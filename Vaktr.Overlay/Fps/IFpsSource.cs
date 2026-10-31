@@ -10,6 +10,9 @@ public enum FpsAccuracy
     /// game. Correct only while the game is v-synced to the refresh rate; over-reports otherwise.
     /// </summary>
     Approximate,
+
+    /// <summary>No game-specific frame timing source is available.</summary>
+    Unavailable,
 }
 
 public interface IFpsSource : IDisposable

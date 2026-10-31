@@ -19,7 +19,7 @@ internal static class EtwInterop
     internal static Guid DxgiProviderGuid = new("ca11c036-0102-4a2d-a6ad-f03cfed5d3c9");
 
     // Microsoft-Windows-D3D9. Older titles present through D3D9 and never touch DXGI.
-    internal static Guid D3d9ProviderGuid = new("783aca0a-790e-4d7f-8451-aa850511c93b");
+    internal static Guid D3d9ProviderGuid = new("783aca0a-790e-4d7f-8451-aa850511c6b9");
 
     // DXGI event IDs (Microsoft-Windows-DXGI manifest).
     internal const int EventIdDxgiPresentStart = 42;

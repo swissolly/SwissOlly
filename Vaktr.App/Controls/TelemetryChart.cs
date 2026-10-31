@@ -89,7 +89,7 @@ public sealed class TelemetryChart : UserControl
     private readonly List<(Border Tooltip, Line Marker)> _pinnedTooltips = [];
 
 
-    private static readonly FontFamily s_numericFont = new("Bahnschrift");
+    private static readonly FontFamily s_numericFont = new("Segoe UI Variable Text");
 
     public TelemetryChart()
     {
