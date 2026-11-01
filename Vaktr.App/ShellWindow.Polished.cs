@@ -156,6 +156,10 @@ public sealed partial class ShellWindow : Window
         _statusText.MaxWidth = 300;
         _statusText.TextWrapping = TextWrapping.NoWrap;
         _statusText.TextTrimming = TextTrimming.CharacterEllipsis;
+        // The status column is fixed-width, so long messages (errors especially) are cut off;
+        // the full text is one hover away. Only while trimmed, so short status has no tooltip.
+        _statusText.IsTextTrimmedChanged += (sender, _) =>
+            ToolTipService.SetToolTip(sender, sender.IsTextTrimmed ? sender.Text : null);
         _statusIndicator = new Ellipse
         {
             Width = 7,
@@ -2283,6 +2287,11 @@ public sealed partial class ShellWindow : Window
         {
             _lastRenderedStatusText = text;
             StartupTrace.Write($"StatusText -> {text}");
+            if (_statusText.IsTextTrimmed)
+            {
+                // Still trimmed after a text change: IsTextTrimmedChanged won't fire to refresh it.
+                ToolTipService.SetToolTip(_statusText, text);
+            }
         }
     }
 

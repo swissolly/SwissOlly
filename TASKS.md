@@ -140,11 +140,18 @@ UI/UX pass:
 
 - [ ] Settings: Apply should be disabled until something changes, and show "Saved" inline beside
       it rather than only in the status line.
-- [ ] Hero status text truncates at 320px - give it a tooltip with the full message.
+- [x] Hero status text: full message as a tooltip while trimmed.
 - [ ] Empty panels after a range change flash "No data" before history loads; show a skeleton.
-- [ ] Number formatting: align value columns with tabular figures (`FontFeatures` tnum) so live
-      values stop jittering horizontally as digits change.
-- [ ] Reduce motion: honour the Windows "Animation effects" setting in `MotionTokens`.
+- [x] Tabular figures and reduced motion: both were already in place (checked, nothing to do).
+- [x] Charts drew as scattered dots after a restart: gap detection used one median for a
+      mixed-resolution series (minute history + live). Now a local, both-sides test.
+- [ ] Verify after the dots fix: on CPU Total/Clock/GPU the live stretch after a restart drew
+      nothing (not even fill) while the latest marker showed. Not explained from code; if a
+      straight line now bridges restart -> latest point, live points are being lost somewhere.
+- [ ] Startup history loads minute averages for the whole retention window (>24h), so the
+      last hours show at 1-minute resolution until live data replaces them. Consider raw samples
+      for the most recent hour only (~75k rows) - measure startup cost first.
+- [x] CPU Cores legend squashed the plot to ~35px; the legend now yields to a ~120px plot.
 
 ---
 
