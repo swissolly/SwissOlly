@@ -26,10 +26,10 @@ jobs:
           dotnet-version: 8.0.x
 
       - name: Restore dependencies
-        run: dotnet restore Vaktr.sln
+        run: dotnet restore SwissOlly.sln
 
       - name: Check for vulnerable packages
-        run: dotnet list Vaktr.sln package --vulnerable --include-transitive 2>&1 | tee vulnerability-report.txt
+        run: dotnet list SwissOlly.sln package --vulnerable --include-transitive 2>&1 | tee vulnerability-report.txt
 
       - name: Fail on critical vulnerabilities
         shell: pwsh
@@ -77,11 +77,11 @@ jobs:
           dotnet-version: 8.0.x
 
       - name: Restore
-        run: dotnet restore Vaktr.sln
+        run: dotnet restore SwissOlly.sln
 
       - name: Build with analysis
-        run: dotnet build Vaktr.sln -c Release -p:Platform=x64 -p:TreatWarningsAsErrors=false --no-restore
+        run: dotnet build SwissOlly.sln -c Release -p:Platform=x64 -p:TreatWarningsAsErrors=false --no-restore
 
       - name: Check for outdated packages
-        run: dotnet list Vaktr.sln package --outdated
+        run: dotnet list SwissOlly.sln package --outdated
         continue-on-error: true

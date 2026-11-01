@@ -1,4 +1,4 @@
-# Vaktr v1.2.0 — Tasks
+# SwissOlly v1.2.0 — Tasks
 
 **Status (2026-10-31):** Dashboard edit mode rebuilt after tracing a live gesture frame by frame;
 the crash on Reset zoom → 24h fixed; whole-UI UX pass done. Release x64 + ARM64 build clean,
@@ -172,9 +172,9 @@ auto-scroll, Esc), `TelemetryPanelCard` (gesture input + float API: `BeginFloat`
 - `RefreshDashboardPanels` clears the grid: re-add every overlay element it owns.
 - Never compare `ColumnDefinitions.Count` to `DetermineDashboardColumns()` (12 vs 1–3 → rebuild loop).
 - Don't assign geometry in `ApplyConfig` (panel list not populated yet).
-- Bad layout poisons the config: delete `panelLayouts` in `%LocalAppData%\Vaktr\vaktr-settings.json`.
+- Bad layout poisons the config: delete `panelLayouts` in `%LocalAppData%\SwissOlly\swissolly-settings.json`.
 
-**Verifying:** `C:\Program Files\dotnet\dotnet.exe`; kill `Vaktr.exe` before building. Capture with
+**Verifying:** `C:\Program Files\dotnet\dotnet.exe`; kill `SwissOlly.exe` before building. Capture with
 `PrintWindow(hwnd, hdc, 2)` on the `WinUIDesktopWin32WindowClass` window — never force foreground
 (the owner games on this machine; the in-game overlay also appears over a running game whenever the
 app launches). Real input can't be injected safely, so gestures were driven in-process: a temporary

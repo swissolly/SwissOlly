@@ -44,10 +44,10 @@ jobs:
           dotnet-version: 8.0.x
 
       - name: Restore
-        run: dotnet restore Vaktr.sln
+        run: dotnet restore SwissOlly.sln
 
       - name: Publish app (self-contained ${{ matrix.platform }})
-        run: dotnet publish Vaktr.App/Vaktr.App.csproj -c Release -p:Platform=${{ matrix.platform }} -r ${{ matrix.runtime }} --self-contained -o publish/${{ matrix.platform }}
+        run: dotnet publish SwissOlly.App/SwissOlly.App.csproj -c Release -p:Platform=${{ matrix.platform }} -r ${{ matrix.runtime }} --self-contained -o publish/${{ matrix.platform }}
 
       - name: Sign executable (uiAccess requires a signed binary)
         if: ${{ secrets.CODE_SIGN_PFX != '' }}
@@ -56,10 +56,10 @@ jobs:
           PFX_BASE64: ${{ secrets.CODE_SIGN_PFX }}
           PFX_PASS:   ${{ secrets.CODE_SIGN_PFX_PASSWORD }}
         run: |
-          $pfxPath = "$env:RUNNER_TEMP\vaktr-sign.pfx"
+          $pfxPath = "$env:RUNNER_TEMP\swissolly-sign.pfx"
           [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:PFX_BASE64))
           $signtool = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\signtool.exe"
-          & $signtool sign /f $pfxPath /p $env:PFX_PASS /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 "publish/${{ matrix.platform }}/Vaktr.exe"
+          & $signtool sign /f $pfxPath /p $env:PFX_PASS /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 "publish/${{ matrix.platform }}/SwissOlly.exe"
           Remove-Item $pfxPath
 
       - name: Install Inno Setup
@@ -68,12 +68,12 @@ jobs:
       - name: Build installer
         run: |
           $version = "${{ env.RELEASE_VERSION }}".TrimStart("v")
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion="$version" /DMyAppArch="${{ matrix.arch_flag }}" /DMyPublishDir="..\publish\${{ matrix.platform }}" /DMyOutputSuffix="-${{ matrix.platform }}" installer/vaktr-setup.iss
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion="$version" /DMyAppArch="${{ matrix.arch_flag }}" /DMyPublishDir="..\publish\${{ matrix.platform }}" /DMyOutputSuffix="-${{ matrix.platform }}" installer/swissolly-setup.iss
 
       - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
-          name: VaktrSetup-${{ matrix.platform }}-${{ env.RELEASE_VERSION }}
+          name: SwissOllySetup-${{ matrix.platform }}-${{ env.RELEASE_VERSION }}
           path: installer/Output/*.exe
 
   create-release:
@@ -85,7 +85,7 @@ jobs:
       - name: Download x64 installer
         uses: actions/download-artifact@v4
         with:
-          pattern: VaktrSetup-*
+          pattern: SwissOllySetup-*
           merge-multiple: true
           path: installers/
 

@@ -1,0 +1,55 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <AssemblyName>SwissOlly</AssemblyName>
+    <TargetName>SwissOlly</TargetName>
+    <Product>SwissOlly</Product>
+    <ApplicationIcon>Assets\SwissOlly.ico</ApplicationIcon>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <RootNamespace>SwissOlly.App</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Platforms>x64;ARM64</Platforms>
+    <Platform Condition="'$(Platform)' == '' or '$(Platform)' == 'AnyCPU'">x64</Platform>
+    <PlatformTarget Condition="'$(PlatformTarget)' == '' or '$(PlatformTarget)' == 'AnyCPU'">x64</PlatformTarget>
+    <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <UseWinUI>true</UseWinUI>
+    <WinUISDKReferences>false</WinUISDKReferences>
+    <WindowsPackageType>None</WindowsPackageType>
+    <DefaultItemExcludes>$(DefaultItemExcludes);obj\**;obj_winui3\**;bin\**;artifacts\**</DefaultItemExcludes>
+  </PropertyGroup>
+
+  <!-- Precompile the shipped build: JIT is a large share of a cold launch. Publish-only. -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <PublishReadyToRun>true</PublishReadyToRun>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Manifest Include="$(ApplicationManifest)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="Assets\**\*.*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.8.260317003" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove="obj_winui3\**\*.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\SwissOlly.Core\SwissOlly.Core.csproj" />
+    <ProjectReference Include="..\SwissOlly.Collector\SwissOlly.Collector.csproj" />
+    <ProjectReference Include="..\SwissOlly.Store\SwissOlly.Store.csproj" />
+    <ProjectReference Include="..\SwissOlly.Overlay\SwissOlly.Overlay.csproj" />
+  </ItemGroup>
+
+</Project>

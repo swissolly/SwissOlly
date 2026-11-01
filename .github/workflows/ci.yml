@@ -28,32 +28,32 @@ jobs:
           dotnet-version: 8.0.x
 
       - name: Restore dependencies
-        run: dotnet restore Vaktr.sln
+        run: dotnet restore SwissOlly.sln
 
       - name: Check formatting
-        run: dotnet format Vaktr.sln --verify-no-changes --verbosity diagnostic
+        run: dotnet format SwissOlly.sln --verify-no-changes --verbosity diagnostic
         continue-on-error: true
 
       - name: Build solution
-        run: dotnet build Vaktr.sln -c Release -p:Platform=${{ matrix.platform }} --no-restore
+        run: dotnet build SwissOlly.sln -c Release -p:Platform=${{ matrix.platform }} --no-restore
 
       - name: Run tests
         if: matrix.platform == 'x64'
-        run: dotnet test Vaktr.Tests/Vaktr.Tests.csproj -c Release --no-build --verbosity normal --logger "trx;LogFileName=test-results.trx"
+        run: dotnet test SwissOlly.Tests/SwissOlly.Tests.csproj -c Release --no-build --verbosity normal --logger "trx;LogFileName=test-results.trx"
 
       - name: Upload test results
         if: always() && matrix.platform == 'x64'
         uses: actions/upload-artifact@v4
         with:
           name: test-results-${{ matrix.platform }}
-          path: Vaktr.Tests/TestResults/*.trx
+          path: SwissOlly.Tests/TestResults/*.trx
 
       - name: Publish app (self-contained)
-        run: dotnet publish Vaktr.App/Vaktr.App.csproj -c Release -p:Platform=${{ matrix.platform }} -r ${{ matrix.runtime }} --self-contained -o publish/${{ matrix.platform }}
+        run: dotnet publish SwissOlly.App/SwissOlly.App.csproj -c Release -p:Platform=${{ matrix.platform }} -r ${{ matrix.runtime }} --self-contained -o publish/${{ matrix.platform }}
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: vaktr-${{ matrix.platform }}
+          name: swissolly-${{ matrix.platform }}
           path: publish/${{ matrix.platform }}
           retention-days: 14

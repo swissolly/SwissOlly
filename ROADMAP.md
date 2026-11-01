@@ -1,4 +1,4 @@
-# Vaktr Roadmap
+# SwissOlly Roadmap
 
 ## Current Version: v1
 
@@ -7,7 +7,7 @@
 ### CPU Temperature Monitoring
 CPU temperature sensors on AMD and Intel require kernel-level access (PCI config space / MSR registers) that Windows restricts to signed kernel drivers. Every monitoring app that shows CPU temps (HWiNFO, Core Temp, MSI Afterburner) ships a signed driver for this.
 
-LibreHardwareMonitor supports CPU temps through the [PawnIO](https://pawnio.eu/) kernel driver. The plan is to bundle PawnIO into the Vaktr installer so CPU temperatures work out of the box with no extra setup.
+LibreHardwareMonitor supports CPU temps through the [PawnIO](https://pawnio.eu/) kernel driver. The plan is to bundle PawnIO into the SwissOlly installer so CPU temperatures work out of the box with no extra setup.
 
 **Status:** GPU temps work today. CPU temp panel exists in the UI — just needs the driver bundled.
 
@@ -27,17 +27,17 @@ Export historical metric data as CSV or JSON for analysis in external tools. Use
 **Status:** Planned.
 
 ### Prometheus Metrics Endpoint
-Expose Vaktr's collected metrics via a local HTTP endpoint in Prometheus exposition format. This lets advanced users scrape Vaktr from a Prometheus instance for long-term storage, alerting, or multi-machine dashboards — bridging the gap between Vaktr's simplicity and Prometheus/Grafana's power.
+Expose SwissOlly's collected metrics via a local HTTP endpoint in Prometheus exposition format. This lets advanced users scrape SwissOlly from a Prometheus instance for long-term storage, alerting, or multi-machine dashboards — bridging the gap between SwissOlly's simplicity and Prometheus/Grafana's power.
 
 **Status:** Planned.
 
 ## Shipped
 
 ### v1.2.0 — In-Game Telemetry Overlay
-A compact, always-on-top overlay that renders FPS and selected system metrics on top of running games. Owned by the main Vaktr process — no second window, no taskbar entry, no Alt+Tab entry.
+A compact, always-on-top overlay that renders FPS and selected system metrics on top of running games. Owned by the main SwissOlly process — no second window, no taskbar entry, no Alt+Tab entry.
 
 - Three display modes: Simple (FPS only), Advanced (FPS + CPU + GPU + GPU temp + memory), Custom (pick your own)
-- True per-process FPS, counted from the game's own DXGI/D3D9 present calls via a read-only ETW trace — no DLL injection, no anti-cheat conflicts (safe with Vanguard, EAC, BattlEye), and Vaktr never runs elevated. The installer grants Performance Log Users membership so the app itself stays unprivileged; the overlay degrades to an approximate reading, clearly labelled, when that right is absent
+- True per-process FPS, counted from the game's own DXGI/D3D9 present calls via a read-only ETW trace — no DLL injection, no anti-cheat conflicts (safe with Vanguard, EAC, BattlEye), and SwissOlly never runs elevated. The installer grants Performance Log Users membership so the app itself stays unprivileged; the overlay degrades to an approximate reading, clearly labelled, when that right is absent
 - Auto-shows when a game has focus; hides when focus returns to desktop
 - Corner positioning (top-left, top-right, bottom-left, bottom-right)
 - Outlined text with no background box — reads cleanly over any game background
@@ -47,7 +47,7 @@ A compact, always-on-top overlay that renders FPS and selected system metrics on
 - Resource cost: ~0.4–0.6% CPU, ~12 MB memory added
 
 **Known limitations in v1.2.0:**
-- Exclusive fullscreen isn't supported — an intentional scope decision. Vaktr targets borderless and windowed-fullscreen games only, which avoids ever requiring code-signing or elevated UIAccess.
+- Exclusive fullscreen isn't supported — an intentional scope decision. SwissOlly targets borderless and windowed-fullscreen games only, which avoids ever requiring code-signing or elevated UIAccess.
 - HDR games render dim (SDR overlay). Deferred to v1.3.0.
 - Group membership only applies to a new logon token, so the first session after install shows approximate FPS until you sign out and back in.
 - ETW delivers events in buffers, so the reading trails live by about a second.

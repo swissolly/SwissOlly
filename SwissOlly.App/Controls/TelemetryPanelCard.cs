@@ -1,0 +1,2263 @@
+using System.ComponentModel;
+using System.Linq;
+using Microsoft.UI.Dispatching;
+using Microsoft.UI.Input;
+using Microsoft.UI.Text;
+using Microsoft.UI.Xaml.Controls.Primitives;
+using Microsoft.UI.Xaml.Hosting;
+using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Input;
+using Microsoft.UI.Xaml.Media.Animation;
+using Microsoft.UI.Xaml.Media;
+using Windows.UI;
+using SwissOlly.App.ViewModels;
+using SwissOlly.Core.Models;
+
+namespace SwissOlly.App.Controls;
+
+public sealed class TelemetryPanelCard : UserControl
+{
+    public static readonly DependencyProperty PanelProperty =
+        DependencyProperty.Register(
+            nameof(Panel),
+            typeof(MetricPanelViewModel),
+            typeof(TelemetryPanelCard),
+            new PropertyMetadata(null, OnPanelChanged));
+
+    private readonly Border _cardBorder;
+    private readonly Border _badgeBorder;
+    private readonly Grid _badgeIconHost;
+    private readonly TextBlock _footerText;
+    private readonly TextBlock _scaleText;
+    private readonly TextBlock _titleText;
+    private readonly TextBlock _currentValueText;
+    private readonly TextBlock _secondaryValueText;
+    private readonly TelemetryChart _chart;
+    private readonly UsageGauge _gauge;
+    private readonly Viewbox _gaugeHost;
+    private readonly Grid _visualGrid;
+    private readonly Border _chartFrame;
+    private readonly Border _rangeShell;
+    private readonly Border _scalePill;
+    private readonly StackPanel _legendHost;
+    private readonly ScrollViewer _legendScroller;
+    private readonly Border _processSection;
+    private readonly TextBlock _processSectionTitleText;
+    private readonly TextBlock _processLabelText;
+    private readonly TextBlock _activityLabelText;
+    private readonly TextBlock _valueLabelText;
+    private readonly StackPanel _processRowsHost;
+    private readonly ScrollViewer _processScroller;
+    private readonly ActionChip _sortHighestButton;
+    private readonly ActionChip _sortLowestButton;
+    private readonly ActionChip _sortNameButton;
+    private readonly ActionChip _processToggleButton;
+    private readonly Border _legendDivider;
+    private readonly Grid _contentGrid;
+    private readonly RowDefinition _processRow;
+    private readonly Dictionary<string, (ClickableBorder Row, Border InnerBorder, TextBlock NameText, TextBlock ValueText, Ellipse Dot)> _legendRows = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, (ClickableBorder Row, TextBlock NameText, TextBlock ValueText, TextBlock CaptionText, LinearGradientBrush FillBrush, Border RowBorder, Ellipse? ChartDot)> _processRowParts = new(StringComparer.OrdinalIgnoreCase);
+    private bool _processScrollLoadQueued;
+    private bool _processSectionExpanded;
+    private MetricPanelViewModel? _observedPanel;
+    private bool _refreshQueued;
+    private string? _lastBadgeIconKey;
+    private Brush? _lastBadgeAccentBrush;
+    private IReadOnlyList<ChartSeriesViewModel>? _lastRenderedSeries;
+    private IReadOnlyList<ProcessListItemViewModel>? _lastRenderedProcessRows;
+    private DateTimeOffset _lastRenderedWindowStartUtc;
+    private DateTimeOffset _lastRenderedWindowEndUtc;
+    private double _lastRenderedCeilingValue = double.NaN;
+    private MetricUnit _lastRenderedUnit;
+    private ProcessSortMode _lastRenderedSortMode;
+    // Nullable so the first render always applies the visual mode. As plain bools they started
+    // "false", matched every panel without a process table, and the Processes button kept its
+    // default Visible on CPU Cores, Clock, GPU and the rest.
+    private bool? _lastRenderedSupportsProcessTable;
+    private bool? _lastRenderedGaugeMode;
+    // Layout-edit geometry. One offset serves both roles a card plays in a gesture: the
+    // floating card's position on the board, or a sibling's displacement while it makes room.
+    // It is UIElement.Translation, not a RenderTransform: a RenderTransform change re-runs the
+    // effective-viewport pass and moves every ScrollViewer's DirectManipulation viewport inside
+    // the card, which cost 20-40ms per frame with ten panels in motion. Translation is applied
+    // purely in the compositor.
+    private double _offsetX;
+    private double _offsetY;
+    private readonly ScaleTransform _liftScale = new() { ScaleX = 1d, ScaleY = 1d };
+    private readonly Grid _shadowHost = new() { IsHitTestVisible = false };
+    private Microsoft.UI.Composition.DropShadow? _liftShadow;
+    private Microsoft.UI.Composition.SpriteVisual? _liftCaster;
+    private bool _isFloating;
+    private bool _gesturePointerDown;
+    private bool _gestureActive;
+    private ResizeEdge _gestureEdge;
+    private Windows.Foundation.Point _gesturePressPoint;
+    private UIElement? _gestureCaptureElement;
+    private ResizeEdge? _hoveredHandleEdge;
+    private bool _bodyHovered;
+    private bool _handlesRevealed;
+    private readonly List<(Border Visual, ResizeEdge Edge)> _handleVisuals = [];
+    private bool _isEffectivelyVisible = true;
+    private bool _isRenderingSuspended;
+    private bool _deferredRefreshPending;
+
+    public event EventHandler<ChartZoomSelectionEventArgs>? PanelZoomSelectionRequested;
+
+    public event EventHandler? PanelZoomResetRequested;
+
+
+
+    /// <summary>
+    /// A move (edge None) or resize crossed its drag threshold. Points are in window-content
+    /// coordinates, which stay put while this card moves - unlike the card's own space, where
+    /// reading the pointer during a left/top resize fed the card's motion back into the input.
+    /// </summary>
+    public event EventHandler<LayoutGestureEventArgs>? LayoutGestureStarted;
+
+    /// <summary>The pointer moved during a gesture. Raised per input event; the shell coalesces.</summary>
+    public event EventHandler<LayoutGestureEventArgs>? LayoutGestureMoved;
+
+    /// <summary>The gesture finished: released (commit) or cancelled (capture lost).</summary>
+    public event EventHandler<LayoutGestureEndedEventArgs>? LayoutGestureEnded;
+
+    private Grid _resizeHandleLayer = null!;
+    private bool _isLayoutEditMode;
+
+    /// <summary>Which edges a handle drags. Flags so a corner is just two edges combined.</summary>
+    [Flags]
+    public enum ResizeEdge
+    {
+        None = 0,
+        Left = 1,
+        Right = 2,
+        Top = 4,
+        Bottom = 8,
+        TopLeft = Top | Left,
+        TopRight = Top | Right,
+        BottomLeft = Bottom | Left,
+        BottomRight = Bottom | Right,
+    }
+
+    /// <summary>True while a gesture has lifted the card out of grid layout.</summary>
+    public bool IsFloating => _isFloating;
+
+    public TelemetryPanelCard()
+    {
+        // Height comes from the panel's H in grid units, so the card stretches to fill the rows
+        // it spans. The grid's minimum (PanelLayout.MinHeight) is the only floor: a second floor
+        // here is what once let a card overflow the space the grid had reserved for it.
+        HorizontalAlignment = HorizontalAlignment.Stretch;
+        VerticalAlignment = VerticalAlignment.Stretch;
+
+        _badgeIconHost = new Grid
+        {
+            Width = 16,
+            Height = 16,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        // Text contrast comes from the semantic text brushes alone. Stacking Opacity on an already
+        // muted brush is what pushed captions and column headers to ~2.4:1 against the card.
+        _footerText = CreateTextBlock(fontSize: 11);
+        _scaleText = CreateTextBlock("Segoe UI Variable Text", 11, FontWeights.Normal);
+        _scaleText.TextWrapping = TextWrapping.NoWrap;
+        _scaleText.TextTrimming = TextTrimming.CharacterEllipsis;
+        _scaleText.MaxWidth = 200;
+        _titleText = CreateTextBlock("Segoe UI Variable Text", 14, FontWeights.SemiBold);
+        _titleText.TextTrimming = TextTrimming.CharacterEllipsis;
+        _titleText.TextWrapping = TextWrapping.NoWrap;
+        _titleText.Foreground = ResolveBrush("TextPrimaryBrush", "#F2F8FF");
+
+        _currentValueText = CreateTextBlock("Segoe UI Variable Display", 30, FontWeights.SemiBold);
+        _currentValueText.TextTrimming = TextTrimming.CharacterEllipsis;
+        _currentValueText.TextWrapping = TextWrapping.NoWrap;
+        // Tabular figures: every digit the same width, so the headline number holds still
+        // instead of shuffling sideways each time a 1 becomes an 8.
+        UseTabularFigures(_currentValueText);
+        _secondaryValueText = CreateTextBlock(fontSize: 12);
+
+        _badgeBorder = new Border
+        {
+            Width = 36,
+            Height = 36,
+            CornerRadius = new CornerRadius(8),
+            BorderThickness = new Thickness(0.9),
+            Background = ResolveBrush("SurfaceInsetBrush", "#091321"),
+            Child = _badgeIconHost,
+        };
+
+
+        _visualGrid = new Grid
+        {
+            ColumnSpacing = 14,
+        };
+        _visualGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        _visualGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+        _gauge = new UsageGauge
+        {
+            Width = 144,
+            Height = 144,
+        };
+
+        // The chart fills whatever height the panel's grid span leaves. MinHeight is the
+        // smallest plot that still reads as a trend line.
+        _chart = new TelemetryChart
+        {
+            MinHeight = 64,
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            VerticalAlignment = VerticalAlignment.Stretch,
+        };
+        _chart.ZoomSelectionRequested += OnChartZoomSelectionRequested;
+        _chart.ZoomResetRequested += OnChartZoomResetRequested;
+
+        // The chart's own plot surface already paints an inset fill, so an outline here just
+        // drew a second rectangle a few pixels outside the first one.
+        _chartFrame = new Border
+        {
+            Background = BrushFactory.CreateBrush("#00FFFFFF"),
+            BorderThickness = new Thickness(0),
+            CornerRadius = new CornerRadius(8),
+            Padding = new Thickness(4, 4, 4, 3),
+            Child = _chart,
+        };
+        // A gauge is fixed artwork; scale it down rather than clip it in a short panel.
+        _gaugeHost = new Viewbox
+        {
+            Child = _gauge,
+            MaxWidth = 144,
+            MaxHeight = 144,
+            Stretch = Stretch.Uniform,
+            VerticalAlignment = VerticalAlignment.Center,
+            Visibility = Visibility.Collapsed,
+        };
+
+        _visualGrid.Children.Add(_gaugeHost);
+        _visualGrid.Children.Add(_chartFrame);
+        Grid.SetColumn(_chartFrame, 1);
+
+        _legendHost = new StackPanel
+        {
+            Spacing = 4,
+        };
+        _legendDivider = new Border
+        {
+            Height = 1,
+            Margin = new Thickness(8, 0, 8, 0),
+            Background = ResolveBrush("SurfaceStrokeBrush", "#27425E"),
+            Opacity = 0.3,
+            IsHitTestVisible = false,
+        };
+        _legendScroller = new ScrollViewer
+        {
+            Margin = new Thickness(0, 8, 0, 0),
+            MaxHeight = 400,
+            VerticalScrollMode = ScrollMode.Enabled,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            HorizontalScrollMode = ScrollMode.Disabled,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+            ZoomMode = ZoomMode.Disabled,
+            Content = _legendHost,
+        };
+        _legendScroller.PointerWheelChanged += (sender, e) =>
+        {
+            if (sender is ScrollViewer sv && sv.ScrollableHeight > 0)
+            {
+                e.Handled = true;
+            }
+        };
+
+        _sortHighestButton = CreateProcessSortButton("Highest", ProcessSortMode.Highest);
+        _sortLowestButton = CreateProcessSortButton("Lowest", ProcessSortMode.Lowest);
+        _sortNameButton = CreateProcessSortButton("Name", ProcessSortMode.Name);
+        // Wide enough for "Hide processes", so toggling never shifts the header beside it.
+        _processToggleButton = new ActionChip { Text = "Processes", MinHeight = 30, MinWidth = 124 };
+        ToolTipService.SetToolTip(_processToggleButton, "Show the top processes for this metric");
+        _processToggleButton.Click += OnProcessSectionToggleClick;
+        // Hidden until a panel that has a process table says otherwise.
+        _processToggleButton.Visibility = Visibility.Collapsed;
+
+        _processSectionTitleText = CreateTextBlock("Segoe UI Variable Text", 12, FontWeights.SemiBold);
+        _processRowsHost = new StackPanel
+        {
+            Spacing = 0,
+        };
+        // Click handlers are attached per-row in the slow path of RefreshProcessRows
+        _processScroller = new ScrollViewer
+        {
+            VerticalScrollMode = ScrollMode.Enabled,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            HorizontalScrollMode = ScrollMode.Disabled,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+            ZoomMode = ZoomMode.Disabled,
+            Content = _processRowsHost,
+        };
+
+        var processHeader = new Grid
+        {
+            ColumnSpacing = 10,
+        };
+        processHeader.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        processHeader.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        processHeader.Children.Add(_processSectionTitleText);
+
+        var sortHost = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 5,
+            Children =
+            {
+                _sortHighestButton,
+                _sortLowestButton,
+                _sortNameButton,
+            },
+        };
+        processHeader.Children.Add(sortHost);
+        Grid.SetColumn(sortHost, 1);
+
+        var processColumns = new Grid
+        {
+            ColumnSpacing = 6,
+            Padding = new Thickness(6, 0, 6, 4),
+        };
+        processColumns.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star), MinWidth = 90 });
+        processColumns.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(0.7, GridUnitType.Star) });
+        processColumns.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(32) });
+        processColumns.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+        _processLabelText = CreateTextBlock(fontSize: 10.5);
+        _processLabelText.Foreground = ResolveBrush("TextMutedBrush", "#7D9AB6");
+        _processLabelText.CharacterSpacing = 40;
+        _processLabelText.Text = "PROCESS";
+        processColumns.Children.Add(_processLabelText);
+
+        _activityLabelText = CreateTextBlock(fontSize: 10.5);
+        _activityLabelText.Foreground = ResolveBrush("TextMutedBrush", "#7D9AB6");
+        _activityLabelText.CharacterSpacing = 40;
+        _activityLabelText.Text = "DETAILS";
+        processColumns.Children.Add(_activityLabelText);
+        Grid.SetColumn(_activityLabelText, 1);
+
+        _valueLabelText = CreateTextBlock(fontSize: 10.5);
+        _valueLabelText.Foreground = ResolveBrush("TextMutedBrush", "#7D9AB6");
+        _valueLabelText.CharacterSpacing = 40;
+        _valueLabelText.Text = "VALUE";
+        _valueLabelText.HorizontalAlignment = HorizontalAlignment.Right;
+        processColumns.Children.Add(_valueLabelText);
+        Grid.SetColumn(_valueLabelText, 3);
+
+        // Capture scroll events — prevent bubbling to main shell scroll, but let through at edges
+        _processScroller.PointerWheelChanged += (sender, e) =>
+        {
+            // Always capture scroll wheel when the process list has scrollable content.
+            // This prevents the wheel event from bubbling to the parent ScrollViewer
+            // and scrolling the entire page when the user is over the process list.
+            if (sender is ScrollViewer sv && sv.ScrollableHeight > 0)
+            {
+                e.Handled = true;
+            }
+        };
+
+        // Load more processes when user scrolls near the bottom
+        _processScroller.ViewChanged += (_, _) =>
+        {
+            if (_processScrollLoadQueued || Panel is null)
+            {
+                return;
+            }
+
+            var scrollableHeight = _processScroller.ScrollableHeight;
+            if (scrollableHeight <= 0)
+            {
+                return;
+            }
+
+            // When within 20px of the bottom, load more
+            if (_processScroller.VerticalOffset >= scrollableHeight - 20)
+            {
+                _processScrollLoadQueued = true;
+                _ = DispatcherQueue.TryEnqueue(() =>
+                {
+                    _processScrollLoadQueued = false;
+                    if (Panel is { } panel && !panel.ProcessListExpanded)
+                    {
+                        panel.ProcessListExpanded = true;
+                    }
+                });
+            }
+        };
+
+        // A grid rather than a stack, so the list fills the section's row and scrolls inside it
+        // instead of pushing the card taller than its grid span.
+        var processLayout = new Grid { RowSpacing = 10 };
+        processLayout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        processLayout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        processLayout.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+        processLayout.Children.Add(processHeader);
+        processLayout.Children.Add(processColumns);
+        processLayout.Children.Add(_processScroller);
+        Grid.SetRow(processColumns, 1);
+        Grid.SetRow(_processScroller, 2);
+
+        _processSection = new Border
+        {
+            Background = BrushFactory.CreateBrush("#00FFFFFF"),
+            BorderThickness = new Thickness(0),
+            Padding = new Thickness(0, 8, 0, 0),
+            Margin = new Thickness(0, 12, 0, 0),
+            Visibility = Visibility.Collapsed,
+            Child = processLayout,
+        };
+
+        var panelActions = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 6,
+            Children =
+            {
+                _processToggleButton,
+            },
+        };
+        _rangeShell = new Border
+        {
+            Background = BrushFactory.CreateBrush("#00FFFFFF"),
+            BorderThickness = new Thickness(0),
+            Padding = new Thickness(0),
+            Child = panelActions,
+            HorizontalAlignment = HorizontalAlignment.Right,
+            VerticalAlignment = VerticalAlignment.Top,
+        };
+
+        // Top row: badge + title inline, scale pill on the right
+        var titleRow = new Grid { ColumnSpacing = 10 };
+        titleRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        titleRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        titleRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        titleRow.Children.Add(_badgeBorder);
+        titleRow.Children.Add(_titleText);
+        Grid.SetColumn(_titleText, 1);
+        _titleText.VerticalAlignment = VerticalAlignment.Center;
+
+        // Caption, not a control. It states the chart's ceiling ("100% ceiling · 100.8k handles")
+        // and was never clickable, so boxing it made it compete with the range chips beside it.
+        _scalePill = new Border
+        {
+            Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
+            BorderThickness = new Thickness(0),
+            CornerRadius = new CornerRadius(9),
+            Padding = new Thickness(2, 3, 10, 3),
+            Child = _scaleText,
+            HorizontalAlignment = HorizontalAlignment.Right,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        titleRow.Children.Add(_scalePill);
+        Grid.SetColumn(_scalePill, 2);
+
+        // Value row: large value + secondary on the same line
+        var valueRow = new StackPanel
+        {
+            Spacing = 2,
+            Children =
+            {
+                _currentValueText,
+                _secondaryValueText,
+            },
+        };
+        _secondaryValueText.Padding = new Thickness(1, 0, 0, 0);
+
+        var headerContent = new StackPanel
+        {
+            Spacing = 6,
+            Padding = new Thickness(0, 0, 0, 4),
+            Background = BrushFactory.CreateBrush("#00FFFFFF"),
+            Children =
+            {
+                titleRow,
+                valueRow,
+                _footerText,
+            },
+        };
+        var headerGrid = new Grid
+        {
+            ColumnSpacing = 12,
+        };
+        headerGrid.Background = BrushFactory.CreateBrush("#00FFFFFF");
+        headerGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        headerGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        headerGrid.ManipulationMode = ManipulationModes.None;
+        headerGrid.Children.Add(headerContent);
+        headerGrid.Children.Add(_rangeShell);
+        Grid.SetColumn(_rangeShell, 1);
+
+        // Rows, not a stack: the chart row takes whatever height the panel's grid span leaves,
+        // so a taller panel means a taller chart. In a stack the chart kept a fixed 176px and
+        // every extra row of panel height became dead space beneath it. Spacing lives on the
+        // children (not RowSpacing) so collapsed rows cost nothing.
+        _visualGrid.Margin = new Thickness(0, 12, 0, 0);
+        _legendDivider.Margin = new Thickness(8, 12, 8, 0);
+        _processRow = new RowDefinition { Height = GridLength.Auto };
+        _contentGrid = new Grid();
+        _contentGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        _contentGrid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star), MinHeight = 76 });
+        _contentGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        _contentGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        _contentGrid.RowDefinitions.Add(_processRow);
+        _contentGrid.Children.Add(headerGrid);
+        _contentGrid.Children.Add(_visualGrid);
+        _contentGrid.Children.Add(_legendDivider);
+        _contentGrid.Children.Add(_legendScroller);
+        _contentGrid.Children.Add(_processSection);
+        Grid.SetRow(_visualGrid, 1);
+        Grid.SetRow(_legendDivider, 2);
+        Grid.SetRow(_legendScroller, 3);
+        Grid.SetRow(_processSection, 4);
+
+        _cardBorder = new Border
+        {
+            Background = ResolveBrush("SurfaceBrush", "#1C1F22"),
+            BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#2C3035"),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(8),
+            Padding = new Thickness(16),
+            RenderTransform = _liftScale,
+            RenderTransformOrigin = new Windows.Foundation.Point(0.5, 0.5),
+            Child = _contentGrid,
+        };
+        _cardBorder.PointerEntered += (_, _) =>
+        {
+            _bodyHovered = true;
+            SetHoverState(true);
+            UpdateCursor();
+        };
+        _cardBorder.PointerExited += (_, _) =>
+        {
+            _bodyHovered = false;
+            SetHoverState(false);
+            UpdateCursor();
+        };
+        _cardBorder.SizeChanged += (_, e) =>
+        {
+            // The chart is the panel: the legend only gets what is left once the header and a
+            // readable plot are placed, up to a third of the card, and steps aside entirely on
+            // short cards. A flat third let a 16-core legend squash the plot to ~35px.
+            const double headerAndPaddingHeight = 166;
+            const double minimumReadableChartHeight = 120;
+            const double minimumUsefulLegendHeight = 56;
+            var available = e.NewSize.Height - headerAndPaddingHeight - minimumReadableChartHeight;
+            _legendScroller.MaxHeight = available < minimumUsefulLegendHeight
+                ? 0
+                : Math.Min(available, e.NewSize.Height * 0.33);
+            // Opacity, not Visibility: several paths own the divider's visibility already.
+            _legendDivider.Opacity = _legendScroller.MaxHeight > 0 ? 1 : 0;
+        };
+
+        // In edit mode the whole card body is the move handle.
+        _cardBorder.PointerPressed += (_, e) => BeginGesturePointer(ResizeEdge.None, _cardBorder, e);
+        _cardBorder.PointerMoved += OnGesturePointerMoved;
+        _cardBorder.PointerReleased += OnGesturePointerReleased;
+        _cardBorder.PointerCaptureLost += OnGesturePointerCaptureLost;
+
+        PointerEntered += (_, _) => SetHandlesRevealed(_isLayoutEditMode);
+        PointerExited += (_, _) => SetHandlesRevealed(_isLayoutEditMode && _gesturePointerDown);
+        EffectiveViewportChanged += OnEffectiveViewportChanged;
+
+        // Handles live in an overlay above the card so they can be switched off entirely
+        // outside edit mode. Visibility alone is not enough — an invisible-but-hit-testable
+        // handle would still swallow the pointer events chart drag-zoom depends on.
+        _resizeHandleLayer = BuildResizeHandleLayer();
+        Content = new Grid
+        {
+            Children = { _shadowHost, _cardBorder, _resizeHandleLayer },
+        };
+        Loaded += (_, _) =>
+        {
+            // Re-attach on every load. The shell rebuilds the board by removing and re-adding the
+            // same cards, and Unloaded below has already let go of the view model - without this
+            // a rebuilt board kept rendering but its panels silently stopped updating.
+            if (!ReferenceEquals(_observedPanel, Panel))
+            {
+                DetachPanel(_observedPanel);
+                AttachPanel(Panel);
+            }
+
+            RefreshFromPanel();
+        };
+
+        // Without this the card stays subscribed to its MetricPanelViewModel after the shell
+        // drops it. The view models are permanent, so every toggled-off panel left an orphaned
+        // card alive - still running RefreshFromPanel and rebuilding its chart on every scrape.
+        // WinUI can raise Unloaded after a remove-and-re-add in the same tick, by which point the
+        // card is back in the tree; only let go if it really left.
+        Unloaded += (_, _) =>
+        {
+            if (!IsLoaded)
+            {
+                DetachPanel(_observedPanel);
+            }
+        };
+    }
+
+    /// <summary>
+    /// Edit mode gates every layout affordance. Outside it the handle layer is collapsed *and*
+    /// non-hit-testable and the card ignores presses, so panels behave exactly as before this
+    /// feature existed - which is what keeps chart drag-to-zoom working after a layout is saved.
+    /// </summary>
+    public void SetLayoutEditMode(bool editing)
+    {
+        if (!editing)
+        {
+            AbortLayoutGesture();
+        }
+
+        _isLayoutEditMode = editing;
+        _resizeHandleLayer.Visibility = editing ? Visibility.Visible : Visibility.Collapsed;
+        _resizeHandleLayer.IsHitTestVisible = editing;
+        SetHandlesRevealed(false);
+
+        if (editing)
+        {
+            // Edit mode replaces hover; clear any hover lift the pointer left behind.
+            _cardBorder.Background = ResolveBrush("SurfaceBrush", "#1C1F22");
+            _cardBorder.Translation = System.Numerics.Vector3.Zero;
+        }
+
+        _cardBorder.BorderBrush = ResolveEditBorderBrush();
+
+        // In edit mode the whole card is one drag surface. Anything inside that reacts to the
+        // pointer - chart zoom, legend rows, the process list, the header chips - would steal
+        // the press and the panel would refuse to move.
+        _chart.IsHitTestVisible = !editing;
+        _legendScroller.IsHitTestVisible = !editing;
+        _processSection.IsHitTestVisible = !editing;
+        _rangeShell.IsHitTestVisible = !editing;
+        FadeTo(_rangeShell, editing ? 0d : 1d);
+        UpdateCursor();
+    }
+
+    private Brush ResolveEditBorderBrush() => _isFloating
+        ? ResolveBrush("AccentStrongBrush", "#9FEFFF")
+        : _isLayoutEditMode
+            ? ResolveBrush("AccentBrush", "#79B8FF")
+            : ResolveBrush("SurfaceStrokeBrush", "#2C3035");
+
+    // ---- Floating geometry ---------------------------------------------------------------
+    //
+    // During a gesture the shell spans this card across the whole board, pins it top-left and
+    // drives its real Width/Height and offset every frame. Real size, not a scale transform:
+    // scaling magnified the title, chips and chart like a zoom and re-rasterised all of it on
+    // every frame (28-76ms frames against 7ms idle). At real size the content simply reflows,
+    // the way a window's does while you drag its edge.
+
+    /// <summary>Lifts the card above the board. <paramref name="lift"/> adds the pick-up scale used for moves.</summary>
+    public void BeginFloat(bool lift)
+    {
+        if (_isFloating)
+        {
+            return;
+        }
+
+        _isFloating = true;
+        Canvas.SetZIndex(this, 100);
+        HorizontalAlignment = HorizontalAlignment.Left;
+        VerticalAlignment = VerticalAlignment.Top;
+        _cardBorder.BorderBrush = ResolveEditBorderBrush();
+        AnimateLiftScale(lift ? LiftScale : 1d);
+        if (lift)
+        {
+            AnimateLiftShadow(lifted: true);
+        }
+    }
+
+    /// <summary>Board-relative geometry for this frame. Width/Height are real layout sizes.</summary>
+    public void SetFloatGeometry(double x, double y, double width, double height)
+    {
+        ApplyOffset(x, y);
+
+        // Written only when changed: an identical Width still invalidates measure.
+        if (!(Math.Abs(Width - width) < 0.01))
+        {
+            Width = width;
+        }
+
+        if (!(Math.Abs(Height - height) < 0.01))
+        {
+            Height = height;
+        }
+    }
+
+    /// <summary>Hands the card back to its grid cell. The shell assigns the cell first.</summary>
+    public void EndFloat()
+    {
+        if (!_isFloating)
+        {
+            return;
+        }
+
+        _isFloating = false;
+        Width = double.NaN;
+        Height = double.NaN;
+        HorizontalAlignment = HorizontalAlignment.Stretch;
+        VerticalAlignment = VerticalAlignment.Stretch;
+        ApplyOffset(0, 0);
+        Canvas.SetZIndex(this, 0);
+        _cardBorder.BorderBrush = ResolveEditBorderBrush();
+        AnimateLiftScale(1d);
+        AnimateLiftShadow(lifted: false);
+    }
+
+    /// <summary>Displaces a sibling toward its preview cell. The shell animates the values.</summary>
+    public void SetReflowOffset(double x, double y) => ApplyOffset(x, y);
+
+    private void ApplyOffset(double x, double y)
+    {
+        if (x == _offsetX && y == _offsetY)
+        {
+            return;
+        }
+
+        _offsetX = x;
+        _offsetY = y;
+        Translation = new System.Numerics.Vector3((float)x, (float)y, 0f);
+    }
+
+    private const double LiftScale = 1.012;
+
+    private void AnimateLiftScale(double to)
+    {
+        if (!Motion.AnimationsEnabled)
+        {
+            _liftScale.ScaleX = to;
+            _liftScale.ScaleY = to;
+            return;
+        }
+
+        var storyboard = new Storyboard();
+        foreach (var axis in new[] { "ScaleX", "ScaleY" })
+        {
+            var animation = new DoubleAnimation
+            {
+                To = to,
+                Duration = new Duration(TimeSpan.FromMilliseconds(to > 1d ? MotionTokens.Quick : MotionTokens.Standard)),
+                EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
+            };
+            Storyboard.SetTarget(animation, _liftScale);
+            Storyboard.SetTargetProperty(animation, axis);
+            storyboard.Children.Add(animation);
+        }
+
+        storyboard.Begin();
+    }
+
+    private void AnimateLiftShadow(bool lifted)
+    {
+        try
+        {
+            var shadow = EnsureLiftShadow();
+            var compositor = shadow.Compositor;
+            if (lifted && _liftCaster is not null)
+            {
+                _liftCaster.IsVisible = true;
+            }
+
+            var animation = compositor.CreateScalarKeyFrameAnimation();
+            animation.InsertKeyFrame(1f, lifted ? (IsLightPaletteActive() ? 0.20f : 0.5f) : 0f);
+            animation.Duration = TimeSpan.FromMilliseconds(lifted ? MotionTokens.Quick : MotionTokens.Standard);
+
+            var batch = compositor.CreateScopedBatch(Microsoft.UI.Composition.CompositionBatchTypes.Animation);
+            shadow.StartAnimation("Opacity", animation);
+            batch.End();
+            batch.Completed += (_, _) =>
+            {
+                // A zero-opacity shadow still costs a blur pass; stop drawing it once it's gone.
+                if (!_isFloating && _liftCaster is not null)
+                {
+                    _liftCaster.IsVisible = false;
+                }
+            };
+        }
+        catch
+        {
+            // A shadow is decoration; it must never fail a gesture.
+        }
+    }
+
+    private Microsoft.UI.Composition.DropShadow EnsureLiftShadow()
+    {
+        if (_liftShadow is not null)
+        {
+            return _liftShadow;
+        }
+
+        var hostVisual = ElementCompositionPreview.GetElementVisual(_shadowHost);
+        var compositor = hostVisual.Compositor;
+        var shadow = compositor.CreateDropShadow();
+        shadow.BlurRadius = 36f;
+        shadow.Offset = new System.Numerics.Vector3(0f, 14f, 0f);
+        shadow.Color = Microsoft.UI.Colors.Black;
+        shadow.Opacity = 0f;
+
+        // The shadow is cast by a plain rectangle inset under the card's rounded corners, so the
+        // caster itself is always hidden behind the opaque card.
+        var caster = compositor.CreateSpriteVisual();
+        caster.Brush = compositor.CreateColorBrush(ResolveColor("SurfaceBrush", "#1C1F22"));
+        caster.RelativeSizeAdjustment = System.Numerics.Vector2.One;
+        caster.Size = new System.Numerics.Vector2(-8f, -8f);
+        caster.Offset = new System.Numerics.Vector3(4f, 4f, 0f);
+        caster.Shadow = shadow;
+        ElementCompositionPreview.SetElementChildVisual(_shadowHost, caster);
+
+        _liftShadow = shadow;
+        _liftCaster = caster;
+        return shadow;
+    }
+
+    private static void FadeTo(UIElement element, double to, double milliseconds = MotionTokens.Quick)
+    {
+        if (!Motion.AnimationsEnabled)
+        {
+            element.Opacity = to;
+            return;
+        }
+
+        var animation = new DoubleAnimation
+        {
+            To = to,
+            Duration = new Duration(TimeSpan.FromMilliseconds(milliseconds)),
+            EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
+        };
+        Storyboard.SetTarget(animation, element);
+        Storyboard.SetTargetProperty(animation, "Opacity");
+        var storyboard = new Storyboard();
+        storyboard.Children.Add(animation);
+        storyboard.Begin();
+    }
+
+    private Grid BuildResizeHandleLayer()
+    {
+        const double edge = 10;   // grab thickness, centred on the card's outline
+        const double corner = 22; // corner hotspot, larger because it is the common grab
+
+        var layer = new Grid
+        {
+            Visibility = Visibility.Collapsed,
+            IsHitTestVisible = false,
+            // Straddle the outline like a window border: the grab zone sits where the eye says
+            // the edge is, half inside the card and half in the gutter.
+            Margin = new Thickness(-5),
+        };
+
+        // Edges are inset by the corner size so they never sit under a corner hotspot. Without
+        // the inset the corner is unreachable along most of its length and the diagonal cursor
+        // only shows up in a few stray pixels - which is why the corner arrows felt missing.
+        void AddEdge(ResizeEdge e, HorizontalAlignment h, VerticalAlignment v, bool vertical)
+        {
+            var handle = CreateHandle(e);
+            if (vertical)
+            {
+                handle.Width = edge;
+                handle.HorizontalAlignment = h;
+                handle.VerticalAlignment = VerticalAlignment.Stretch;
+                handle.Margin = new Thickness(0, corner, 0, corner);
+            }
+            else
+            {
+                handle.Height = edge;
+                handle.VerticalAlignment = v;
+                handle.HorizontalAlignment = HorizontalAlignment.Stretch;
+                handle.Margin = new Thickness(corner, 0, corner, 0);
+            }
+            layer.Children.Add(handle);
+        }
+
+        void AddCorner(ResizeEdge e, HorizontalAlignment h, VerticalAlignment v)
+        {
+            var handle = CreateHandle(e);
+            handle.Width = corner;
+            handle.Height = corner;
+            handle.HorizontalAlignment = h;
+            handle.VerticalAlignment = v;
+            layer.Children.Add(handle);
+        }
+
+        AddEdge(ResizeEdge.Left, HorizontalAlignment.Left, VerticalAlignment.Stretch, vertical: true);
+        AddEdge(ResizeEdge.Right, HorizontalAlignment.Right, VerticalAlignment.Stretch, vertical: true);
+        AddEdge(ResizeEdge.Top, HorizontalAlignment.Stretch, VerticalAlignment.Top, vertical: false);
+        AddEdge(ResizeEdge.Bottom, HorizontalAlignment.Stretch, VerticalAlignment.Bottom, vertical: false);
+
+        AddCorner(ResizeEdge.TopLeft, HorizontalAlignment.Left, VerticalAlignment.Top);
+        AddCorner(ResizeEdge.TopRight, HorizontalAlignment.Right, VerticalAlignment.Top);
+        AddCorner(ResizeEdge.BottomLeft, HorizontalAlignment.Left, VerticalAlignment.Bottom);
+        AddCorner(ResizeEdge.BottomRight, HorizontalAlignment.Right, VerticalAlignment.Bottom);
+
+        return layer;
+    }
+
+    private const double CornerIdleOpacity = 0.9;
+    private const double EdgeIdleOpacity = 0.55;
+
+    private static readonly Dictionary<InputSystemCursorShape, InputSystemCursor> s_cursors = [];
+
+    private static InputSystemCursorShape CursorFor(ResizeEdge edge) => edge switch
+    {
+        ResizeEdge.TopLeft or ResizeEdge.BottomRight => InputSystemCursorShape.SizeNorthwestSoutheast,
+        ResizeEdge.TopRight or ResizeEdge.BottomLeft => InputSystemCursorShape.SizeNortheastSouthwest,
+        ResizeEdge.Left or ResizeEdge.Right => InputSystemCursorShape.SizeWestEast,
+        ResizeEdge.Top or ResizeEdge.Bottom => InputSystemCursorShape.SizeNorthSouth,
+        _ => InputSystemCursorShape.SizeAll,
+    };
+
+    /// <summary>
+    /// One place decides the cursor, from state rather than from whichever enter/exit event
+    /// fired last. Moving from the body onto a handle raises the body's exit after the handle's
+    /// enter on some paths, which used to wipe the resize arrows the instant they appeared.
+    /// </summary>
+    private void UpdateCursor()
+    {
+        InputSystemCursorShape? shape = null;
+        if (_gesturePointerDown)
+        {
+            shape = CursorFor(_gestureEdge);
+        }
+        else if (_isLayoutEditMode && _hoveredHandleEdge is { } edge)
+        {
+            shape = CursorFor(edge);
+        }
+        else if (_isLayoutEditMode && _bodyHovered)
+        {
+            shape = InputSystemCursorShape.SizeAll;
+        }
+
+        try
+        {
+            if (shape is not { } value)
+            {
+                ProtectedCursor = null;
+                return;
+            }
+
+            if (!s_cursors.TryGetValue(value, out var cursor))
+            {
+                cursor = InputSystemCursor.Create(value);
+                s_cursors[value] = cursor;
+            }
+
+            ProtectedCursor = cursor;
+        }
+        catch
+        {
+            // Cursor changes are cosmetic.
+        }
+    }
+
+    /// <summary>
+    /// Grips appear on the panel under the pointer only. Eight always-visible grips on fourteen
+    /// panels was 112 marks of noise; the outline already says "editable", the grips say "here".
+    /// </summary>
+    private void SetHandlesRevealed(bool revealed)
+    {
+        if (_handlesRevealed == revealed)
+        {
+            return;
+        }
+
+        _handlesRevealed = revealed;
+        foreach (var (visual, edge) in _handleVisuals)
+        {
+            FadeTo(visual, revealed ? IdleOpacityFor(edge) : 0d, revealed ? MotionTokens.Quick : MotionTokens.Standard);
+        }
+    }
+
+    private static bool IsCorner(ResizeEdge edge) => edge is ResizeEdge.TopLeft or ResizeEdge.TopRight
+        or ResizeEdge.BottomLeft or ResizeEdge.BottomRight;
+
+    private static double IdleOpacityFor(ResizeEdge edge) => IsCorner(edge) ? CornerIdleOpacity : EdgeIdleOpacity;
+
+    private Border CreateHandle(ResizeEdge edge)
+    {
+        var isCorner = IsCorner(edge);
+        var handle = new Border
+        {
+            Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent), // hit target only
+        };
+
+        // The visible grip. Corners are L-brackets hugging the card's own rounded corner, so they
+        // read as "this corner is draggable" rather than as stray squares; edges are short pills
+        // centred on the outline.
+        Border grip;
+        if (isCorner)
+        {
+            var left = edge.HasFlag(ResizeEdge.Left);
+            var top = edge.HasFlag(ResizeEdge.Top);
+            grip = new Border
+            {
+                Width = 14,
+                Height = 14,
+                HorizontalAlignment = left ? HorizontalAlignment.Left : HorizontalAlignment.Right,
+                VerticalAlignment = top ? VerticalAlignment.Top : VerticalAlignment.Bottom,
+                // The layer overhangs the card by 5px; this lands the bracket on the outline.
+                Margin = new Thickness(left ? 5 : 0, top ? 5 : 0, left ? 0 : 5, top ? 0 : 5),
+                BorderThickness = new Thickness(left ? 2.5 : 0, top ? 2.5 : 0, left ? 0 : 2.5, top ? 0 : 2.5),
+                CornerRadius = new CornerRadius(
+                    left && top ? 8 : 0,
+                    !left && top ? 8 : 0,
+                    !left && !top ? 8 : 0,
+                    left && !top ? 8 : 0),
+                BorderBrush = ResolveBrush("AccentStrongBrush", "#9FEFFF"),
+            };
+        }
+        else
+        {
+            var vertical = edge is ResizeEdge.Left or ResizeEdge.Right;
+            grip = new Border
+            {
+                Width = vertical ? 4 : 32,
+                Height = vertical ? 32 : 4,
+                CornerRadius = new CornerRadius(2),
+                Background = ResolveBrush("AccentStrongBrush", "#9FEFFF"),
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center,
+            };
+        }
+
+        grip.IsHitTestVisible = false;
+        grip.Opacity = 0;
+        handle.Child = grip;
+        _handleVisuals.Add((grip, edge));
+
+        handle.PointerEntered += (_, _) =>
+        {
+            if (!_isLayoutEditMode)
+            {
+                return;
+            }
+
+            _hoveredHandleEdge = edge;
+            SetHandlesRevealed(true);
+            FadeTo(grip, 1d, MotionTokens.Instant);
+            UpdateCursor();
+        };
+
+        handle.PointerExited += (_, _) =>
+        {
+            if (_hoveredHandleEdge == edge)
+            {
+                _hoveredHandleEdge = null;
+            }
+
+            if (!(_gesturePointerDown && _gestureEdge == edge))
+            {
+                FadeTo(grip, _handlesRevealed ? IdleOpacityFor(edge) : 0d);
+            }
+
+            UpdateCursor();
+        };
+
+        handle.PointerPressed += (_, e) => BeginGesturePointer(edge, handle, e);
+        handle.PointerMoved += OnGesturePointerMoved;
+        handle.PointerReleased += OnGesturePointerReleased;
+        handle.PointerCaptureLost += OnGesturePointerCaptureLost;
+
+        return handle;
+    }
+
+    // ---- Gesture input --------------------------------------------------------------------
+    //
+    // The card only reports pointer positions; the shell owns geometry, snapping and the board.
+    // Positions are read in window-content space, which stays still while the card moves.
+
+    private void BeginGesturePointer(ResizeEdge edge, UIElement source, PointerRoutedEventArgs e)
+    {
+        if (!_isLayoutEditMode || _gesturePointerDown || Panel is null || XamlRoot?.Content is not UIElement root)
+        {
+            return;
+        }
+
+        var point = e.GetCurrentPoint(root);
+        if (!point.Properties.IsLeftButtonPressed)
+        {
+            return;
+        }
+
+        // On touch and pen the board's ScrollViewer would otherwise claim the drag as a pan and
+        // take the pointer away mid-gesture.
+        CancelDirectManipulations();
+
+        if (source.CapturePointer(e.Pointer))
+        {
+            _gesturePointerDown = true;
+            _gestureActive = false;
+            _gestureEdge = edge;
+            _gesturePressPoint = point.Position;
+            _gestureCaptureElement = source;
+            UpdateCursor();
+        }
+
+        e.Handled = true;
+    }
+
+    private void OnGesturePointerMoved(object sender, PointerRoutedEventArgs e)
+    {
+        if (!_gesturePointerDown
+            || !ReferenceEquals(sender, _gestureCaptureElement)
+            || XamlRoot?.Content is not UIElement root)
+        {
+            return;
+        }
+
+        var position = e.GetCurrentPoint(root).Position;
+        if (!_gestureActive)
+        {
+            // A resize grip is an explicit grab and engages almost at once; a press on the body
+            // needs a little travel so an ordinary click never nudges a panel.
+            var threshold = _gestureEdge == ResizeEdge.None ? 5d : 2d;
+            var dx = position.X - _gesturePressPoint.X;
+            var dy = position.Y - _gesturePressPoint.Y;
+            if ((dx * dx) + (dy * dy) < threshold * threshold)
+            {
+                e.Handled = true;
+                return;
+            }
+
+            _gestureActive = true;
+            LayoutGestureStarted?.Invoke(this, new LayoutGestureEventArgs(_gestureEdge, _gesturePressPoint));
+        }
+
+        LayoutGestureMoved?.Invoke(this, new LayoutGestureEventArgs(_gestureEdge, position));
+        e.Handled = true;
+    }
+
+    private void OnGesturePointerReleased(object sender, PointerRoutedEventArgs e)
+    {
+        if (!ReferenceEquals(sender, _gestureCaptureElement))
+        {
+            return;
+        }
+
+        FinishGesturePointer(cancelled: false);
+        e.Handled = true;
+    }
+
+    private void OnGesturePointerCaptureLost(object sender, PointerRoutedEventArgs e)
+    {
+        if (!ReferenceEquals(sender, _gestureCaptureElement))
+        {
+            return;
+        }
+
+        // Capture lost without a release (Alt+Tab, a system prompt): put everything back
+        // rather than commit a layout the user never actually let go of.
+        FinishGesturePointer(cancelled: true);
+    }
+
+    private void FinishGesturePointer(bool cancelled)
+    {
+        if (!_gesturePointerDown)
+        {
+            return;
+        }
+
+        var wasActive = _gestureActive;
+        var element = _gestureCaptureElement;
+        _gesturePointerDown = false;
+        _gestureActive = false;
+        _gestureCaptureElement = null;
+        element?.ReleasePointerCaptures();
+        UpdateCursor();
+        SetHandlesRevealed(_isLayoutEditMode && (_bodyHovered || _hoveredHandleEdge is not null));
+
+        if (wasActive)
+        {
+            LayoutGestureEnded?.Invoke(this, new LayoutGestureEndedEventArgs(cancelled));
+        }
+    }
+
+    /// <summary>Drops the pointer interaction without raising events; the shell cancelled it.</summary>
+    public void AbortLayoutGesture()
+    {
+        if (!_gesturePointerDown)
+        {
+            return;
+        }
+
+        var element = _gestureCaptureElement;
+        _gesturePointerDown = false;
+        _gestureActive = false;
+        _gestureCaptureElement = null;
+        element?.ReleasePointerCaptures();
+        UpdateCursor();
+    }
+
+    public MetricPanelViewModel? Panel
+    {
+        get => (MetricPanelViewModel?)GetValue(PanelProperty);
+        set => SetValue(PanelProperty, value);
+    }
+
+    private static void OnPanelChanged(DependencyObject dependencyObject, DependencyPropertyChangedEventArgs args)
+    {
+        var control = (TelemetryPanelCard)dependencyObject;
+        if (!ReferenceEquals(args.OldValue, args.NewValue))
+        {
+            control._processSectionExpanded = false;
+            control._lastRenderedProcessRows = null;
+            control._lastRenderedSupportsProcessTable = null;
+            control._lastRenderedGaugeMode = null;
+            control._thresholdLevel = 0;
+        }
+
+        control.DetachPanel(args.OldValue as MetricPanelViewModel);
+        control.AttachPanel(args.NewValue as MetricPanelViewModel);
+        control.RefreshFromPanel();
+    }
+
+    private void AttachPanel(MetricPanelViewModel? panel)
+    {
+        _observedPanel = panel;
+        if (panel is not null)
+        {
+            // Idempotent: a second attach must not double every refresh.
+            panel.PropertyChanged -= OnPanelPropertyChanged;
+            panel.PropertyChanged += OnPanelPropertyChanged;
+        }
+    }
+
+    private void DetachPanel(MetricPanelViewModel? panel)
+    {
+        if (panel is null)
+        {
+            return;
+        }
+
+        panel.PropertyChanged -= OnPanelPropertyChanged;
+        if (ReferenceEquals(_observedPanel, panel))
+        {
+            _observedPanel = null;
+        }
+    }
+
+    private void OnPanelPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (_isRenderingSuspended || (!_isEffectivelyVisible && !IsPriorityPanelProperty(e.PropertyName)))
+        {
+            _deferredRefreshPending = true;
+            return;
+        }
+
+        if (_refreshQueued)
+        {
+            return;
+        }
+
+        _refreshQueued = true;
+        _ = DispatcherQueue.TryEnqueue(DispatcherQueuePriority.Low, () =>
+        {
+            _refreshQueued = false;
+            RefreshFromPanel();
+        });
+    }
+
+    private void RefreshFromPanel()
+    {
+        var panel = Panel;
+        if (panel is null)
+        {
+            UpdateBadgeIcon(null);
+            _footerText.Text = string.Empty;
+            _footerText.Visibility = Visibility.Collapsed;
+            _scaleText.Text = string.Empty;
+            _scalePill.Visibility = Visibility.Collapsed;
+            _titleText.Text = "Telemetry";
+            _currentValueText.Text = "Waiting";
+            _secondaryValueText.Text = "Collecting hardware samples";
+            _chart.Series = Array.Empty<ChartSeriesViewModel>();
+            _chart.CeilingValue = 0d;
+            _chart.EmptyStateText = "Waiting for samples";
+            _legendHost.Children.Clear();
+            _legendRows.Clear();
+            _legendScroller.Visibility = Visibility.Collapsed;
+            _processRowsHost.Children.Clear();
+            _processRowParts.Clear();
+            _processSection.Visibility = Visibility.Collapsed;
+            _processSectionExpanded = false;
+            RefreshProcessSortButtons(null);
+            RefreshVisualMode(null);
+            _lastRenderedSeries = null;
+            _lastRenderedProcessRows = null;
+            _lastRenderedWindowStartUtc = default;
+            _lastRenderedWindowEndUtc = default;
+            _lastRenderedCeilingValue = double.NaN;
+            return;
+        }
+
+        UpdateBadgeIcon(panel);
+
+        // Unzoomed this line reads "1h replay", which is exactly what the highlighted range chip
+        // a few inches to the right already says \u2014 a redundant caption on every card in the
+        // default state. Zoomed it reports the actual span ("zoomed 3.2m"), which nothing else
+        // shows, so it earns its place only then.
+        _footerText.Visibility = panel.IsZoomed ? Visibility.Visible : Visibility.Collapsed;
+        if (panel.IsZoomed)
+        {
+            _footerText.Text = $"\u23F8 {panel.FooterText}";
+            _footerText.Opacity = 0.85;
+            _footerText.Foreground = ResolveBrush("AccentBrush", "#66E7FF");
+        }
+        // Uppercased for the eyebrow treatment: "CPU Total" -> "CPU TOTAL".
+        _titleText.Text = panel.Title;
+        _currentValueText.Text = panel.CurrentValue;
+        _secondaryValueText.Text = panel.SecondaryValue;
+        _scaleText.Text = panel.ScaleLabel;
+        _chart.EmptyStateText = panel.EmptyStateText;
+        _scalePill.Visibility = string.IsNullOrWhiteSpace(panel.ScaleLabel) ? Visibility.Collapsed : Visibility.Visible;
+
+        if (!_isEffectivelyVisible)
+        {
+            ApplyPalette(panel);
+            return;
+        }
+
+        var chartChanged =
+            !ReferenceEquals(_lastRenderedSeries, panel.VisibleSeries) ||
+            _lastRenderedUnit != panel.Unit ||
+            _lastRenderedWindowStartUtc != panel.WindowStartUtc ||
+            _lastRenderedWindowEndUtc != panel.WindowEndUtc ||
+            !double.Equals(_lastRenderedCeilingValue, panel.ChartCeilingValue);
+        if (chartChanged)
+        {
+            _chart.Series = panel.VisibleSeries;
+            _chart.Unit = panel.Unit;
+            _chart.WindowStartUtc = panel.WindowStartUtc;
+            _chart.WindowEndUtc = panel.WindowEndUtc;
+            _chart.CeilingValue = panel.ChartCeilingValue;
+            _lastRenderedSeries = panel.VisibleSeries;
+            _lastRenderedUnit = panel.Unit;
+            _lastRenderedWindowStartUtc = panel.WindowStartUtc;
+            _lastRenderedWindowEndUtc = panel.WindowEndUtc;
+            _lastRenderedCeilingValue = panel.ChartCeilingValue;
+            RefreshLegend(panel);
+        }
+
+        _gauge.Value = panel.GaugeValue;
+        UpdateThresholdLevel(panel);
+        _gauge.AccentBrush = ResolveThresholdBrush(panel);
+        _gauge.Caption = panel.PrefersGaugeVisual ? "Capacity" : "Live";
+
+        if (_processSectionExpanded && !ReferenceEquals(_lastRenderedProcessRows, panel.ProcessRows))
+        {
+            RefreshProcessRows(panel);
+            _lastRenderedProcessRows = panel.ProcessRows;
+        }
+
+        if (_lastRenderedSortMode != panel.ProcessSortMode)
+        {
+            RefreshProcessSortButtons(panel);
+            _lastRenderedSortMode = panel.ProcessSortMode;
+        }
+
+        if (_lastRenderedSupportsProcessTable != panel.SupportsProcessTable || _lastRenderedGaugeMode != panel.PrefersGaugeVisual)
+        {
+            RefreshVisualMode(panel);
+            _lastRenderedSupportsProcessTable = panel.SupportsProcessTable;
+            _lastRenderedGaugeMode = panel.PrefersGaugeVisual;
+        }
+
+        ApplyPalette(panel);
+    }
+
+    private void OnEffectiveViewportChanged(FrameworkElement sender, EffectiveViewportChangedEventArgs args)
+    {
+        // EffectiveViewport is expressed in THIS element's coordinate space, so for a panel
+        // scrolled far out of view it is still a non-empty rect - it simply does not intersect
+        // the element. Testing Width/Height > 0 was therefore true essentially always, the
+        // off-screen gate never engaged, and all 14 panels kept redrawing their charts even
+        // when four were visible. Intersect against the element's own bounds instead.
+        var viewport = args.EffectiveViewport;
+        var bounds = new Windows.Foundation.Rect(0, 0, ActualWidth, ActualHeight);
+        var isVisible = ActualWidth <= 0 || ActualHeight <= 0
+            || (viewport.Right > bounds.Left
+                && viewport.Left < bounds.Right
+                && viewport.Bottom > bounds.Top
+                && viewport.Top < bounds.Bottom);
+        if (_isEffectivelyVisible == isVisible)
+        {
+            return;
+        }
+
+        _isEffectivelyVisible = isVisible;
+        if (_isEffectivelyVisible && _deferredRefreshPending)
+        {
+            _deferredRefreshPending = false;
+            RefreshFromPanel();
+        }
+    }
+
+    public void SetRenderingSuspended(bool suspended)
+    {
+        if (_isRenderingSuspended == suspended)
+        {
+            return;
+        }
+
+        _isRenderingSuspended = suspended;
+        if (!_isRenderingSuspended && _deferredRefreshPending)
+        {
+            _deferredRefreshPending = false;
+            RefreshFromPanel();
+        }
+    }
+
+    /// <summary>Optimizes the panel for window resize — collapses heavy elements and flattens corners.</summary>
+    public void SetResizeMode(bool resizing)
+    {
+        // Corner radius intentionally left alone. Flattening 8 -> 4 -> 8 made every card visibly
+        // pop at the start and end of a drag-resize, and rounded corners are not what makes a
+        // resize expensive — collapsing the charts below is where the real saving is.
+
+        // Suspend chart/gauge rendering only during resize
+        _chart.SetRenderingSuspended(resizing);
+        _gauge.SetRenderingSuspended(resizing);
+
+        // Collapse charts and legends during resize so WinUI's layout engine
+        // skips measuring them entirely — this is the biggest layout cost saver
+        _chart.Visibility = resizing ? Visibility.Collapsed : Visibility.Visible;
+        _legendScroller.Visibility = resizing ? Visibility.Collapsed : Visibility.Visible;
+        _processSection.Visibility = !resizing && Panel?.SupportsProcessTable == true && _processSectionExpanded
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        _processRow.Height = _processSection.Visibility == Visibility.Visible
+            ? new GridLength(1.2, GridUnitType.Star)
+            : GridLength.Auto;
+    }
+
+    private static bool IsPriorityPanelProperty(string? propertyName)
+    {
+        return string.Equals(propertyName, nameof(MetricPanelViewModel.CurrentValue), StringComparison.Ordinal) ||
+               string.Equals(propertyName, nameof(MetricPanelViewModel.SecondaryValue), StringComparison.Ordinal) ||
+               string.Equals(propertyName, nameof(MetricPanelViewModel.FooterText), StringComparison.Ordinal) ||
+               string.Equals(propertyName, nameof(MetricPanelViewModel.ScaleLabel), StringComparison.Ordinal);
+    }
+
+    public void RefreshThemeResources()
+    {
+        // Use theme resource brushes where possible — they update in-place when theme changes.
+        // Only use CreateSurfaceGradient for elements that need distinct gradients.
+        var strokeBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E");
+        var mutedBrush = ResolveBrush("TextMutedBrush", "#7D9AB6");
+        var cardBg = ResolveBrush("SurfaceBrush", "#1C1F22");
+
+        _cardBorder.Background = cardBg;
+        // Constant 1px. Every thickness change is a layout pass, and 0.9 here vs 1 elsewhere
+        // shifted the card's content by a fraction of a pixel on each theme change.
+        _cardBorder.BorderThickness = new Thickness(1);
+        _cardBorder.BorderBrush = ResolveEditBorderBrush();
+        if (_liftCaster is not null)
+        {
+            _liftCaster.Brush = _liftCaster.Compositor.CreateColorBrush(ResolveColor("SurfaceBrush", "#1C1F22"));
+        }
+
+        foreach (var (grip, edge) in _handleVisuals)
+        {
+            if (IsCorner(edge))
+            {
+                grip.BorderBrush = ResolveBrush("AccentStrongBrush", "#9FEFFF");
+            }
+            else
+            {
+                grip.Background = ResolveBrush("AccentStrongBrush", "#9FEFFF");
+            }
+        }
+
+        _cardBorder.Opacity = 1.0;
+        _cardBorder.Translation = new System.Numerics.Vector3(0f, 0f, 0f);
+        _rangeShell.Background = BrushFactory.CreateBrush("#00FFFFFF");
+        // Both are intentionally borderless — re-applying a stroke here would restore the boxes.
+        _scalePill.Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
+        _chartFrame.Background = BrushFactory.CreateBrush("#00FFFFFF");
+        _processSection.Background = BrushFactory.CreateBrush("#00FFFFFF");
+        _legendDivider.Background = strokeBrush;
+        _legendScroller.Background = null;
+        _processScroller.Background = null;
+        _processLabelText.Foreground = mutedBrush;
+        _activityLabelText.Foreground = mutedBrush;
+        _valueLabelText.Foreground = mutedBrush;
+
+        _badgeBorder.Background = ResolveBrush("SurfaceInsetBrush", "#091321");
+
+        _processToggleButton.RefreshThemeResources();
+        _sortHighestButton.RefreshThemeResources();
+        _sortLowestButton.RefreshThemeResources();
+        _sortNameButton.RefreshThemeResources();
+
+        var secondaryBrush = ResolveBrush("TextSecondaryBrush", "#B7CCE1");
+        var primaryBrush = ResolveBrush("TextPrimaryBrush", "#F2F8FF");
+        foreach (var rowParts in _legendRows.Values)
+        {
+            // Legend rows are deliberately borderless and transparent at rest; re-applying a
+            // background here on theme change would put the boxes back.
+            rowParts.InnerBorder.Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
+            rowParts.NameText.Foreground = secondaryBrush;
+            rowParts.ValueText.Foreground = primaryBrush;
+        }
+
+        foreach (var rowParts in _processRowParts.Values)
+        {
+            rowParts.NameText.Foreground = primaryBrush;
+            rowParts.ValueText.Foreground = primaryBrush;
+            rowParts.CaptionText.Foreground = mutedBrush;
+        }
+
+        if (Panel is { } panel)
+        {
+            UpdateBadgeIcon(panel);
+            ApplyPalette(panel);
+            // Re-apply sort button states so active highlights use the new theme colors.
+            RefreshProcessSortButtons(panel);
+        }
+        else
+        {
+            _footerText.Foreground = ResolveBrush("TextMutedBrush", "#7D9AB6");
+            _scaleText.Foreground = ResolveBrush("TextSecondaryBrush", "#B7CCE1");
+            _titleText.Foreground = ResolveBrush("TextPrimaryBrush", "#F2F8FF");
+            _currentValueText.Foreground = ResolveBrush("TextPrimaryBrush", "#F2F8FF");
+            _secondaryValueText.Foreground = ResolveBrush("TextSecondaryBrush", "#B7CCE1");
+            _processSectionTitleText.Foreground = ResolveBrush("TextSecondaryBrush", "#B7CCE1");
+        }
+
+        _chart.RefreshThemeResources();
+        _gauge.RefreshThemeResources();
+    }
+
+    private void RefreshLegend(MetricPanelViewModel panel)
+    {
+        if (panel.VisibleSeries.Count == 0)
+        {
+            _legendRows.Clear();
+            _legendHost.Children.Clear();
+            _legendScroller.Visibility = Visibility.Collapsed;
+            _legendDivider.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        // A single-series panel already states its value in the header (and again in the gauge,
+        // where there is one), so a one-row legend repeating it a third time is noise — and with
+        // nothing to compare against, click-to-isolate has nothing to isolate from.
+        var legendEarnsItsSpace = !panel.SupportsProcessTable && panel.VisibleSeries.Count > 1;
+        if (!legendEarnsItsSpace)
+        {
+            _legendRows.Clear();
+            _legendHost.Children.Clear();
+            _legendScroller.Visibility = Visibility.Collapsed;
+            _legendDivider.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        _legendScroller.Visibility = Visibility.Visible;
+        _legendDivider.Visibility = _legendScroller.Visibility;
+
+        if (_legendRows.Count == 0 && _legendHost.Children.Count > 0)
+        {
+            _legendHost.Children.Clear();
+        }
+
+        // Rows are keyed by series key, not display name. Two series can share a name (sensors
+        // from different hardware, or a renamed adapter in loaded history), and keying by name
+        // put the same row in the list twice - adding an element that already has a parent is
+        // a hard COMException (0x800F1000) in WinUI.
+        var activeKeys = new HashSet<string>(panel.VisibleSeries.Select(LegendKey), StringComparer.OrdinalIgnoreCase);
+        foreach (var staleKey in _legendRows.Keys.Where(key => !activeKeys.Contains(key)).ToArray())
+        {
+            _legendHost.Children.Remove(_legendRows[staleKey].Row);
+            _legendRows.Remove(staleKey);
+        }
+
+        var orderedRows = new List<UIElement>(panel.VisibleSeries.Count);
+        var seenKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        for (var index = 0; index < panel.VisibleSeries.Count; index++)
+        {
+            var series = panel.VisibleSeries[index];
+            var legendKey = LegendKey(series);
+            if (!seenKeys.Add(legendKey))
+            {
+                continue;
+            }
+
+            var value = series.Points.Count == 0
+                ? "--"
+                : FormatValue(series.Points[^1].Value, panel.Unit);
+
+            if (!_legendRows.TryGetValue(legendKey, out var rowParts))
+            {
+                rowParts = CreateLegendRow(series.Name, series.StrokeBrush);
+                _legendRows.Add(legendKey, rowParts);
+                _legendHost.Children.Add(rowParts.Row);
+
+                // Click legend row to isolate/focus that series on the chart
+                var capturedKey = series.Key;
+                rowParts.Row.Tapped += (_, _) => Panel?.ToggleSeriesFocus(capturedKey);
+            }
+
+            // Dim unfocused legend rows when a series is focused
+            var isFocused = panel.FocusedSeriesKey is null ||
+                string.Equals(series.Key, panel.FocusedSeriesKey, StringComparison.OrdinalIgnoreCase);
+            rowParts.Row.Opacity = isFocused ? 1.0 : 0.35;
+
+            rowParts.ValueText.Text = value;
+            orderedRows.Add(rowParts.Row);
+        }
+
+        if (_legendHost.Children.Count != orderedRows.Count ||
+            !_legendHost.Children.Cast<UIElement>().SequenceEqual(orderedRows))
+        {
+            _legendHost.Children.Clear();
+            foreach (var row in orderedRows)
+            {
+                _legendHost.Children.Add(row);
+            }
+        }
+    }
+
+    private static string LegendKey(ChartSeriesViewModel series)
+        => string.IsNullOrEmpty(series.Key) ? series.Name : series.Key;
+
+    private void RefreshProcessRows(MetricPanelViewModel panel)
+    {
+        if (!panel.SupportsProcessTable)
+        {
+            _processRowsHost.Children.Clear();
+            _processRowParts.Clear();
+
+            return;
+        }
+
+        _processSectionTitleText.Text = panel.ProcessTableTitle;
+        if (panel.ProcessRows.Count == 0)
+        {
+            _processRowParts.Clear();
+            _processRowsHost.Children.Clear();
+            _processRowsHost.Children.Add(CreateEmptyText("Process table warming up"));
+
+            return;
+        }
+
+        // One row per key. A repeated key would add the same element twice (a WinUI
+        // COMException) on the fast path, or throw a duplicate-key exception on the slow one.
+        var seenRowKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var rows = panel.ProcessRows.Where(row => seenRowKeys.Add(row.Key)).ToList();
+
+        // Fast path: if all rows already exist as UI elements, just reorder + update in-place.
+        // Skip fast path if a pin state changed (need full rebuild for bold/dot visuals).
+        var forceRebuild = panel._forceProcessRowRebuild;
+        if (forceRebuild) panel._forceProcessRowRebuild = false; // consume the flag
+        var allExist = !forceRebuild && rows.Count <= _processRowParts.Count;
+        if (allExist)
+        {
+            for (var i = 0; i < rows.Count; i++)
+            {
+                if (!_processRowParts.ContainsKey(rows[i].Key))
+                {
+                    allExist = false;
+                    break;
+                }
+            }
+        }
+
+        if (allExist && rows.Count > 0)
+        {
+            var requiresReorder = _processRowsHost.Children.Count != rows.Count;
+            for (var i = 0; i < rows.Count; i++)
+            {
+                var item = rows[i];
+                var rp = _processRowParts[item.Key];
+                rp.NameText.Text = item.Name;
+                rp.ValueText.Text = item.Value;
+                rp.CaptionText.Text = item.Caption;
+                rp.Row.Tag = item.Key;
+                var intensity = Math.Clamp(item.Intensity, 0d, 1d);
+                if (rp.FillBrush.GradientStops.Count >= 3)
+                {
+                    rp.FillBrush.GradientStops[1].Offset = intensity;
+                    rp.FillBrush.GradientStops[2].Offset = Math.Min(intensity + 0.03, 1.0);
+                }
+
+                if (!requiresReorder)
+                {
+                    requiresReorder =
+                        _processRowsHost.Children[i] is not FrameworkElement current ||
+                        !string.Equals(current.Tag as string, item.Key, StringComparison.OrdinalIgnoreCase);
+                }
+            }
+
+            if (requiresReorder)
+            {
+                _processRowsHost.Children.Clear();
+                for (var i = 0; i < rows.Count; i++)
+                {
+                    _processRowsHost.Children.Add(_processRowParts[rows[i].Key].Row);
+                }
+            }
+
+            // Remove entries for rows no longer shown
+            if (_processRowParts.Count > rows.Count)
+            {
+                var activeKeys = new HashSet<string>(rows.Count, StringComparer.OrdinalIgnoreCase);
+                foreach (var r in rows) activeKeys.Add(r.Key);
+                foreach (var key in _processRowParts.Keys.Where(k => !activeKeys.Contains(k)).ToArray())
+                    _processRowParts.Remove(key);
+            }
+
+            return;
+        }
+
+        // Slow path: rebuild the row list (sort change, new/removed processes)
+        _processRowsHost.Children.Clear();
+        _processRowParts.Clear();
+
+        for (var i = 0; i < rows.Count; i++)
+        {
+            var item = rows[i];
+            var rowParts = CreateProcessRow(item, panel.AccentBrush);
+            rowParts.Row.Tag = item.Key;
+            _processRowParts.Add(item.Key, rowParts);
+            _processRowsHost.Children.Add(rowParts.Row);
+
+            // Track press/release to distinguish taps from scroll drags.
+            // Use AddHandler with handledEventsToo so events fire even when
+            // the parent ScrollViewer has already marked them as Handled.
+            var processName = item.Name;
+            Windows.Foundation.Point pressPos = default;
+            rowParts.Row.AddHandler(PointerPressedEvent, new PointerEventHandler((sender, args) =>
+            {
+                pressPos = args.GetCurrentPoint((UIElement)sender).Position;
+            }), true);
+            rowParts.Row.AddHandler(PointerReleasedEvent, new PointerEventHandler((sender, args) =>
+            {
+                if (Panel is not { } p) return;
+                var releasePos = args.GetCurrentPoint((UIElement)sender).Position;
+                // Only count as a click if the pointer didn't move far (not a scroll)
+                var dx = Math.Abs(releasePos.X - pressPos.X);
+                var dy = Math.Abs(releasePos.Y - pressPos.Y);
+                if (dx < 12 && dy < 12)
+                {
+                    p.ToggleProcessPin(processName);
+                }
+                args.Handled = true;
+            }), true);
+        }
+
+    }
+
+    private void RefreshVisualMode(MetricPanelViewModel? panel)
+    {
+        var showGauge = panel?.PrefersGaugeVisual == true;
+        _gaugeHost.Visibility = showGauge ? Visibility.Visible : Visibility.Collapsed;
+        Grid.SetColumn(_chartFrame, showGauge ? 1 : 0);
+        Grid.SetColumnSpan(_chartFrame, showGauge ? 1 : 2);
+        _legendScroller.Visibility = panel?.SupportsProcessTable == true ? Visibility.Collapsed : Visibility.Visible;
+        var supportsProcesses = panel?.SupportsProcessTable == true;
+        _processToggleButton.Visibility = supportsProcesses ? Visibility.Visible : Visibility.Collapsed;
+        _processToggleButton.Text = _processSectionExpanded ? "Hide processes" : "Processes";
+        _processToggleButton.IsActive = _processSectionExpanded;
+        _processToggleButton.IsFilled = _processSectionExpanded;
+        _processSection.Visibility = supportsProcesses && _processSectionExpanded
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+
+        // Expanded, the list shares the card's height with the chart instead of growing the
+        // card past its grid span; collapsed, the row takes nothing.
+        _processRow.Height = _processSection.Visibility == Visibility.Visible
+            ? new GridLength(1.2, GridUnitType.Star)
+            : GridLength.Auto;
+    }
+
+    private void OnProcessSectionToggleClick(object? sender, EventArgs e)
+    {
+        if (Panel?.SupportsProcessTable != true)
+        {
+            return;
+        }
+
+        _processSectionExpanded = !_processSectionExpanded;
+        if (_processSectionExpanded && Panel is { } panel)
+        {
+            RefreshProcessRows(panel);
+            _lastRenderedProcessRows = panel.ProcessRows;
+        }
+
+        RefreshVisualMode(Panel);
+        if (_processSectionExpanded && Motion.AnimationsEnabled)
+        {
+            // The list arrives rather than pops in; the chart's row resizes underneath it.
+            _processSection.Opacity = 0;
+            FadeTo(_processSection, 1d, MotionTokens.Standard);
+        }
+    }
+
+    private void RefreshProcessSortButtons(MetricPanelViewModel? panel)
+    {
+        ApplyRangeState(_sortHighestButton, panel?.ProcessSortMode == ProcessSortMode.Highest);
+        ApplyRangeState(_sortLowestButton, panel?.ProcessSortMode == ProcessSortMode.Lowest);
+        var isNameSort = panel?.ProcessSortMode is ProcessSortMode.Name or ProcessSortMode.NameReverse;
+        ApplyRangeState(_sortNameButton, isNameSort);
+        _sortNameButton.Text = panel?.ProcessSortMode == ProcessSortMode.NameReverse ? "Name \u2191" : "Name \u2193";
+    }
+
+    private static void ApplyRangeState(ActionChip control, bool isActive)
+    {
+        control.IsActive = isActive;
+        control.IsFilled = isActive;
+        control.Opacity = isActive ? 1 : 0.76;
+    }
+
+    private void ApplyPalette(MetricPanelViewModel panel)
+    {
+        _badgeBorder.Background = ResolveBrush("SurfaceInsetBrush", "#091321");
+        _footerText.Foreground = ResolveBrush("TextMutedBrush", "#7D9AB6");
+        _scaleText.Foreground = ResolveBrush("TextSecondaryBrush", "#B7CCE1");
+        _titleText.Foreground = ResolveBrush("TextPrimaryBrush", "#F2F8FF");
+        _secondaryValueText.Foreground = ResolveBrush("TextSecondaryBrush", "#B7CCE1");
+        _processSectionTitleText.Foreground = ResolveBrush("TextSecondaryBrush", "#B7CCE1");
+
+        // Colour-code the value and badge by threshold state.
+        var level = UpdateThresholdLevel(panel);
+        _badgeBorder.BorderBrush = ResolveThresholdBrush(panel);
+        _currentValueText.Foreground = level switch
+        {
+            2 => ResolveBrush("CriticalBrush", "#FF9761"),
+            1 => ResolveBrush("WarningBrush", "#F0C968"),
+            _ => ResolveBrush("TextPrimaryBrush", "#F2F8FF"),
+        };
+    }
+
+    private const double ThresholdHysteresis = 2d;
+    private int _thresholdLevel;
+
+    /// <summary>
+    /// Normal (0), warning (1) or critical (2), with hysteresis: rising crosses at the threshold,
+    /// falling must clear it by a margin. A reading hovering at 74.8/75.2 used to flip the
+    /// colour on every sample. Temperatures have their own thresholds - previously none at all,
+    /// so the hottest readings in the app were the only ones that never turned amber or red.
+    /// </summary>
+    private int UpdateThresholdLevel(MetricPanelViewModel panel)
+    {
+        var (value, warning, critical) = panel.Unit == MetricUnit.Celsius
+            ? (HottestReading(panel), 80d, 90d)
+            : (panel.UtilizationPercent, 75d, 90d);
+
+        _thresholdLevel = value > critical ? 2
+            : _thresholdLevel == 2 && value > critical - ThresholdHysteresis ? 2
+            : value > warning ? 1
+            : _thresholdLevel >= 1 && value > warning - ThresholdHysteresis ? 1
+            : 0;
+        return _thresholdLevel;
+    }
+
+    private static double HottestReading(MetricPanelViewModel panel)
+    {
+        var hottest = 0d;
+        foreach (var series in panel.VisibleSeries)
+        {
+            if (series.Points.Count > 0)
+            {
+                hottest = Math.Max(hottest, series.Points[^1].Value);
+            }
+        }
+
+        return hottest;
+    }
+
+    /// <summary>Badge and gauge accent: threshold colour for load and heat, the panel accent otherwise.</summary>
+    private Brush ResolveThresholdBrush(MetricPanelViewModel panel)
+    {
+        var applies = panel.Unit == MetricUnit.Celsius
+            || (panel.Unit == MetricUnit.Percent && panel.UtilizationPercent > 0);
+        if (!applies)
+        {
+            return panel.AccentBrush;
+        }
+
+        return _thresholdLevel switch
+        {
+            2 => ResolveBrush("CriticalBrush", "#FF9761"),
+            1 => ResolveBrush("WarningBrush", "#F0C968"),
+            _ => panel.AccentBrush,
+        };
+    }
+
+    private void SetHoverState(bool isHovered)
+    {
+        // In edit mode the accent border IS the affordance saying "this panel is draggable".
+        // Letting hover overwrite it meant the signal vanished the moment you moved the pointer
+        // toward a panel to grab it.
+        if (_isFloating || _isLayoutEditMode)
+        {
+            return;
+        }
+
+        // Border thickness stays constant. Animating it (0.9 -> 1.15) re-ran a full layout pass
+        // on every pointer enter/leave and nudged the card's content by a quarter pixel, which is
+        // exactly the sort of thing that reads as "loose". Hover now changes only brushes and a
+        // composition-level translation, neither of which invalidates layout.
+        _cardBorder.BorderBrush = isHovered
+            ? ResolveBrush("SurfaceStrongBrush", "#292D31")
+            : ResolveBrush("SurfaceStrokeBrush", "#2C3035");
+        _cardBorder.Background = isHovered
+            ? ResolveBrush("SurfaceElevatedBrush", "#222529")
+            : ResolveBrush("SurfaceBrush", "#1C1F22");
+
+        // 1px lift, composition-only — free, and enough to read as responsive.
+        _cardBorder.Translation = new System.Numerics.Vector3(0f, isHovered ? -1f : 0f, 0f);
+    }
+
+    private ActionChip CreateProcessSortButton(string text, ProcessSortMode sortMode)
+    {
+        var button = new ActionChip
+        {
+            Tag = sortMode,
+            MinHeight = 28,
+            MinWidth = 58,
+            Text = text,
+        };
+
+        button.Click += OnProcessSortClick;
+        return button;
+    }
+
+    private void OnProcessSortClick(object? sender, EventArgs e)
+    {
+        if (sender is not ActionChip { Tag: ProcessSortMode sortMode })
+        {
+            return;
+        }
+
+        if (Panel is { } panel)
+        {
+            // Toggle Name → NameReverse on second click
+            if (sortMode == ProcessSortMode.Name && panel.ProcessSortMode == ProcessSortMode.Name)
+            {
+                sortMode = ProcessSortMode.NameReverse;
+            }
+            else if (sortMode == ProcessSortMode.Name && panel.ProcessSortMode == ProcessSortMode.NameReverse)
+            {
+                sortMode = ProcessSortMode.Name;
+            }
+
+            panel.ProcessSortMode = sortMode;
+            RefreshProcessSortButtons(panel);
+        }
+    }
+
+    private void OnChartZoomSelectionRequested(object? sender, ChartZoomSelectionEventArgs e)
+    {
+        if (PanelZoomSelectionRequested is not null)
+        {
+            PanelZoomSelectionRequested.Invoke(this, e);
+            return;
+        }
+
+        Panel?.ZoomToWindow(e.StartUtc, e.EndUtc);
+    }
+
+    private void OnChartZoomResetRequested(object? sender, EventArgs e)
+    {
+        if (PanelZoomResetRequested is not null)
+        {
+            PanelZoomResetRequested.Invoke(this, e);
+            return;
+        }
+
+        Panel?.ResetZoom();
+    }
+
+    private static (ClickableBorder Row, Border InnerBorder, TextBlock NameText, TextBlock ValueText, Ellipse Dot) CreateLegendRow(string name, Brush strokeBrush)
+    {
+        var row = new Grid();
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+        var dot = new Ellipse
+        {
+            Width = 8,
+            Height = 8,
+            Margin = new Thickness(0, 2, 8, 0),
+            Fill = strokeBrush,
+        };
+        row.Children.Add(dot);
+
+        var nameText = new TextBlock
+        {
+            FontSize = 12,
+            Foreground = ResolveBrush("TextSecondaryBrush", "#B7CCE1"),
+            Text = name,
+            TextTrimming = TextTrimming.CharacterEllipsis,
+        };
+        row.Children.Add(nameText);
+        Grid.SetColumn(nameText, 1);
+
+        // Same family as the headline, tabular. Bahnschrift here made two numeral styles in one card.
+        var valueText = new TextBlock
+        {
+            FontFamily = new FontFamily("Segoe UI Variable Text"),
+            FontSize = 12,
+            FontWeight = FontWeights.SemiBold,
+            Foreground = ResolveBrush("TextPrimaryBrush", "#F2F8FF"),
+            Text = "--",
+            MinWidth = 42,
+            TextAlignment = TextAlignment.Right,
+        };
+        UseTabularFigures(valueText);
+        row.Children.Add(valueText);
+        Grid.SetColumn(valueText, 2);
+
+        // Borderless by design. A 16-core CPU panel renders 16 of these; giving each its own
+        // outline and inset fill turned the card into a stack of boxes. The row reads as a row —
+        // the colour dot and the value column carry the structure, and hover supplies the only
+        // affordance needed for the click-to-isolate behaviour.
+        var border = new Border
+        {
+            Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
+            BorderThickness = new Thickness(0),
+            CornerRadius = new CornerRadius(8),
+            Padding = new Thickness(10, 6, 10, 6),
+            Child = row,
+        };
+
+        // Hover reads current theme each time — no stale captured brushes
+        border.PointerEntered += (_, _) =>
+        {
+            border.Background = ResolveBrush("SurfaceElevatedBrush", "#112033");
+        };
+        border.PointerExited += (_, _) =>
+        {
+            border.Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
+        };
+
+        var wrapper = new ClickableBorder(border);
+        return (wrapper, border, nameText, valueText, dot);
+    }
+
+    private static (ClickableBorder Row, TextBlock NameText, TextBlock ValueText, TextBlock CaptionText, LinearGradientBrush FillBrush, Border RowBorder, Ellipse? ChartDot) CreateProcessRow(ProcessListItemViewModel item, Brush accentBrush)
+    {
+        // Small color dot showing the process chart line color (if charted)
+        Ellipse? chartDot = null;
+        var nameContent = (FrameworkElement)new TextBlock
+        {
+            FontFamily = new FontFamily("Segoe UI Variable Text"),
+            FontSize = 12,
+            Foreground = ResolveBrush("TextPrimaryBrush", "#F2F8FF"),
+            Text = item.Name,
+            TextTrimming = TextTrimming.CharacterEllipsis,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        var nameText = (TextBlock)nameContent;
+
+        // Bold name + color dot when pinned
+        if (item.IsPinned)
+        {
+            nameText.FontWeight = FontWeights.SemiBold;
+        }
+
+        if (item.ChartColor is not null)
+        {
+            chartDot = new Ellipse
+            {
+                Width = 7,
+                Height = 7,
+                Fill = item.ChartColor,
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(0, 0, 6, 0),
+            };
+            var nameStack = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                Children = { chartDot, nameText },
+            };
+            nameContent = nameStack;
+        }
+
+        var captionText = new TextBlock
+        {
+            FontFamily = new FontFamily("Segoe UI Variable Text"),
+            FontSize = 11,
+            Foreground = ResolveBrush("TextMutedBrush", "#7D9AB6"),
+            Text = item.Caption,
+            TextTrimming = TextTrimming.CharacterEllipsis,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(8, 0, 0, 0),
+        };
+
+        var valueText = new TextBlock
+        {
+            FontFamily = new FontFamily("Segoe UI Variable Text"),
+            FontSize = 12,
+            FontWeight = FontWeights.SemiBold,
+            Foreground = ResolveBrush("TextPrimaryBrush", "#F2F8FF"),
+            Text = item.Value,
+            HorizontalAlignment = HorizontalAlignment.Right,
+            VerticalAlignment = VerticalAlignment.Center,
+            MinWidth = 46,
+            TextAlignment = TextAlignment.Right,
+        };
+        UseTabularFigures(valueText);
+
+        // Table row: Name | Caption | Value
+        var rowGrid = new Grid
+        {
+            ColumnSpacing = 6,
+        };
+        rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star), MinWidth = 90 });
+        rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(0.7, GridUnitType.Star) });
+        rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+        rowGrid.Children.Add(nameContent);
+        rowGrid.Children.Add(captionText);
+        Grid.SetColumn(captionText, 1);
+        rowGrid.Children.Add(valueText);
+        Grid.SetColumn(valueText, 2);
+
+        // Background gradient fill — row itself acts as the meter (Grafana-style)
+        var intensity = Math.Clamp(item.Intensity, 0d, 1d);
+        var accentColor = accentBrush is SolidColorBrush scb ? scb.Color : BrushFactory.ParseColor("#66E7FF");
+        var baseAlpha = item.IsPinned ? (byte)70 : (byte)55;
+        var edgeAlpha = item.IsPinned ? (byte)50 : (byte)35;
+
+        var fillBrush = new LinearGradientBrush
+        {
+            StartPoint = new Windows.Foundation.Point(0, 0),
+            EndPoint = new Windows.Foundation.Point(1, 0),
+            GradientStops =
+            {
+                new GradientStop { Color = Color.FromArgb(baseAlpha, accentColor.R, accentColor.G, accentColor.B), Offset = 0 },
+                new GradientStop { Color = Color.FromArgb(edgeAlpha, accentColor.R, accentColor.G, accentColor.B), Offset = intensity },
+                new GradientStop { Color = Color.FromArgb(0, accentColor.R, accentColor.G, accentColor.B), Offset = Math.Min(intensity + 0.03, 1.0) },
+            },
+        };
+
+        var rowBorder = new Border
+        {
+            Padding = new Thickness(8, 5, 8, 5),
+            BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E"),
+            BorderThickness = new Thickness(0, 0, 0, 0.4),
+            Background = fillBrush,
+            // Transparent background on the grid ensures the entire row is hit-testable
+            Child = new Grid { Background = BrushFactory.CreateBrush("#01000000"), Children = { rowGrid } },
+        };
+
+        // Hover feedback — accent border + subtle background brighten
+        rowBorder.PointerEntered += (_, _) =>
+        {
+            // Brush only. Thickening the hairline (0.4 -> 1.2) re-ran layout for the row and
+            // shunted its text by most of a pixel on every pointer move across the list.
+            rowBorder.BorderBrush = ResolveBrush("AccentBrush", "#66E7FF");
+            // Boost fill opacity on hover for clear visual feedback
+            if (fillBrush.GradientStops.Count >= 3)
+            {
+                var c0 = fillBrush.GradientStops[0].Color;
+                var c1 = fillBrush.GradientStops[1].Color;
+                fillBrush.GradientStops[0].Color = Color.FromArgb(Math.Min((byte)120, (byte)(c0.A + 40)), c0.R, c0.G, c0.B);
+                fillBrush.GradientStops[1].Color = Color.FromArgb(Math.Min((byte)100, (byte)(c1.A + 40)), c1.R, c1.G, c1.B);
+            }
+        };
+        rowBorder.PointerExited += (_, _) =>
+        {
+            rowBorder.BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#2C3035");
+            // Restore original fill opacity
+            if (fillBrush.GradientStops.Count >= 3)
+            {
+                var c0 = fillBrush.GradientStops[0].Color;
+                var c1 = fillBrush.GradientStops[1].Color;
+                fillBrush.GradientStops[0].Color = Color.FromArgb(baseAlpha, c0.R, c0.G, c0.B);
+                fillBrush.GradientStops[1].Color = Color.FromArgb(edgeAlpha, c1.R, c1.G, c1.B);
+            }
+        };
+
+        // Wrap in ClickableBorder for hand cursor + click handlers in slow path
+        var clickableRow = new ClickableBorder(rowBorder);
+        return (clickableRow, nameText, valueText, captionText, fillBrush, rowBorder, chartDot);
+    }
+
+    private void UpdateBadgeIcon(MetricPanelViewModel? panel)
+    {
+        var iconKey = panel switch
+        {
+            null => "collection",
+            { PanelKey: var key } when key.Contains("temperature", StringComparison.OrdinalIgnoreCase) => "temperature",
+            { Category: MetricCategory.Cpu } => "cpu",
+            { Category: MetricCategory.Gpu } => "gpu",
+            { Category: MetricCategory.Memory } => "memory",
+            { Category: MetricCategory.Disk, PrefersGaugeVisual: true } => "drive",
+            { Category: MetricCategory.Disk } => "disk",
+            { Category: MetricCategory.Network } => "network",
+            { Category: MetricCategory.System } => "system",
+            _ => "collection",
+        };
+
+        var accentBrush = panel?.AccentBrush ?? ResolveBrush("AccentBrush", "#66E7FF");
+        if (string.Equals(iconKey, _lastBadgeIconKey, StringComparison.Ordinal) &&
+            ReferenceEquals(accentBrush, _lastBadgeAccentBrush))
+        {
+            return;
+        }
+
+        _lastBadgeIconKey = iconKey;
+        _lastBadgeAccentBrush = accentBrush;
+        _badgeIconHost.Children.Clear();
+        _badgeIconHost.Children.Add(IconFactory.CreateIcon(iconKey, accentBrush, 16));
+    }
+
+    private static TextBlock CreateTextBlock(string? fontFamily = null, double fontSize = 12, Windows.UI.Text.FontWeight? fontWeight = null) =>
+        new()
+        {
+            FontFamily = string.IsNullOrWhiteSpace(fontFamily) ? new FontFamily("Segoe UI Variable Text") : new FontFamily(fontFamily),
+            FontSize = fontSize,
+            FontWeight = fontWeight ?? FontWeights.Normal,
+            TextWrapping = TextWrapping.WrapWholeWords,
+        };
+
+    private static void UseTabularFigures(TextBlock text)
+        => Microsoft.UI.Xaml.Documents.Typography.SetNumeralAlignment(text, FontNumeralAlignment.Tabular);
+
+    private static TextBlock CreateEmptyText(string text) =>
+        new()
+        {
+            FontSize = 12,
+            Foreground = ResolveBrush("TextMutedBrush", "#7D9AB6"),
+            Text = text,
+        };
+
+    private static Brush ResolveBrush(string key, string fallbackHex) => ThemeVisuals.ResolveBrush(key, fallbackHex);
+
+    private static bool IsLightPaletteActive() => ThemeVisuals.IsLightPaletteActive();
+
+    private static Windows.UI.Color ResolveColor(string key, string fallbackHex) => ThemeVisuals.ResolveColor(key, fallbackHex);
+
+    private static string FormatValue(double value, MetricUnit unit) => unit switch
+    {
+        MetricUnit.Percent => $"{value:0.#}%",
+        MetricUnit.Celsius => $"{value:0.#} C",
+        MetricUnit.Gigabytes when value >= 1024d => $"{value / 1024d:0.0} TiB",
+        MetricUnit.Gigabytes => $"{value:0.0} GiB",
+        MetricUnit.MegabytesPerSecond => $"{value:0.0} MB/s",
+        MetricUnit.MegabitsPerSecond => $"{value:0.0} Mbps",
+        MetricUnit.Megahertz => $"{value / 1000d:0.00} GHz",
+        MetricUnit.Count when value >= 1_000_000d => $"{value / 1_000_000d:0.#}M",
+        MetricUnit.Count when value >= 1_000d => $"{value / 1_000d:0.#}k",
+        MetricUnit.Count => $"{value:0}",
+        _ => $"{value:0.##}",
+    };
+
+}
+
+/// <summary>A layout gesture's pointer position, in window-content coordinates.</summary>
+public sealed class LayoutGestureEventArgs(TelemetryPanelCard.ResizeEdge edge, Windows.Foundation.Point point) : EventArgs
+{
+    /// <summary>The edges being dragged; <see cref="TelemetryPanelCard.ResizeEdge.None"/> for a move.</summary>
+    public TelemetryPanelCard.ResizeEdge Edge { get; } = edge;
+
+    public Windows.Foundation.Point Point { get; } = point;
+}
+
+public sealed class LayoutGestureEndedEventArgs(bool cancelled) : EventArgs
+{
+    public bool Cancelled { get; } = cancelled;
+}
