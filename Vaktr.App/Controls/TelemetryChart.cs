@@ -200,6 +200,8 @@ public sealed class TelemetryChart : UserControl
             },
         };
 
+        // Crosshair says "this surface takes a selection" - the only cue drag-to-zoom has.
+        ProtectedCursor = Microsoft.UI.Input.InputSystemCursor.Create(Microsoft.UI.Input.InputSystemCursorShape.Cross);
         Loaded += (_, _) => ScheduleRedraw();
         SizeChanged += OnChartSizeChanged;
         PointerPressed += OnPointerPressed;

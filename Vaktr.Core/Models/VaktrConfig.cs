@@ -87,6 +87,35 @@ public sealed class VaktrConfig
         return TimeSpan.FromHours(Math.Clamp(MaxRetentionHours, 1, 24 * 3650));
     }
 
+    /// <summary>
+    /// Accepts only a fully-qualified local drive path. Relative paths would resolve against
+    /// whatever the working directory happens to be; UNC and device (\\?\, \\.\) paths put
+    /// SQLite on a share, where its file locking is unreliable and the database can corrupt.
+    /// </summary>
+    public static bool TryNormalizeStorageDirectory(string? candidate, out string normalized)
+    {
+        normalized = string.Empty;
+        var trimmed = candidate?.Trim();
+        if (string.IsNullOrEmpty(trimmed)
+            || !Path.IsPathFullyQualified(trimmed)
+            || trimmed.StartsWith(@"\\", StringComparison.Ordinal)
+            || trimmed.StartsWith("//", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        try
+        {
+            // Collapses "..\.." segments so the stored path is the one actually used.
+            normalized = Path.GetFullPath(trimmed);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     public VaktrConfig Normalize()
     {
         var migratedFromLegacyStorage = string.Equals(
@@ -155,15 +184,9 @@ public sealed class VaktrConfig
         }
         else
         {
-            // Resolve to absolute path to prevent path traversal (e.g., "..\..\")
-            try
-            {
-                StorageDirectory = Path.GetFullPath(StorageDirectory.Trim());
-            }
-            catch
-            {
-                StorageDirectory = DefaultStorageDirectory;
-            }
+            StorageDirectory = TryNormalizeStorageDirectory(StorageDirectory, out var storageDirectory)
+                ? storageDirectory
+                : DefaultStorageDirectory;
         }
 
         PanelVisibility ??= new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);

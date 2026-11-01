@@ -214,7 +214,16 @@ public sealed class MainViewModel : ObservableObject
     public string StatusText
     {
         get => _statusText;
-        set => SetProperty(ref _statusText, value);
+        private set => SetProperty(ref _statusText, value);
+    }
+
+    /// <summary>Drives the status dot colour. Explicit, so wording changes never recolour it.</summary>
+    public StatusSeverity StatusSeverity { get; private set; } = StatusSeverity.Pending;
+
+    public void SetStatus(string text, StatusSeverity severity)
+    {
+        StatusSeverity = severity;
+        StatusText = text;
     }
 
     public MetricPanelViewModel? ExpandedPanel
@@ -367,6 +376,7 @@ public sealed class MainViewModel : ObservableObject
         }
 
         var panelCount = DashboardPanels.Count;
+        StatusSeverity = StatusSeverity.Healthy;
         StatusText = $"Last sample {snapshot.Timestamp.LocalDateTime:t} · {panelCount} panels · {snapshot.Samples.Count} metrics";
         UpdateSummaryCards(snapshot, detailContext);
 
@@ -1167,6 +1177,13 @@ internal sealed class PanelDetailContext
 }
 
 internal readonly record struct DriveDetailContext(double UsedPercent, double UsedGigabytes, double TotalGigabytes);
+
+public enum StatusSeverity
+{
+    Healthy,
+    Pending,
+    Issue,
+}
 
 public enum ProcessSortMode
 {

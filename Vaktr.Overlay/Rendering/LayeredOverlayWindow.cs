@@ -185,65 +185,79 @@ internal sealed class LayeredOverlayWindow : IDisposable
         int w = bmp.Width;
         int h = bmp.Height;
 
-        var screenDc = Win32Interop.GetDC(IntPtr.Zero);
-        var memDc = Win32Interop.CreateCompatibleDC(screenDc);
-
-        // CreateDIBSection produces a 32bpp DIB section, which is what UpdateLayeredWindow requires.
-        // GetHbitmap produces a DDB, causing UpdateLayeredWindow to silently return FALSE.
-        var bmi = new Win32Interop.BITMAPINFO
+        // Every handle is released in finally: an exception from LockBits/CopyMemory used to leak a
+        // screen DC, memory DC and DIB section per frame until GDI's per-process quota ran out.
+        var screenDc = IntPtr.Zero;
+        var memDc = IntPtr.Zero;
+        var hDib = IntPtr.Zero;
+        var oldObj = IntPtr.Zero;
+        try
         {
-            bmiHeader = new Win32Interop.BITMAPINFOHEADER
+            screenDc = Win32Interop.GetDC(IntPtr.Zero);
+            memDc = Win32Interop.CreateCompatibleDC(screenDc);
+
+            // CreateDIBSection produces a 32bpp DIB section, which is what UpdateLayeredWindow requires.
+            // GetHbitmap produces a DDB, causing UpdateLayeredWindow to silently return FALSE.
+            var bmi = new Win32Interop.BITMAPINFO
             {
-                biSize = (uint)System.Runtime.InteropServices.Marshal.SizeOf<Win32Interop.BITMAPINFOHEADER>(),
-                biWidth = w,
-                biHeight = -h, // negative = top-down, matches GDI+ memory layout
-                biPlanes = 1,
-                biBitCount = 32,
-                biCompression = Win32Interop.BI_RGB,
+                bmiHeader = new Win32Interop.BITMAPINFOHEADER
+                {
+                    biSize = (uint)System.Runtime.InteropServices.Marshal.SizeOf<Win32Interop.BITMAPINFOHEADER>(),
+                    biWidth = w,
+                    biHeight = -h, // negative = top-down, matches GDI+ memory layout
+                    biPlanes = 1,
+                    biBitCount = 32,
+                    biCompression = Win32Interop.BI_RGB,
+                }
+            };
+
+            hDib = Win32Interop.CreateDIBSection(memDc, ref bmi, Win32Interop.DIB_RGB_COLORS, out IntPtr ppvBits, IntPtr.Zero, 0);
+            if (hDib == IntPtr.Zero)
+            {
+                return;
             }
-        };
 
-        var hDib = Win32Interop.CreateDIBSection(memDc, ref bmi, Win32Interop.DIB_RGB_COLORS, out IntPtr ppvBits, IntPtr.Zero, 0);
-        if (hDib == IntPtr.Zero)
-        {
-            Win32Interop.DeleteDC(memDc);
-            Win32Interop.ReleaseDC(IntPtr.Zero, screenDc);
-            bmp.Dispose();
-            return;
+            // Copy premultiplied BGRA pixels directly — GDI+ Format32bppArgb is stored BGRA in memory
+            var data = bmp.LockBits(
+                new Rectangle(0, 0, w, h),
+                System.Drawing.Imaging.ImageLockMode.ReadOnly,
+                System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+            try
+            {
+                Buffer.MemoryCopy(data.Scan0.ToPointer(), ppvBits.ToPointer(), (long)data.Stride * h, (long)data.Stride * h);
+            }
+            finally
+            {
+                bmp.UnlockBits(data);
+            }
+
+            oldObj = Win32Interop.SelectObject(memDc, hDib);
+
+            var size = new Win32Interop.SIZE { CX = w, CY = h };
+            var srcPt = new Win32Interop.POINT { X = 0, Y = 0 };
+            var dstPt = GetCornerPosition(w, h);
+
+            var blend = new Win32Interop.BLENDFUNCTION
+            {
+                BlendOp = Win32Interop.AC_SRC_OVER,
+                BlendFlags = 0,
+                SourceConstantAlpha = 255,
+                AlphaFormat = Win32Interop.AC_SRC_ALPHA,
+            };
+
+            bool ulwOk = Win32Interop.UpdateLayeredWindow(
+                _hwnd, screenDc, ref dstPt, ref size,
+                memDc, ref srcPt, 0, ref blend, Win32Interop.ULW_ALPHA);
+            OverlayLog.Write($"UpdateLayeredWindow({w}x{h} @ {dstPt.X},{dstPt.Y}) = {ulwOk}  err={System.Runtime.InteropServices.Marshal.GetLastWin32Error()}");
         }
-
-        // Copy premultiplied BGRA pixels directly — GDI+ Format32bppArgb is stored BGRA in memory
-        var data = bmp.LockBits(
-            new Rectangle(0, 0, w, h),
-            System.Drawing.Imaging.ImageLockMode.ReadOnly,
-            System.Drawing.Imaging.PixelFormat.Format32bppArgb);
-        Buffer.MemoryCopy(data.Scan0.ToPointer(), ppvBits.ToPointer(), (long)data.Stride * h, (long)data.Stride * h);
-        bmp.UnlockBits(data);
-
-        var oldObj = Win32Interop.SelectObject(memDc, hDib);
-
-        var size = new Win32Interop.SIZE { CX = w, CY = h };
-        var srcPt = new Win32Interop.POINT { X = 0, Y = 0 };
-        var dstPt = GetCornerPosition(w, h);
-
-        var blend = new Win32Interop.BLENDFUNCTION
+        finally
         {
-            BlendOp = Win32Interop.AC_SRC_OVER,
-            BlendFlags = 0,
-            SourceConstantAlpha = 255,
-            AlphaFormat = Win32Interop.AC_SRC_ALPHA,
-        };
-
-        bool ulwOk = Win32Interop.UpdateLayeredWindow(
-            _hwnd, screenDc, ref dstPt, ref size,
-            memDc, ref srcPt, 0, ref blend, Win32Interop.ULW_ALPHA);
-        OverlayLog.Write($"UpdateLayeredWindow({w}x{h} @ {dstPt.X},{dstPt.Y}) = {ulwOk}  err={System.Runtime.InteropServices.Marshal.GetLastWin32Error()}");
-
-        Win32Interop.SelectObject(memDc, oldObj);
-        Win32Interop.DeleteObject(hDib);
-        Win32Interop.DeleteDC(memDc);
-        Win32Interop.ReleaseDC(IntPtr.Zero, screenDc);
-        bmp.Dispose();
+            if (oldObj != IntPtr.Zero) Win32Interop.SelectObject(memDc, oldObj);
+            if (hDib != IntPtr.Zero) Win32Interop.DeleteObject(hDib);
+            if (memDc != IntPtr.Zero) Win32Interop.DeleteDC(memDc);
+            if (screenDc != IntPtr.Zero) Win32Interop.ReleaseDC(IntPtr.Zero, screenDc);
+            bmp.Dispose();
+        }
     }
 
     private Win32Interop.POINT GetCornerPosition(int w, int h)

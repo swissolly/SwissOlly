@@ -201,7 +201,7 @@ internal static class EtwInterop
         ulong traceHandle, ref Guid providerId, uint controlCode, byte level,
         ulong matchAnyKeyword, ulong matchAllKeyword, uint timeout, IntPtr enableParameters);
 
-    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, EntryPoint = "OpenTraceW")]
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, EntryPoint = "OpenTraceW", SetLastError = true)]
     internal static extern ulong OpenTrace(ref EVENT_TRACE_LOGFILE logfile);
 
     [DllImport("advapi32.dll", EntryPoint = "ProcessTrace")]

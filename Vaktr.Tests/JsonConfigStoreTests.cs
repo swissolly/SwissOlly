@@ -4,6 +4,21 @@ public sealed class JsonConfigStoreTests : IDisposable
 {
     private readonly string _tempDir = Path.Combine(AppContext.BaseDirectory, $"vaktr-config-test-{Guid.NewGuid():N}");
 
+    [Theory]
+    [InlineData("{ \"graphWindowMinutes\": 24")]
+    [InlineData("")]
+    public async Task Load_Corrupt_Config_Falls_Back_To_Defaults_And_Keeps_A_Copy(string contents)
+    {
+        Directory.CreateDirectory(_tempDir);
+        var configPath = Path.Combine(_tempDir, "vaktr-settings.json");
+        await File.WriteAllTextAsync(configPath, contents);
+
+        var loaded = await new Vaktr.Store.Persistence.JsonConfigStore(configPath).LoadAsync(CancellationToken.None);
+
+        Assert.Equal(VaktrConfig.CreateDefault().Normalize().GraphWindowMinutes, loaded.GraphWindowMinutes);
+        Assert.Single(Directory.GetFiles(_tempDir, "vaktr-settings.json.corrupt-*"));
+    }
+
     [Fact]
     public async Task Save_Then_Load_Preserves_Settings_Across_Store_Restart()
     {

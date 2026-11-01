@@ -67,6 +67,8 @@ public sealed partial class ShellWindow
     private Action<double>? _layoutTick;
     private bool _layoutTickerAttached;
     private TextBlock? _editModeHint;
+    private const string EditModeHintText = "Drag a panel to move it · drag an edge or corner to resize · Esc when done";
+    private const string BrowseModeHintText = "Drag across a chart to zoom · click to pin a reading · double-click or Esc to reset";
 
     /// <summary>True while a panel is being dragged or is still settling from a drop.</summary>
     private bool IsLayoutMotionActive => _layoutGesture is not null || _floatSettle is not null;
@@ -178,7 +180,11 @@ public sealed partial class ShellWindow
 
         if (_editModeHint is not null)
         {
-            FadeElementTo(_editModeHint, editing ? 1d : 0d, editing ? MotionTokens.Quick : MotionTokens.Instant);
+            // One slot, two modes: arranging instructions while editing, chart gestures otherwise
+            // (drag-zoom, pin and reset had no affordance at all).
+            _editModeHint.Text = editing ? EditModeHintText : BrowseModeHintText;
+            _editModeHint.Opacity = 0;
+            FadeElementTo(_editModeHint, 1d, MotionTokens.Quick);
         }
 
         if (editing)
@@ -205,10 +211,67 @@ public sealed partial class ShellWindow
                 SetLayoutEditMode(false, commit: true);
                 args.Handled = true;
             }
+            else if (!_settingsViewActive && _globalResetZoomButton.Visibility == Visibility.Visible)
+            {
+                // Then a chart zoom, back to the live window - the Grafana habit.
+                OnResetAllZoomClick(null, EventArgs.Empty);
+                args.Handled = true;
+            }
         };
 
         _rootLayout.KeyboardAcceleratorPlacementMode = KeyboardAcceleratorPlacementMode.Hidden;
         _rootLayout.KeyboardAccelerators.Add(escape);
+
+        AddControlShortcut(VirtualKey.Number1, () => SetActiveShellView(false));
+        AddControlShortcut(VirtualKey.Number2, () => SetActiveShellView(true));
+        AddControlShortcut(VirtualKey.E, () =>
+        {
+            if (_settingsViewActive)
+            {
+                SetActiveShellView(false);
+            }
+
+            OnToggleLayoutEditClick(null, EventArgs.Empty);
+        });
+        // Ctrl+[ / Ctrl+] narrow and widen the board's time range one preset at a time.
+        AddControlShortcut((VirtualKey)219, () => StepGlobalWindowRange(-1));
+        AddControlShortcut((VirtualKey)221, () => StepGlobalWindowRange(+1));
+    }
+
+    private static readonly int[] s_rangeStepsMinutes = [1, 5, 15, 30, 60, 720, 1440, 2880, 7200, 10080, 43200, 129600, 525600];
+
+    private void AddControlShortcut(VirtualKey key, Action action)
+    {
+        var accelerator = new KeyboardAccelerator { Key = key, Modifiers = VirtualKeyModifiers.Control };
+        accelerator.Invoked += (_, args) =>
+        {
+            // A mid-gesture shortcut would rebuild the board under the pointer.
+            if (_layoutGesture is not null)
+            {
+                return;
+            }
+
+            action();
+            args.Handled = true;
+        };
+        _rootLayout.KeyboardAccelerators.Add(accelerator);
+    }
+
+    private void StepGlobalWindowRange(int direction)
+    {
+        if (_settingsViewActive)
+        {
+            return;
+        }
+
+        var current = _viewModel.SelectedWindowMinutes;
+        var next = direction > 0
+            ? s_rangeStepsMinutes.FirstOrDefault(minutes => minutes > current, current)
+            : s_rangeStepsMinutes.LastOrDefault(minutes => minutes < current, current);
+        if (next != current)
+        {
+            RunWithDeferredPanelRendering(() => ApplyGlobalWindowRange(next));
+        }
     }
 
     // ---- Gesture lifecycle --------------------------------------------------------------------

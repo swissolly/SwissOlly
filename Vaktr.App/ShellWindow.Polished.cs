@@ -177,7 +177,7 @@ public sealed partial class ShellWindow : Window
         };
         _globalRangeButton = CreateActionChip("15m", OnToggleGlobalRangeEditor, true);
         _globalRangeButton.MinWidth = 88;
-        ToolTipService.SetToolTip(_globalRangeButton, "Choose the time range for all charts");
+        ToolTipService.SetToolTip(_globalRangeButton, "Choose the time range for all charts (Ctrl+[ and Ctrl+] to step)");
         _globalOneMinuteButton = CreateGlobalRangeChip("1m", 1);
         _globalFiveMinuteButton = CreateGlobalRangeChip("5m", 5);
         _globalFifteenMinuteButton = CreateGlobalRangeChip("15m", 15);
@@ -193,11 +193,11 @@ public sealed partial class ShellWindow : Window
         _globalOneYearButton = CreateGlobalRangeChip("1y", 525600);
         _globalResetZoomButton = CreateActionChip("Reset zoom", OnResetAllZoomClick);
         _editLayoutButton = CreateActionChip("Edit layout", OnToggleLayoutEditClick);
-        ToolTipService.SetToolTip(_editLayoutButton, "Resize and rearrange panels");
+        ToolTipService.SetToolTip(_editLayoutButton, "Resize and rearrange panels (Ctrl+E)");
         _cancelLayoutButton = CreateActionChip("Cancel", OnCancelLayoutEditClick);
         _cancelLayoutButton.Visibility = Visibility.Collapsed;
         _globalResetZoomButton.Visibility = Visibility.Collapsed;
-        ToolTipService.SetToolTip(_globalResetZoomButton, "Return all charts to the live window");
+        ToolTipService.SetToolTip(_globalResetZoomButton, "Return all charts to the live window (Esc)");
         _titleBarDragHost = new Grid
         {
             Height = 34,
@@ -690,7 +690,7 @@ public sealed partial class ShellWindow : Window
         catch (Exception ex)
         {
             StartupTrace.WriteException("OnRootLoaded", ex);
-            _viewModel.StatusText = $"Startup issue: {ex.Message}";
+            _viewModel.SetStatus($"Startup issue: {ex.Message}", StatusSeverity.Issue);
             UpdateStatusText();
             App.CurrentApp.MarkStartupSettled();
         }
@@ -756,7 +756,7 @@ public sealed partial class ShellWindow : Window
     {
         try
         {
-            _viewModel.StatusText = "Starting telemetry";
+            _viewModel.SetStatus("Starting telemetry", StatusSeverity.Pending);
             UpdateStatusText();
 
             // Open the store first, on a worker. Initialization is idempotent, so the collector's
@@ -791,7 +791,7 @@ public sealed partial class ShellWindow : Window
             StartupTrace.WriteException("StartTelemetryAsync", ex);
             _ = _uiQueue.TryEnqueue(() =>
             {
-                _viewModel.StatusText = $"Startup issue: {ex.Message}";
+                _viewModel.SetStatus($"Startup issue: {ex.Message}", StatusSeverity.Issue);
                 UpdateStatusText();
             });
         }
@@ -926,7 +926,7 @@ public sealed partial class ShellWindow : Window
             var previousConfig = _viewModel.BuildConfig();
             if (!TryNormalizeScrapeInput(_draftScrapeIntervalInput, out var normalizedScrapeInput))
             {
-                _viewModel.StatusText = "Scrape interval must be a whole number of seconds between 1 and 60.";
+                _viewModel.SetStatus("Scrape interval must be a whole number of seconds between 1 and 60.", StatusSeverity.Issue);
                 UpdateStatusText();
                 RenderEditableControlDeck();
                 return;
@@ -934,7 +934,7 @@ public sealed partial class ShellWindow : Window
 
             if (!MainViewModel.TryParseRetentionInput(_draftRetentionInput, out _, out var normalizedRetentionInput))
             {
-                _viewModel.StatusText = "Retention must use m, h, or d. Try 30m, 24h, or 7d.";
+                _viewModel.SetStatus("Retention must use m, h, or d. Try 30m, 24h, or 7d.", StatusSeverity.Issue);
                 UpdateStatusText();
                 RenderEditableControlDeck();
                 return;
@@ -963,13 +963,13 @@ public sealed partial class ShellWindow : Window
             var themeChanged = config.Theme != previousConfig.Theme;
             var collectorRestartRequired = scrapeChanged || storageChanged;
 
-            _viewModel.StatusText = collectorRestartRequired
+            _viewModel.SetStatus(collectorRestartRequired
                 ? "Applying telemetry settings"
                 : retentionLowered
                     ? "Saving settings and pruning older history"
                     : themeChanged
                         ? "Applying theme"
-                        : "Saving settings";
+                        : "Saving settings", StatusSeverity.Healthy);
             UpdateStatusText();
             _viewModel.ApplyConfig(config);
             SyncControlDeckDraftsFromViewModel();
@@ -984,7 +984,7 @@ public sealed partial class ShellWindow : Window
         }
         catch (Exception ex)
         {
-            _viewModel.StatusText = $"Settings issue: {ex.Message}";
+            _viewModel.SetStatus($"Settings issue: {ex.Message}", StatusSeverity.Issue);
             UpdateStatusText();
         }
     }
@@ -1196,7 +1196,7 @@ public sealed partial class ShellWindow : Window
             StartupTrace.WriteException("Collection failed", ex);
             if (!_hasReceivedFirstSnapshot)
             {
-                _viewModel.StatusText = $"Telemetry retrying: {ex.Message}";
+                _viewModel.SetStatus($"Telemetry retrying: {ex.Message}", StatusSeverity.Issue);
                 UpdateStatusText();
             }
         });
@@ -1500,7 +1500,7 @@ public sealed partial class ShellWindow : Window
 
                 _ = _uiQueue.TryEnqueue(DispatcherQueuePriority.Low, () =>
                 {
-                    _viewModel.StatusText = msg;
+                    _viewModel.SetStatus(msg, StatusSeverity.Issue);
                     UpdateStatusText();
                 });
             };
@@ -1768,7 +1768,7 @@ public sealed partial class ShellWindow : Window
         }
 
         RenderEditableControlDeck();
-        _viewModel.StatusText = "Settings reverted";
+        _viewModel.SetStatus("Settings reverted", StatusSeverity.Healthy);
         UpdateStatusText();
     }
 
@@ -1978,9 +1978,9 @@ public sealed partial class ShellWindow : Window
                 }
             });
 
-            _viewModel.StatusText = _viewModel.DashboardPanels.Count > 0
+            _viewModel.SetStatus(_viewModel.DashboardPanels.Count > 0
                 ? "Streaming local telemetry"
-                : "Waiting for first sample";
+                : "Waiting for first sample", _viewModel.DashboardPanels.Count > 0 ? StatusSeverity.Healthy : StatusSeverity.Pending);
             UpdateStatusText();
 
             if (_overlayController != null && config.Overlay != null)
@@ -1991,7 +1991,7 @@ public sealed partial class ShellWindow : Window
         }
         catch (Exception ex)
         {
-            _viewModel.StatusText = $"Settings issue: {ex.Message}";
+            _viewModel.SetStatus($"Settings issue: {ex.Message}", StatusSeverity.Issue);
             UpdateStatusText();
         }
     }
@@ -2013,12 +2013,19 @@ public sealed partial class ShellWindow : Window
                 return;
             }
 
-            SetStorageDirectory(folder.Path);
+            if (!VaktrConfig.TryNormalizeStorageDirectory(folder.Path, out var storageDirectory))
+            {
+                _viewModel.SetStatus("History must live on a local drive, not a network share.", StatusSeverity.Issue);
+                UpdateStatusText();
+                return;
+            }
+
+            SetStorageDirectory(storageDirectory);
         }
         catch (Exception ex)
         {
             StartupTrace.WriteException("BrowseStorageClick", ex);
-            _viewModel.StatusText = $"Storage picker issue: {ex.Message}";
+            _viewModel.SetStatus($"Storage picker issue: {ex.Message}", StatusSeverity.Issue);
             UpdateStatusText();
         }
     }
@@ -2212,7 +2219,7 @@ public sealed partial class ShellWindow : Window
             {
                 if (!_hasReceivedFirstSnapshot)
                 {
-                    _viewModel.StatusText = "History unavailable, starting live telemetry";
+                    _viewModel.SetStatus("History unavailable, starting live telemetry", StatusSeverity.Issue);
                     UpdateStatusText();
                 }
             });
@@ -2254,7 +2261,7 @@ public sealed partial class ShellWindow : Window
         // The first sample may already be in; don't regress its status line.
         if (!_hasReceivedFirstSnapshot)
         {
-            _viewModel.StatusText = "Waiting for first sample";
+            _viewModel.SetStatus("Waiting for first sample", StatusSeverity.Pending);
             UpdateStatusText();
         }
 
@@ -2265,15 +2272,12 @@ public sealed partial class ShellWindow : Window
     {
         var text = _viewModel.StatusText;
         _statusText.Text = text;
-        var isIssue = text.Contains("issue", StringComparison.OrdinalIgnoreCase)
-            || text.Contains("retrying", StringComparison.OrdinalIgnoreCase);
-        var isWaiting = text.Contains("waiting", StringComparison.OrdinalIgnoreCase)
-            || text.Contains("arming", StringComparison.OrdinalIgnoreCase);
-        _statusIndicator.Fill = isIssue
-            ? ResolveBrush("CriticalBrush", "#FF897D")
-            : isWaiting
-                ? ResolveBrush("TextMutedBrush", "#858B93")
-                : ResolveBrush("AccentBrush", "#79B8FF");
+        _statusIndicator.Fill = _viewModel.StatusSeverity switch
+        {
+            StatusSeverity.Issue => ResolveBrush("CriticalBrush", "#FF897D"),
+            StatusSeverity.Pending => ResolveBrush("TextMutedBrush", "#858B93"),
+            _ => ResolveBrush("AccentBrush", "#79B8FF"),
+        };
 
         if (!string.Equals(_lastRenderedStatusText, text, StringComparison.Ordinal))
         {
@@ -2553,7 +2557,7 @@ public sealed partial class ShellWindow : Window
     {
         if (!TryParseGlobalDateTime(fromText, out var start) || !TryParseGlobalDateTime(toText, out var end) || end <= start)
         {
-            _viewModel.StatusText = "Time range must use local date/time like 2026-04-02 21:30, and End must be after From.";
+            _viewModel.SetStatus("Time range must use local date/time like 2026-04-02 21:30, and End must be after From.", StatusSeverity.Issue);
             UpdateStatusText();
             return;
         }
@@ -2571,7 +2575,7 @@ public sealed partial class ShellWindow : Window
         });
 
         HideGlobalRangeEditor();
-        _viewModel.StatusText = $"Pinned {start.LocalDateTime:g} to {end.LocalDateTime:g}";
+        _viewModel.SetStatus($"Pinned {start.LocalDateTime:g} to {end.LocalDateTime:g}", StatusSeverity.Healthy);
         UpdateStatusText();
     }
 

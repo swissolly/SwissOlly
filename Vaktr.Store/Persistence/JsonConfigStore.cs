@@ -32,11 +32,34 @@ public sealed class JsonConfigStore : IConfigStore
             return VaktrConfig.CreateDefault().Normalize();
         }
 
-        await using var stream = File.OpenRead(path);
-        var config = await JsonSerializer.DeserializeAsync<VaktrConfig>(stream, JsonOptions, cancellationToken)
-            .ConfigureAwait(false);
+        VaktrConfig? config;
+        try
+        {
+            await using var stream = File.OpenRead(path);
+            config = await JsonSerializer.DeserializeAsync<VaktrConfig>(stream, JsonOptions, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (JsonException)
+        {
+            // Truncated by a crash mid-write on an older build, or hand-edited badly. Starting on
+            // defaults beats failing startup; the original is kept beside it for recovery.
+            PreserveCorruptConfig(path);
+            config = null;
+        }
 
         return (config ?? VaktrConfig.CreateDefault()).Normalize();
+    }
+
+    private static void PreserveCorruptConfig(string path)
+    {
+        try
+        {
+            File.Copy(path, $"{path}.corrupt-{DateTime.Now:yyyyMMdd-HHmmss}", overwrite: true);
+        }
+        catch
+        {
+            // Best effort; the next save replaces the corrupt file either way.
+        }
     }
 
     public async Task SaveAsync(VaktrConfig config, CancellationToken cancellationToken)

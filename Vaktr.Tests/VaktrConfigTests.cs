@@ -298,4 +298,25 @@ public sealed class VaktrConfigTests
         Assert.Equal("Ctrl+Shift+F11", config.Overlay.HotkeyGesture);
         Assert.Equal("#66E7FF", config.Overlay.TextColor);
     }
+
+    [Theory]
+    [InlineData(@"\\server\share\vaktr")]
+    [InlineData(@"\\?\C:\vaktr")]
+    [InlineData(@"\\.\C:\vaktr")]
+    [InlineData(@"relative\data")]
+    [InlineData(@"C:relative")]
+    public void Normalize_Rejects_Unsafe_Storage_Directories(string storageDirectory)
+    {
+        var config = new VaktrConfig { StorageDirectory = storageDirectory }.Normalize();
+
+        Assert.Equal(VaktrConfig.DefaultStorageDirectory, config.StorageDirectory);
+    }
+
+    [Fact]
+    public void Normalize_Accepts_Local_Drive_Storage_And_Collapses_Traversal()
+    {
+        var config = new VaktrConfig { StorageDirectory = @"D:\Telemetry\..\Vaktr" }.Normalize();
+
+        Assert.Equal(@"D:\Vaktr", config.StorageDirectory);
+    }
 }

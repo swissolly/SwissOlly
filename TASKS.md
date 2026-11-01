@@ -99,16 +99,28 @@ UI/UX pass:
       the window was occluded — re-measure with no game running.)
 - [ ] `InlineTextEntry` simulates a text box (no caret/selection/clipboard/IME). Replace — the app
       skips `XamlControlsResources`, so a styled `TextBox` needs those resources merged or restyled.
-- [ ] Status channel: severity is substring-matched English; give it a real severity field.
-- [ ] Keyboard: accelerators for views/range, resize handles as tab stops, chart gestures.
-- [ ] Chart: cold-start axis (clamp to available data), gesture hints (drag-zoom/click-pin/double-
-      click reset have no cursor or tooltip), colour-blind series differentiation.
+- [x] Status channel: explicit `StatusSeverity` (Healthy/Pending/Issue) via `SetStatus`. Validation
+      errors and "History unavailable" used to show the healthy accent dot.
+- [x] Keyboard: Ctrl+1/Ctrl+2 views, Ctrl+[ / Ctrl+] step range, Ctrl+E edit layout, Esc resets
+      chart zoom (after gesture/edit mode). Shortcuts listed in tooltips.
+- [ ] Keyboard, remaining: resize handles as tab stops; arrow-key nudge of a focused panel.
+- [x] Chart gesture hints: crosshair cursor over plots; the board-title hint shows chart gestures
+      while browsing and arranging instructions while editing.
+- [ ] Chart: cold-start axis — recommend NOT clamping (axis would creep for the first N minutes);
+      instead show a faint "collecting since hh:mm" marker at the data's left edge.
+- [ ] Chart: colour-blind series differentiation (dash patterns for 2nd/3rd series).
+- [ ] Hands-on verify (needs no game running): vertical/diagonal resize down to 4 rows, drag-zoom,
+      header steadiness on Apply, Ctrl shortcuts, overlay rendering after the GDI try/finally.
 - [ ] Remaining consistency: corner-radius and border-weight scales; contrast sweep of all 8
       themes (Nord, Sandstone lowest); hit targets below 32px.
 - [ ] View switch is a fade-rise; consider a directional transition.
-- [ ] Perf: `GridLayoutEngine.Compact` skyline (O(n·W)); hover tooltip caching; collector timeout
-      never fires and shutdown races the PDH buffer; cross-thread snapshot fields lack
-      `volatile`; overlay GDI handles leak on exception path; `SetLastError = true` on P/Invokes.
+- [x] Collector timeout now fires (sample runs on the pool, `WaitAsync(timeout)`); a stuck sample
+      is abandoned and later ticks skip instead of entering PDH concurrently; dispose waits up to
+      2s for it before freeing PDH. Overlay frame GDI handles released in finally.
+      `OpenTraceW` got `SetLastError` (its failure log read a stale error). Snapshot handoff already
+      uses Interlocked/Volatile.
+- [ ] Perf: `GridLayoutEngine.Compact` skyline (O(n·W)); hover tooltip caching.
+- [ ] Perf: profile a 1s scrape with all panels visible and no game running; target <2% CPU.
 - [x] `App.cs` first-chance COMException logger (added for diagnosis) now Debug-only; remove it
       once the 0x800F1000 crash is confirmed gone.
 
@@ -117,10 +129,22 @@ UI/UX pass:
 - [ ] Audit the Performance Log Users grant (system-wide trace rights); confirm honest docs and
       clean degradation when declined.
 - [ ] Installer runs `powershell -ExecutionPolicy Bypass` elevated; prefer `net localgroup` by SID.
-- [ ] Validate the storage path (reject UNC / outside-profile).
+- [x] Storage path: only fully-qualified local drive paths (UNC, `\\?\`, `\\.\`, relative rejected;
+      `..` collapsed). Outside-profile is allowed on purpose (D:\ is legitimate). Picker explains.
 - [ ] Prove the "no network calls" README claim with a static check or blocked-egress run.
-- [ ] Confirm a corrupt/partial config fails safe to defaults.
-- [ ] Review the `HKCU\...\Run` auto-launch write for quoting/path injection.
+- [x] Corrupt/empty config falls back to defaults; the original is kept as `.corrupt-<timestamp>`.
+- [x] `HKCU\...\Run` write reviewed: value is the quoted `Environment.ProcessPath`; `"` cannot
+      occur in a Windows path, so no injection.
+
+## New polish candidates
+
+- [ ] Settings: Apply should be disabled until something changes, and show "Saved" inline beside
+      it rather than only in the status line.
+- [ ] Hero status text truncates at 320px - give it a tooltip with the full message.
+- [ ] Empty panels after a range change flash "No data" before history loads; show a skeleton.
+- [ ] Number formatting: align value columns with tabular figures (`FontFeatures` tnum) so live
+      values stop jittering horizontally as digits change.
+- [ ] Reduce motion: honour the Windows "Animation effects" setting in `MotionTokens`.
 
 ---
 

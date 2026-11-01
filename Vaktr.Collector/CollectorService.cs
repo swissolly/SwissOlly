@@ -7,6 +7,7 @@ public sealed class CollectorService : IAsyncDisposable
 {
     private static readonly TimeSpan InitialCollectionTimeout = TimeSpan.FromSeconds(3);
     private static readonly TimeSpan RecurringCollectionTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan ShutdownGrace = TimeSpan.FromSeconds(2);
 
     private readonly IMetricCollector _collector;
     private readonly IMetricStore _store;
@@ -15,6 +16,13 @@ public sealed class CollectorService : IAsyncDisposable
     private CancellationTokenSource? _loopCancellation;
     private PeriodicTimer? _timer;
     private Task? _loopTask;
+
+    // The collector is synchronous PDH/WMI work that only checks its token on entry, so a timeout
+    // can abandon a sample but never stop it. These track the call still running: later ticks (and
+    // a loop restarted by Apply) skip instead of entering the collector concurrently, and disposal
+    // waits for it so PDH buffers are not freed underneath it.
+    private int _collecting;
+    private Task? _inFlightCollect;
 
     public CollectorService(IMetricCollector collector, IMetricStore store)
     {
@@ -65,7 +73,31 @@ public sealed class CollectorService : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         await StopAsync().ConfigureAwait(false);
-        await _collector.DisposeAsync().ConfigureAwait(false);
+
+        var inFlight = Volatile.Read(ref _inFlightCollect);
+        var collectorIdle = inFlight is null || inFlight.IsCompleted;
+        if (!collectorIdle)
+        {
+            try
+            {
+                await inFlight!.WaitAsync(ShutdownGrace).ConfigureAwait(false);
+                collectorIdle = true;
+            }
+            catch (TimeoutException)
+            {
+                // Still wedged: leave its handles to process exit rather than free them mid-call.
+            }
+            catch
+            {
+                collectorIdle = true;
+            }
+        }
+
+        if (collectorIdle)
+        {
+            await _collector.DisposeAsync().ConfigureAwait(false);
+        }
+
         await _store.DisposeAsync().ConfigureAwait(false);
         _gate.Dispose();
     }
@@ -103,16 +135,35 @@ public sealed class CollectorService : IAsyncDisposable
 
     private async Task CollectOnceAsync(CancellationToken cancellationToken, TimeSpan timeout)
     {
+        if (Interlocked.CompareExchange(ref _collecting, 1, 0) != 0)
+        {
+            // The previous sample is still stuck in the collector; it was already reported.
+            return;
+        }
+
+        var collect = Task.Run(() => _collector.CollectAsync(cancellationToken), CancellationToken.None);
+        Volatile.Write(ref _inFlightCollect, collect);
+        _ = collect.ContinueWith(
+            completed =>
+            {
+                _ = completed.Exception; // observe faults from samples that were abandoned
+                Volatile.Write(ref _collecting, 0);
+            },
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+
         using var timeoutCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeoutCancellation.CancelAfter(timeout);
 
         try
         {
-            var snapshot = await _collector.CollectAsync(timeoutCancellation.Token).ConfigureAwait(false);
+            var snapshot = await collect.WaitAsync(timeout, cancellationToken).ConfigureAwait(false);
             await _store.AppendSnapshotAsync(snapshot, timeoutCancellation.Token).ConfigureAwait(false);
             RaiseSnapshotCollected(snapshot);
         }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        catch (Exception ex) when (ex is TimeoutException
+            || (ex is OperationCanceledException && !cancellationToken.IsCancellationRequested))
         {
             RaiseCollectionFailed(new TimeoutException($"Telemetry sampling exceeded {timeout.TotalSeconds:0.#} seconds."));
         }

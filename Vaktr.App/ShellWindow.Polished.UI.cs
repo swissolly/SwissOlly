@@ -197,8 +197,8 @@ public sealed partial class ShellWindow
                 },
             },
         };
-        ToolTipService.SetToolTip(_overviewNavigationButton, "View live system telemetry");
-        ToolTipService.SetToolTip(_settingsNavigationButton, "Configure Vaktr");
+        ToolTipService.SetToolTip(_overviewNavigationButton, "View live system telemetry (Ctrl+1)");
+        ToolTipService.SetToolTip(_settingsNavigationButton, "Configure Vaktr (Ctrl+2)");
         Grid.SetColumn(navigationSurface, 2);
         heroGrid.Children.Add(navigationSurface);
 
@@ -697,7 +697,7 @@ public sealed partial class ShellWindow
         catch (Exception ex)
         {
             StartupTrace.WriteException("StoragePathDrop", ex);
-            _viewModel.StatusText = $"Storage path issue: {ex.Message}";
+            _viewModel.SetStatus($"Storage path issue: {ex.Message}", StatusSeverity.Issue);
             UpdateStatusText();
         }
     }
@@ -815,8 +815,7 @@ public sealed partial class ShellWindow
 
         // The edit-mode instructions live beside the title they describe. They used to go to the
         // status line, a 300px caption at the far end of the window that truncated them.
-        _editModeHint = CreateSecondaryText("Drag a panel to move it \u00B7 drag an edge or corner to resize \u00B7 Esc when done", 12);
-        _editModeHint.Opacity = 0;
+        _editModeHint = CreateSecondaryText(BrowseModeHintText, 12);
         // Baseline-aligned with the title: both trimmed to their baseline and bottom-aligned, so
         // 12px and 18px text share one line. Centring them vertically put the hint visibly low.
         _editModeHint.VerticalAlignment = VerticalAlignment.Bottom;
