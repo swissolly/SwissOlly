@@ -75,7 +75,7 @@ Every palette keeps the same structural relationships — hairline strokes, one-
 
 ## Install
 
-Installers at [Releases](https://github.com/WyrickC/Vaktr/releases):
+Installers at [Releases](https://github.com/swissolly/SwissOlly/releases):
 
 - `SwissOllySetup-x64.exe` — Intel/AMD 64-bit
 - `SwissOllySetup-ARM64.exe` — ARM64
@@ -83,7 +83,7 @@ Installers at [Releases](https://github.com/WyrickC/Vaktr/releases):
 ### Build from source
 
 ```powershell
-git clone https://github.com/WyrickC/Vaktr.git
+git clone https://github.com/swissolly/SwissOlly.git
 cd SwissOlly
 dotnet restore SwissOlly.sln
 dotnet run --project SwissOlly.App/SwissOlly.App.csproj -p:Platform=x64

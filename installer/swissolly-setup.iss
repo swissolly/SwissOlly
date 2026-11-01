@@ -19,7 +19,7 @@
   #define MyAppVersion "1.0.1"
 #endif
 #define MyAppPublisher "SwissOlly"
-#define MyAppURL "https://github.com/WyrickC/Vaktr"
+#define MyAppURL "https://github.com/swissolly/SwissOlly"
 #define MyAppExeName "SwissOlly.exe"
 #define MyAppDescription "System Telemetry Dashboard"
 
