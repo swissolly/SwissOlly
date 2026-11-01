@@ -509,7 +509,7 @@ public sealed class TelemetryChart : UserControl
 
             // Split into contiguous segments at gaps (>3x the expected interval between points)
             runs.Clear();
-            foreach (var segment in SplitAtGaps(downsampled, end - start))
+            foreach (var segment in SplitAtGaps(downsampled))
             {
                 var rawProjected = new Windows.Foundation.Point[segment.Count];
                 for (var pi = 0; pi < segment.Count; pi++)
@@ -1196,43 +1196,18 @@ public sealed class TelemetryChart : UserControl
     }
 
     private static IReadOnlyList<IReadOnlyList<MetricPoint>> SplitAtGaps(
-        IReadOnlyList<MetricPoint> points,
-        TimeSpan windowSpan)
+        IReadOnlyList<MetricPoint> points)
     {
         if (points.Count <= 1)
         {
             return [points];
         }
 
-        // Detect the typical interval using median-of-sample approach (avoids sorting all intervals).
-        // Sample up to 15 intervals evenly spaced through the data to find the typical gap.
-        var medianIntervalMs = 0d;
-        if (points.Count >= 3)
-        {
-            var sampleCount = Math.Min(15, points.Count - 1);
-            var step = Math.Max(1, (points.Count - 1) / sampleCount);
-            var sampleIntervals = new double[sampleCount];
-            var si = 0;
-            for (var i = step; i < points.Count && si < sampleCount; i += step)
-            {
-                sampleIntervals[si++] = (points[i].Timestamp - points[i - step].Timestamp).TotalMilliseconds / step;
-            }
-            if (si > 0)
-            {
-                Array.Sort(sampleIntervals, 0, si);
-                medianIntervalMs = sampleIntervals[si / 2];
-            }
-        }
-
-        // Minimum gap threshold: 3x the median interval, but at least 10 seconds.
-        // For rolled-up data (60s intervals), this gives a 180s threshold.
-        var gapThresholdMs = Math.Max(medianIntervalMs * 3d, 10_000d);
-
         // Fast path: check if there are any gaps at all before allocating segment lists
         var hasGap = false;
         for (var i = 1; i < points.Count; i++)
         {
-            if ((points[i].Timestamp - points[i - 1].Timestamp).TotalMilliseconds > gapThresholdMs)
+            if (IsGap(points, i))
             {
                 hasGap = true;
                 break;
@@ -1248,7 +1223,7 @@ public sealed class TelemetryChart : UserControl
         var segStart = 0;
         for (var i = 1; i < points.Count; i++)
         {
-            if ((points[i].Timestamp - points[i - 1].Timestamp).TotalMilliseconds > gapThresholdMs)
+            if (IsGap(points, i))
             {
                 if (i > segStart)
                 {
@@ -1270,6 +1245,45 @@ public sealed class TelemetryChart : UserControl
         }
 
         return segments;
+    }
+
+    /// <summary>
+    /// True when the interval ending at <paramref name="index"/> is a real outage: more than 3x
+    /// the typical spacing on BOTH sides (and over 10s). It used to compare against one median
+    /// for the whole series, but a series is mixed-resolution right after launch - minute
+    /// averages from history, then live samples every scrape - so the live spacing set the
+    /// median and every history point read as its own gap, drawing the chart as scattered dots.
+    /// </summary>
+    private static bool IsGap(IReadOnlyList<MetricPoint> points, int index)
+    {
+        const double MinimumGapMs = 10_000d;
+        var intervalMs = (points[index].Timestamp - points[index - 1].Timestamp).TotalMilliseconds;
+        if (intervalMs <= MinimumGapMs)
+        {
+            return false;
+        }
+
+        var typicalMs = Math.Max(
+            NeighbourIntervalMaxMs(points, index, -1),
+            NeighbourIntervalMaxMs(points, index, +1));
+        return intervalMs > typicalMs * 3d;
+    }
+
+    /// <summary>
+    /// Largest of up to three intervals beside <paramref name="index"/> in one direction; 0 if none.
+    /// The largest, not the median: min/max-downsampled points alternate short (within a bucket)
+    /// and long (between buckets) intervals, and a median could land on a short one.
+    /// </summary>
+    private static double NeighbourIntervalMaxMs(IReadOnlyList<MetricPoint> points, int index, int direction)
+    {
+        var largest = 0d;
+        var seen = 0;
+        for (var k = index + direction; seen < 3 && k >= 1 && k < points.Count; k += direction, seen++)
+        {
+            largest = Math.Max(largest, (points[k].Timestamp - points[k - 1].Timestamp).TotalMilliseconds);
+        }
+
+        return largest;
     }
 
     private static Brush ResolveBrush(string key, string fallbackHex) => ThemeVisuals.ResolveBrush(key, fallbackHex);

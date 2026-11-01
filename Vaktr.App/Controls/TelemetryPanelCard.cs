@@ -531,9 +531,18 @@ public sealed class TelemetryPanelCard : UserControl
         };
         _cardBorder.SizeChanged += (_, e) =>
         {
-            // The legend may claim up to a third of the card before it scrolls; a fixed cap let
-            // a 16-core legend crowd the chart out of a short panel.
-            _legendScroller.MaxHeight = Math.Max(48, e.NewSize.Height * 0.3);
+            // The chart is the panel: the legend only gets what is left once the header and a
+            // readable plot are placed, up to a third of the card, and steps aside entirely on
+            // short cards. A flat third let a 16-core legend squash the plot to ~35px.
+            const double headerAndPaddingHeight = 166;
+            const double minimumReadableChartHeight = 120;
+            const double minimumUsefulLegendHeight = 56;
+            var available = e.NewSize.Height - headerAndPaddingHeight - minimumReadableChartHeight;
+            _legendScroller.MaxHeight = available < minimumUsefulLegendHeight
+                ? 0
+                : Math.Min(available, e.NewSize.Height * 0.33);
+            // Opacity, not Visibility: several paths own the divider's visibility already.
+            _legendDivider.Opacity = _legendScroller.MaxHeight > 0 ? 1 : 0;
         };
 
         // In edit mode the whole card body is the move handle.
