@@ -184,8 +184,12 @@ public sealed class TelemetryChart : UserControl
             Opacity = 0.82,
             Visibility = Visibility.Collapsed,
         };
+        // Transparent, not null: the plot must be hit-testable everywhere for drag-to-zoom and
+        // click-to-pin. Every drawn element is non-hit-testable (retained rendering), so without a
+        // background the chart caught no pointer input at all and zoom silently stopped working.
         Content = new Grid
         {
+            Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
             Children =
             {
                 _plotCanvas,

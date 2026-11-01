@@ -138,6 +138,8 @@ public sealed partial class ShellWindow
         };
     }
 
+    private const double StatusColumnWidth = 320;
+
     private FrameworkElement BuildHeader()
     {
         StartupTrace.Write("BuildHeader // two-view-shell");
@@ -149,7 +151,10 @@ public sealed partial class ShellWindow
         heroGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         heroGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         heroGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        heroGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        // Fixed, not Auto: the status line changes length constantly ("Applying theme", "Saving
+        // settings", "Last sample ..."), and as an Auto column every change shoved the
+        // Overview/Settings pill sideways - the jitter seen when pressing Apply.
+        heroGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(StatusColumnWidth) });
         heroGrid.Children.Add(_brandHost);
 
         var titleText = new TextBlock
@@ -204,7 +209,8 @@ public sealed partial class ShellWindow
             // Wider than the TextBlock's own MaxWidth so the text is the constraining element.
             // When the panel was the narrower of the two it clipped mid-glyph ("41 metr") instead
             // of letting TextTrimming produce an ellipsis.
-            MaxWidth = 340,
+            MaxWidth = StatusColumnWidth,
+            HorizontalAlignment = HorizontalAlignment.Right,
             VerticalAlignment = VerticalAlignment.Center,
             Children =
             {
@@ -811,17 +817,24 @@ public sealed partial class ShellWindow
         // status line, a 300px caption at the far end of the window that truncated them.
         _editModeHint = CreateSecondaryText("Drag a panel to move it \u00B7 drag an edge or corner to resize \u00B7 Esc when done", 12);
         _editModeHint.Opacity = 0;
-        _editModeHint.VerticalAlignment = VerticalAlignment.Center;
+        // Baseline-aligned with the title: both trimmed to their baseline and bottom-aligned, so
+        // 12px and 18px text share one line. Centring them vertically put the hint visibly low.
+        _editModeHint.VerticalAlignment = VerticalAlignment.Bottom;
+        _editModeHint.TextLineBounds = TextLineBounds.TrimToBaseline;
         _editModeHint.TextTrimming = TextTrimming.CharacterEllipsis;
         _editModeHint.TextWrapping = TextWrapping.NoWrap;
         _editModeHint.IsHitTestVisible = false;
+        var boardTitle = CreatePrimaryText("Performance", 18, true);
+        boardTitle.VerticalAlignment = VerticalAlignment.Bottom;
+        boardTitle.TextLineBounds = TextLineBounds.TrimToBaseline;
         grid.Children.Add(new StackPanel
         {
             Orientation = Orientation.Horizontal,
             Spacing = 16,
+            VerticalAlignment = VerticalAlignment.Center,
             Children =
             {
-                CreatePrimaryText("Performance", 18, true),
+                boardTitle,
                 _editModeHint,
             },
         });

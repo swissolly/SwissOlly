@@ -159,9 +159,9 @@ public class GridLayoutEngineTests
         var bottomShrink = GridLayoutEngine.ResizeByDelta(origin, false, false, false, true, 0, -99);
         var bottomGrow = GridLayoutEngine.ResizeByDelta(origin, false, false, false, true, 0, 99);
 
-        Assert.Equal((8, 7), (topShrink.Y, topShrink.H));
+        Assert.Equal((origin.Bottom - PanelLayout.MinHeight, PanelLayout.MinHeight), (topShrink.Y, topShrink.H));
         Assert.Equal((0, 15), (topGrow.Y, topGrow.H));
-        Assert.Equal((5, 7), (bottomShrink.Y, bottomShrink.H));
+        Assert.Equal((5, PanelLayout.MinHeight), (bottomShrink.Y, bottomShrink.H));
         Assert.Equal((5, PanelLayout.MaxHeight), (bottomGrow.Y, bottomGrow.H));
     }
 

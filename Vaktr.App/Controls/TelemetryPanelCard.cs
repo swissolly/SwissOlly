@@ -201,7 +201,7 @@ public sealed class TelemetryPanelCard : UserControl
         // smallest plot that still reads as a trend line.
         _chart = new TelemetryChart
         {
-            MinHeight = 96,
+            MinHeight = 64,
             HorizontalAlignment = HorizontalAlignment.Stretch,
             VerticalAlignment = VerticalAlignment.Stretch,
         };
@@ -492,7 +492,7 @@ public sealed class TelemetryPanelCard : UserControl
         _processRow = new RowDefinition { Height = GridLength.Auto };
         _contentGrid = new Grid();
         _contentGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        _contentGrid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star), MinHeight = 108 });
+        _contentGrid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star), MinHeight = 76 });
         _contentGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         _contentGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         _contentGrid.RowDefinitions.Add(_processRow);

@@ -13,12 +13,12 @@ public sealed class PanelLayout
 
     public const int MinWidth = 2;
     /// <summary>
-    /// Minimum height in row units. At a 48px row unit this reserves 336px, which is the
-    /// smallest a card can actually render without its chart and header overflowing. A smaller
-    /// floor let the grid hand a panel fewer rows than its own content minimum, so the card
-    /// spilled over the panel beneath it.
+    /// Minimum height in row units. Rows advance 62px (48px + 14px gap), so 4 rows is 234px:
+    /// header, value and a compact chart. It was 7 - the same as the default height - so a
+    /// default panel could never be made shorter, which made vertical and diagonal resizing
+    /// look broken. The card's chart row compresses to fit, so content never spills over.
     /// </summary>
-    public const int MinHeight = 7;
+    public const int MinHeight = 4;
     public const int MaxHeight = 24;
 
     /// <summary>Leftmost column, 0-based.</summary>
