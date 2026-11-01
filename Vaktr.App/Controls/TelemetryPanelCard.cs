@@ -70,8 +70,11 @@ public sealed class TelemetryPanelCard : UserControl
     private double _lastRenderedCeilingValue = double.NaN;
     private MetricUnit _lastRenderedUnit;
     private ProcessSortMode _lastRenderedSortMode;
-    private bool _lastRenderedSupportsProcessTable;
-    private bool _lastRenderedGaugeMode;
+    // Nullable so the first render always applies the visual mode. As plain bools they started
+    // "false", matched every panel without a process table, and the Processes button kept its
+    // default Visible on CPU Cores, Clock, GPU and the rest.
+    private bool? _lastRenderedSupportsProcessTable;
+    private bool? _lastRenderedGaugeMode;
     // Layout-edit geometry. One offset serves both roles a card plays in a gesture: the
     // floating card's position on the board, or a sibling's displacement while it makes room.
     // It is UIElement.Translation, not a RenderTransform: a RenderTransform change re-runs the
@@ -267,9 +270,12 @@ public sealed class TelemetryPanelCard : UserControl
         _sortHighestButton = CreateProcessSortButton("Highest", ProcessSortMode.Highest);
         _sortLowestButton = CreateProcessSortButton("Lowest", ProcessSortMode.Lowest);
         _sortNameButton = CreateProcessSortButton("Name", ProcessSortMode.Name);
-        _processToggleButton = new ActionChip { Text = "Processes", MinHeight = 30, MinWidth = 96 };
+        // Wide enough for "Hide processes", so toggling never shifts the header beside it.
+        _processToggleButton = new ActionChip { Text = "Processes", MinHeight = 30, MinWidth = 124 };
         ToolTipService.SetToolTip(_processToggleButton, "Show the top processes for this metric");
         _processToggleButton.Click += OnProcessSectionToggleClick;
+        // Hidden until a panel that has a process table says otherwise.
+        _processToggleButton.Visibility = Visibility.Collapsed;
 
         _processSectionTitleText = CreateTextBlock("Segoe UI Variable Text", 12, FontWeights.SemiBold);
         _processRowsHost = new StackPanel
@@ -1194,6 +1200,8 @@ public sealed class TelemetryPanelCard : UserControl
         {
             control._processSectionExpanded = false;
             control._lastRenderedProcessRows = null;
+            control._lastRenderedSupportsProcessTable = null;
+            control._lastRenderedGaugeMode = null;
             control._thresholdLevel = 0;
         }
 
