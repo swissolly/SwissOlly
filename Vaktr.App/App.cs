@@ -18,6 +18,32 @@ public sealed class App : Application
         StartupTrace.Write("App ctor");
         UnhandledException += OnUnhandledException;
 
+#if DEBUG
+        // WinUI can surface XAML failures as stowed COMExceptions before app-level handlers
+        // run. Mirror the HRESULT, source, message, and managed stack into Visual Studio Output.
+        // Debug only: it writes a stack trace to disk for every first-chance COMException,
+        // including the many the app catches on purpose.
+        AppDomain.CurrentDomain.FirstChanceException += (_, args) =>
+        {
+            if (args.Exception is System.Runtime.InteropServices.COMException comEx)
+            {
+                var message = comEx.Message ?? string.Empty;
+                var source = comEx.Source ?? string.Empty;
+                var isWinUiException =
+                    comEx.HResult == unchecked((int)0x800F1000) ||
+                    message.Contains("No installed components were detected", System.StringComparison.OrdinalIgnoreCase) ||
+                    source.Contains("WinRT.Runtime", System.StringComparison.OrdinalIgnoreCase);
+
+                if (isWinUiException)
+                {
+                    var label = "First-chance WinRT COMException HRESULT=0x" +
+                        comEx.HResult.ToString("X8") + " Source=" + source + " Message=" + message;
+                    StartupTrace.WriteException(label, comEx);
+                }
+            }
+        };
+#endif
+
         // Catch exceptions from background threads (LibreHardwareMonitor, WMI)
         AppDomain.CurrentDomain.UnhandledException += (_, args) =>
         {

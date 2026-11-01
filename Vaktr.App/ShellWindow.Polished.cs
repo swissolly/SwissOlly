@@ -33,13 +33,23 @@ public sealed partial class ShellWindow : Window
     private static readonly int[] RetentionHourPresets = [1, 6, 12, 24, 48, 72, 168, 336, 720, 2160, 8760];
     private static BitmapImage? s_brandBitmap;
     private static string? s_brandBitmapPath;
-    private DeckEditorMode _activeDeckEditor = DeckEditorMode.Scrape;
 
     private readonly MainViewModel _viewModel;
+
+    /// <summary>
+    /// The UI thread's queue, captured on the UI thread. Background threads must post through
+    /// this, never through <c>Window.DispatcherQueue</c>: the Window is a UI-thread COM object, so
+    /// reading its property from a worker is a cross-apartment call into the UI thread - one COM
+    /// can stall or reject depending on what the UI thread is doing at that instant. That call sat
+    /// on both the startup continuation and every snapshot, and losing that race left the app
+    /// stuck on "Starting telemetry" with no data. DispatcherQueue itself is agile.
+    /// </summary>
+    private readonly DispatcherQueue _uiQueue;
     private readonly IMetricStore _metricStore;
     private readonly IConfigStore _configStore;
     private readonly AutoLaunchService _autoLaunchService;
     private readonly Dictionary<string, TelemetryPanelCard> _panelCards = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, PanelLayout> _displayPanelLayouts = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<SummaryCardVisual> _summaryCardVisuals = [];
     private readonly StackPanel _overviewView;
     private readonly StackPanel _settingsView;
@@ -64,7 +74,6 @@ public sealed partial class ShellWindow : Window
     private readonly TextBlock _statusText;
     private readonly Ellipse _statusIndicator;
     private readonly ActionChip _globalRangeButton;
-    private readonly Border _globalRangeEditorHost;
     private readonly ActionChip _globalOneMinuteButton;
     private readonly ActionChip _globalFiveMinuteButton;
     private readonly ActionChip _globalFifteenMinuteButton;
@@ -82,22 +91,26 @@ public sealed partial class ShellWindow : Window
 
     private CollectorService? _collectorService;
     private Task? _pendingHistoryLoad;
+    private Task? _pendingStartupPrune;
     private OverlayController? _overlayController;
     private nint _windowIconHandle;
     private bool _controlDeckEditableActive;
     private bool _dashboardRefreshQueued;
+    private bool _responsiveLayoutUpdateQueued;
     private bool _hasReceivedFirstSnapshot;
     private bool _initialized;
     private bool _launchIntroPlayed;
     private bool _settingsIntroPlayed;
     private int _lastDashboardColumnCount;
+    private int _lastResponsiveMinimumWidth = -1;
     private int _lastSummaryColumnCount;
     private int _lastSettingsColumnCount;
     private bool _windowIconApplied;
     private bool _summaryCardsBound;
     private bool _globalRangeEditorVisible;
     private bool _settingsViewActive;
-    private bool _snapshotApplyQueued;
+    private bool _settingsViewBuilt;
+    private int _snapshotApplyQueued; // 0/1 via Interlocked: set by the collector thread, cleared by the UI thread
     private bool _controlDeckRenderQueued;
     private bool _panelRenderingSuspended;
     private string _lastRenderedStatusText = string.Empty;
@@ -115,7 +128,7 @@ public sealed partial class ShellWindow : Window
     private List<string> _draftOverlayCustomMetrics = ["fps", "cpu", "gpu", "gpu-temp", "memory"];
     private DateTimeOffset? _globalAbsoluteStartUtc;
     private DateTimeOffset? _globalAbsoluteEndUtc;
-    private MetricSnapshot? _pendingSnapshot;
+    private MetricSnapshot? _pendingSnapshot; // written by the collector thread, taken atomically by the UI thread
     private int _lastLoadedHistoryMinutes;
     public ShellWindow(
         MainViewModel viewModel,
@@ -124,6 +137,7 @@ public sealed partial class ShellWindow : Window
         AutoLaunchService autoLaunchService)
     {
         StartupTrace.Write("ShellWindow ctor start // polished-v19");
+        _uiQueue = DispatcherQueue;
         _viewModel = viewModel;
         _metricStore = metricStore;
         _configStore = configStore;
@@ -164,10 +178,6 @@ public sealed partial class ShellWindow : Window
         _globalRangeButton = CreateActionChip("15m", OnToggleGlobalRangeEditor, true);
         _globalRangeButton.MinWidth = 88;
         ToolTipService.SetToolTip(_globalRangeButton, "Choose the time range for all charts");
-        _globalRangeEditorHost = new Border
-        {
-            Visibility = Visibility.Collapsed,
-        };
         _globalOneMinuteButton = CreateGlobalRangeChip("1m", 1);
         _globalFiveMinuteButton = CreateGlobalRangeChip("5m", 5);
         _globalFifteenMinuteButton = CreateGlobalRangeChip("15m", 15);
@@ -257,8 +267,6 @@ public sealed partial class ShellWindow : Window
         {
             TryApplyWindowIcon();
             TryLoadBrandImage();
-            SyncControlDeckDraftsFromViewModel();
-            RenderControlDeckSummary();
             BuildSummaryCards();
             RefreshDashboardPanels();
             RefreshGlobalRangeControls();
@@ -273,7 +281,7 @@ public sealed partial class ShellWindow : Window
         // The dashboard has its own waiting states; telemetry must not keep the
         // entire app hidden if the first sample is slow or unavailable.
         DismissLoadingOverlay();
-        MaybeStartGestureProbe();
+        InstallLayoutKeyboardShortcuts();
     }
 
     public void ApplyInitialTheme(ThemeMode mode)
@@ -334,21 +342,13 @@ public sealed partial class ShellWindow : Window
 
         // Rebuild control deck on next frame — it's less critical than panel visuals
         // and rebuilding synchronously during theme switches causes visible jank.
-        _ = DispatcherQueue.TryEnqueue(DispatcherQueuePriority.Normal, () =>
+        _ = _uiQueue.TryEnqueue(DispatcherQueuePriority.Normal, () =>
         {
-            if (_controlDeckEditableActive)
+            if (_settingsViewBuilt)
             {
                 RenderEditableControlDeck();
             }
-            else
-            {
-                RenderControlDeckSummary();
-            }
 
-            if (_globalRangeEditorVisible)
-            {
-                RenderGlobalRangeEditor();
-            }
         });
     }
 
@@ -382,14 +382,16 @@ public sealed partial class ShellWindow : Window
                 VerticalAlignment = VerticalAlignment.Center,
             };
 
-            var titleText = CreateMutedText(string.Empty, 9.5);
+            var titleText = CreateMutedText(string.Empty, 11);
             titleText.SetBinding(TextBlock.TextProperty, new Binding { Path = new PropertyPath(nameof(SummaryCardViewModel.Title)) });
 
             var valueText = CreatePrimaryText(string.Empty, 24, true);
             valueText.FontFamily = new FontFamily("Segoe UI Variable Display");
+            // Tabular figures keep the live number from shifting width every sample.
+            Microsoft.UI.Xaml.Documents.Typography.SetNumeralAlignment(valueText, FontNumeralAlignment.Tabular);
             valueText.SetBinding(TextBlock.TextProperty, new Binding { Path = new PropertyPath(nameof(SummaryCardViewModel.Value)) });
 
-            var captionText = CreateSecondaryText(string.Empty, 11.5);
+            var captionText = CreateSecondaryText(string.Empty, 12);
             captionText.SetBinding(TextBlock.TextProperty, new Binding { Path = new PropertyPath(nameof(SummaryCardViewModel.Caption)) });
 
             // Mini utilization bar — thin horizontal bar below the value
@@ -401,20 +403,25 @@ public sealed partial class ShellWindow : Window
                 Opacity = 0.38,
                 Margin = new Thickness(0, 7, 0, 6),
             };
+            // The fill spans the track and is scaled, not resized: setting Width every sample was a
+            // layout pass per meter per scrape, and the bar jumped. A scale is composition-only and
+            // animates, so the meter glides from one reading to the next.
+            var gaugeScale = new ScaleTransform { ScaleX = Math.Clamp(card.Utilization / 100d, 0d, 1d), ScaleY = 1d };
             var gaugeFill = new Border
             {
                 Height = 3,
                 CornerRadius = new CornerRadius(2),
-                HorizontalAlignment = HorizontalAlignment.Left,
+                HorizontalAlignment = HorizontalAlignment.Stretch,
                 Background = card.AccentBrush,
                 Margin = new Thickness(0, 7, 0, 6),
+                RenderTransform = gaugeScale,
+                RenderTransformOrigin = new Windows.Foundation.Point(0, 0.5),
             };
             var gaugeHost = new Grid
             {
                 Children = { gaugeTrack, gaugeFill },
             };
 
-            // Bind fill width and color to utilization
             card.PropertyChanged += (_, args) =>
             {
                 if (_isWindowResizing) return; // skip during resize
@@ -424,15 +431,7 @@ public sealed partial class ShellWindow : Window
                 }
 
                 var util = card.Utilization;
-                var trackWidth = gaugeTrack.ActualWidth > 0 ? gaugeTrack.ActualWidth : 120;
-                gaugeFill.Width = trackWidth * Math.Clamp(util / 100d, 0d, 1d);
-                gaugeFill.Background = ResolveSummaryUtilizationBrush(util, card.AccentBrush);
-            };
-            // Also update on track size change
-            gaugeTrack.SizeChanged += (_, _) =>
-            {
-                var util = card.Utilization;
-                gaugeFill.Width = gaugeTrack.ActualWidth * Math.Clamp(util / 100d, 0d, 1d);
+                AnimateMeter(gaugeScale, Math.Clamp(util / 100d, 0d, 1d));
                 gaugeFill.Background = ResolveSummaryUtilizationBrush(util, card.AccentBrush);
             };
 
@@ -538,18 +537,15 @@ public sealed partial class ShellWindow : Window
         {
             if (_panelCards.TryGetValue(staleKey, out var staleCard))
             {
-                staleCard.RangePresetRequested -= OnPanelRangePresetRequested;
                 staleCard.PanelZoomSelectionRequested -= OnPanelZoomSelectionRequested;
                 staleCard.PanelZoomResetRequested -= OnPanelZoomResetRequested;
-                staleCard.PanelSizePresetRequested -= OnPanelSizePresetRequested;
-                staleCard.PanelDragMoved -= OnPanelDragMoved;
-                staleCard.PanelResizeStarted -= OnPanelResizeStarted;
-                staleCard.PanelResizeDelta -= OnPanelResizeDelta;
-                staleCard.PanelResizeCompleted -= OnPanelResizeCompleted;
-                staleCard.PanelDragEnded -= OnPanelDragEnded;
+                staleCard.LayoutGestureStarted -= OnCardLayoutGestureStarted;
+                staleCard.LayoutGestureMoved -= OnCardLayoutGestureMoved;
+                staleCard.LayoutGestureEnded -= OnCardLayoutGestureEnded;
             }
 
             _panelCards.Remove(staleKey);
+            _reflowSprings.Remove(staleKey);
         }
 
         foreach (var panel in panels)
@@ -557,16 +553,12 @@ public sealed partial class ShellWindow : Window
             if (!_panelCards.TryGetValue(panel.PanelKey, out var card))
             {
                 card = new TelemetryPanelCard { Panel = panel };
-                card.RangePresetRequested += OnPanelRangePresetRequested;
                 card.PanelZoomSelectionRequested += OnPanelZoomSelectionRequested;
                 card.PanelZoomResetRequested += OnPanelZoomResetRequested;
-                card.PanelSizePresetRequested += OnPanelSizePresetRequested;
-                card.PanelDragMoved += OnPanelDragMoved;
-                card.PanelResizeStarted += OnPanelResizeStarted;
-                card.PanelResizeDelta += OnPanelResizeDelta;
-                card.PanelResizeCompleted += OnPanelResizeCompleted;
+                card.LayoutGestureStarted += OnCardLayoutGestureStarted;
+                card.LayoutGestureMoved += OnCardLayoutGestureMoved;
+                card.LayoutGestureEnded += OnCardLayoutGestureEnded;
                 card.SetLayoutEditMode(_isLayoutEditMode);
-                card.PanelDragEnded += OnPanelDragEnded;
                 _panelCards.Add(panel.PanelKey, card);
             }
             else
@@ -575,6 +567,18 @@ public sealed partial class ShellWindow : Window
             }
 
             card.SetRenderingSuspended(_panelRenderingSuspended);
+        }
+
+        CancelActiveLayoutGesture();
+        CompleteFloatSettle();
+        foreach (var (key, springs) in _reflowSprings)
+        {
+            springs.X.Snap(0);
+            springs.Y.Snap(0);
+            if (_panelCards.TryGetValue(key, out var resetCard))
+            {
+                resetCard.SetReflowOffset(0, 0);
+            }
         }
 
         _dashboardGrid.Children.Clear();
@@ -602,6 +606,10 @@ public sealed partial class ShellWindow : Window
         }
 
         PlaceDashboardPanels(panels, PanelLayout.Columns, resetRows: true);
+        if (_dropPlaceholder is not null)
+        {
+            EnsureDropPlaceholder();
+        }
     }
 
     private int DetermineDashboardColumns()
@@ -640,14 +648,7 @@ public sealed partial class ShellWindow : Window
         }
 
         _lastSettingsColumnCount = columns;
-        if (_controlDeckEditableActive)
-        {
-            RenderEditableControlDeck();
-        }
-        else
-        {
-            RenderControlDeckSummary();
-        }
+        RenderEditableControlDeck();
     }
 
     private void OnRootLoaded(object sender, RoutedEventArgs e)
@@ -671,7 +672,7 @@ public sealed partial class ShellWindow : Window
                 BuildSummaryCards();
             }
 
-            _ = DispatcherQueue.TryEnqueue(DispatcherQueuePriority.Low, PlayLaunchEntrance);
+            _ = _uiQueue.TryEnqueue(DispatcherQueuePriority.Low, PlayLaunchEntrance);
 
             var config = _viewModel.BuildConfig();
             StartupTrace.Write("OnRootLoaded resumed after first paint // polished-v19");
@@ -680,7 +681,7 @@ public sealed partial class ShellWindow : Window
             App.CurrentApp.MarkStartupSettled();
             _ = StartTelemetryAsync(config);
             StartOverlay(config);
-            _ = DispatcherQueue.TryEnqueue(() =>
+            _ = _uiQueue.TryEnqueue(() =>
             {
                 TryApplyWindowIcon();
             });
@@ -751,44 +752,31 @@ public sealed partial class ShellWindow : Window
         }
     }
 
-    private void PlayControlEditorEntrance()
-    {
-        if (!Motion.AnimationsEnabled || _controlsBodyHost.Child is not StackPanel body)
-        {
-            return;
-        }
-
-        var cardIndex = 0;
-        if (body.Children.Count > 0 && body.Children[0] is Grid cards)
-        {
-            foreach (var card in cards.Children)
-            {
-                var delay = Math.Min(cardIndex, 6) * 28;
-                Motion.PlayEntrance(card, TimeSpan.FromMilliseconds(delay));
-                cardIndex++;
-            }
-        }
-
-        if (body.Children.Count > 1)
-        {
-            Motion.PlayEntrance(body.Children[1], TimeSpan.FromMilliseconds(150));
-        }
-    }
-
     private async Task StartTelemetryAsync(VaktrConfig config)
     {
         try
         {
-            await EnsureCollectorRunningAsync(config);
-            _pendingHistoryLoad = TryLoadHistoryAsync(config);
+            _viewModel.StatusText = "Starting telemetry";
+            UpdateStatusText();
 
-            // Run startup prune in the background — don't block telemetry startup.
-            // This catches up on missed maintenance without delaying the first snapshot.
-            _ = Task.Run(async () =>
+            // Open the store first, on a worker. Initialization is idempotent, so the collector's
+            // own StartAsync reusing it later costs nothing.
+            var store = _metricStore;
+            await Task.Run(() => store.InitializeAsync(config, CancellationToken.None));
+            StartupTrace.Write("Metric store ready");
+
+            // Fill the board from history straight away, in parallel with the collector's PDH
+            // setup. It used to wait behind that setup, so panels appeared ~0.5s later than needed.
+            _pendingHistoryLoad = Task.Run(() => TryLoadHistoryAsync(config));
+
+            await EnsureCollectorRunningAsync(config);
+
+            // Retention catches up in the background; pruning is transactional.
+            _pendingStartupPrune = Task.Run(async () =>
             {
                 try
                 {
-                    await _metricStore.PruneAsync(config, CancellationToken.None);
+                    await _metricStore.PruneAsync(config, CancellationToken.None).ConfigureAwait(false);
                     StartupTrace.Write("Startup prune complete");
                 }
                 catch (Exception pruneEx)
@@ -796,13 +784,12 @@ public sealed partial class ShellWindow : Window
                     StartupTrace.WriteException("Startup prune", pruneEx);
                 }
             });
-
-            StartupTrace.Write("Background startup complete // polished-v19");
+            StartupTrace.Write("Background startup complete // polished-v21");
         }
         catch (Exception ex)
         {
             StartupTrace.WriteException("StartTelemetryAsync", ex);
-            _ = DispatcherQueue.TryEnqueue(() =>
+            _ = _uiQueue.TryEnqueue(() =>
             {
                 _viewModel.StatusText = $"Startup issue: {ex.Message}";
                 UpdateStatusText();
@@ -837,6 +824,20 @@ public sealed partial class ShellWindow : Window
         {
             NativeWindowMethods.DestroyIcon(_windowIconHandle);
             _windowIconHandle = 0;
+        }
+
+        // Wait briefly for startup retention work too; the store also serializes disposal
+        // behind any operation that is already using its write connection.
+        if (_pendingStartupPrune is not null)
+        {
+            try
+            {
+                _pendingStartupPrune.Wait(TimeSpan.FromSeconds(2));
+            }
+            catch
+            {
+                // Best-effort cleanup - the store coordinates any active write before closing.
+            }
         }
 
         // Wait for any in-flight history load to complete so its SQLite
@@ -891,6 +892,13 @@ public sealed partial class ShellWindow : Window
                 // Best-effort cleanup — process is exiting
             }
         }
+
+        // Everything is flushed: config saved, collector stopped, store checkpointed. End the
+        // process explicitly. Left to WinUI, the dispatcher's shutdown drain was observed spinning a
+        // full CPU core indefinitely after the window closed - an invisible zombie, on a machine
+        // that is usually running a game.
+        StartupTrace.Write("Window closed; exiting");
+        Environment.Exit(0);
     }
 
     private void OnWindowActivated(object sender, WindowActivatedEventArgs args)
@@ -907,7 +915,7 @@ public sealed partial class ShellWindow : Window
             return;
         }
 
-        _ = DispatcherQueue.TryEnqueue(TryApplyWindowIcon);
+        _ = _uiQueue.TryEnqueue(TryApplyWindowIcon);
     }
 
 
@@ -965,14 +973,13 @@ public sealed partial class ShellWindow : Window
             UpdateStatusText();
             _viewModel.ApplyConfig(config);
             SyncControlDeckDraftsFromViewModel();
-            _controlDeckEditableActive = false;
             _autoLaunchService.SetEnabled(config.LaunchOnStartup);
             await _configStore.SaveAsync(config, CancellationToken.None);
             if (themeChanged)
             {
                 App.CurrentApp.ApplyTheme(config.Theme);
             }
-            RenderControlDeckSummary();
+            RenderEditableControlDeck();
             _ = ApplyRuntimeSettingsAsync(config, collectorRestartRequired, retentionChanged, retentionLowered);
         }
         catch (Exception ex)
@@ -986,8 +993,13 @@ public sealed partial class ShellWindow : Window
     {
         if (sender is ActionChip { Tag: ThemeMode mode } && Enum.IsDefined(typeof(ThemeMode), mode))
         {
+            // A theme has nothing to validate, so it applies and saves on click. As a draft it
+            // looked applied, then silently reverted on the next launch unless you also found
+            // Apply at the bottom of the page.
             _draftThemeMode = mode;
-            App.CurrentApp.PreviewTheme(mode);
+            _viewModel.SelectedTheme = mode;
+            App.CurrentApp.ApplyTheme(mode);
+            DebouncePersistLayout();
         }
     }
 
@@ -1006,13 +1018,9 @@ public sealed partial class ShellWindow : Window
     {
         if (sender is ActionChip { Tag: int minutes })
         {
+            StartupTrace.Write($"Global time range selected // minutes={minutes}");
             RunWithDeferredPanelRendering(() => ApplyGlobalWindowRange(minutes));
         }
-    }
-
-    private void OnPanelRangePresetRequested(object? sender, TimeRangePresetRequestedEventArgs e)
-    {
-        RunWithDeferredPanelRendering(() => ApplyGlobalWindowRange((int)e.Preset));
     }
 
     private void OnPanelZoomSelectionRequested(object? sender, ChartZoomSelectionEventArgs e)
@@ -1023,64 +1031,6 @@ public sealed partial class ShellWindow : Window
     private void OnPanelZoomResetRequested(object? sender, EventArgs e)
     {
         OnResetAllZoomClick(sender, e);
-    }
-
-    private void OnPanelDragEnded(object? sender, EventArgs e)
-    {
-        // In edit mode a drag is a grid move: translate the pixel offset into cells and let the
-        // engine resolve the board around the dropped panel. Outside edit mode this is just the
-        // legacy reorder settling back into place.
-        HidePlaceholder();
-
-        if (_isLayoutEditMode
-            && sender is TelemetryPanelCard card
-            && card.Panel?.PanelKey is { Length: > 0 } key
-            && _viewModel.GetPanelLayout(key) is { } layout)
-        {
-            var columnWidth = _dashboardGrid.ActualWidth / PanelLayout.Columns;
-            if (columnWidth > 0)
-            {
-                var offset = card.DragOffset;
-                var targetX = layout.X + (int)Math.Round(offset.X / columnWidth);
-                var targetY = layout.Y + (int)Math.Round(offset.Y / DashboardRowUnitPx);
-
-                if (targetX != layout.X || targetY != layout.Y)
-                {
-                    var placements = _viewModel.PanelLayouts
-                        .Select(kv => new PanelPlacement(kv.Key, kv.Value))
-                        .ToList();
-
-                    _viewModel.ApplyPlacements(
-                        GridLayoutEngine.Move(placements, key, targetX, targetY));
-                }
-            }
-        }
-
-        ReorderDashboardPanelsInPlace();
-        DebouncePersistLayout();
-    }
-
-    private void OnPanelReorderRequested(object? sender, PanelReorderRequestedEventArgs e)
-    {
-        // Edit mode places by grid cell, so the drop-target swap must not also fire or the two
-        // would produce different answers for the same gesture.
-        if (_isLayoutEditMode)
-        {
-            return;
-        }
-
-        if (!_viewModel.MovePanel(e.SourcePanelKey, e.TargetPanelKey))
-        {
-            return;
-        }
-
-        // Play a subtle settle animation on the displaced card
-        if (_panelCards.TryGetValue(e.TargetPanelKey, out var displacedCard) && !displacedCard.IsDragging)
-        {
-            displacedCard.PlaySwapSettleAnimation();
-        }
-
-        ReorderDashboardPanelsInPlace();
     }
 
     private void ReorderDashboardPanelsInPlace()
@@ -1108,28 +1058,34 @@ public sealed partial class ShellWindow : Window
         _viewModel.EnsureLayoutsFor(panels.Select(p => p.PanelKey).ToList());
 
         var minWidth = ResponsiveMinimumWidth();
-        var maxRow = 0;
+        var savedPlacements = panels
+            .Select(panel => _viewModel.GetPanelLayout(panel.PanelKey) is { } layout
+                ? new PanelPlacement(panel.PanelKey, layout)
+                : null)
+            .Where(placement => placement is not null)
+            .Select(placement => placement!)
+            .ToList();
+        var displayPlacements = GridLayoutEngine.ResolveResponsive(savedPlacements, minWidth);
+        _displayPanelLayouts.Clear();
+        foreach (var placement in displayPlacements)
+        {
+            _displayPanelLayouts[placement.Key] = placement.Layout;
+        }
+        _lastResponsiveMinimumWidth = minWidth;
 
+        var maxRow = displayPlacements.Count == 0 ? 0 : displayPlacements.Max(placement => placement.Layout.Bottom);
         foreach (var panel in panels)
         {
-            var layout = _viewModel.GetPanelLayout(panel.PanelKey);
-            if (layout is null)
+            if (!_displayPanelLayouts.TryGetValue(panel.PanelKey, out var layout))
             {
                 continue;
             }
 
-            // Widen narrow panels at small windows so a third-width card never becomes an
-            // unreadable sliver. The saved geometry is untouched — this is display-only.
-            var width = Math.Clamp(Math.Max(layout.W, minWidth), PanelLayout.MinWidth, PanelLayout.Columns);
-            var x = Math.Clamp(layout.X, 0, PanelLayout.Columns - width);
-
-            maxRow = Math.Max(maxRow, layout.Bottom);
-
-            if (_panelCards.TryGetValue(panel.PanelKey, out var card) && !card.IsDragging)
+            if (_panelCards.TryGetValue(panel.PanelKey, out var card) && !card.IsFloating)
             {
-                Grid.SetColumn(card, x);
+                Grid.SetColumn(card, layout.X);
                 Grid.SetRow(card, layout.Y);
-                Grid.SetColumnSpan(card, width);
+                Grid.SetColumnSpan(card, layout.W);
                 Grid.SetRowSpan(card, layout.H);
             }
         }
@@ -1138,9 +1094,17 @@ public sealed partial class ShellWindow : Window
         {
             _dashboardGrid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(DashboardRowUnitPx) });
         }
+        // Rows a floating panel still occupies are trimmed when it docks, not here, or the
+        // board would shrink out from under a panel that is still settling.
+        while (!IsLayoutMotionActive && _dashboardGrid.RowDefinitions.Count > maxRow)
+        {
+            _dashboardGrid.RowDefinitions.RemoveAt(_dashboardGrid.RowDefinitions.Count - 1);
+        }
+
+        SpanBoardOverlays();
     }
 
-    /// <summary>Row unit in pixels. A default panel is H=6, so ~336px tall including spacing.</summary>
+    /// <summary>RowDefinition height; its grid pitch also includes the configured row spacing.</summary>
     private const double DashboardRowUnitPx = 48;
 
     /// <summary>
@@ -1160,289 +1124,6 @@ public sealed partial class ShellWindow : Window
         };
     }
 
-    private static int GetPanelColumnSpan(PanelSizePreset size) => size switch
-    {
-        PanelSizePreset.Wide or PanelSizePreset.Large => 2,
-        _ => 1,
-    };
-
-    private void OnToggleLayoutEditClick(object? sender, EventArgs e)
-        => SetLayoutEditMode(!_isLayoutEditMode, commit: true);
-
-    private void OnCancelLayoutEditClick(object? sender, EventArgs e)
-    {
-        if (_layoutSnapshot is not null)
-        {
-            _viewModel.RestorePanelLayouts(_layoutSnapshot);
-            ReorderDashboardPanelsInPlace();
-        }
-
-        SetLayoutEditMode(false, commit: false);
-    }
-
-    /// <summary>
-    /// Entering edit mode snapshots geometry so Cancel is a true revert. Leaving with
-    /// <paramref name="commit"/> persists through the existing debounced save path.
-    /// </summary>
-    private void SetLayoutEditMode(bool editing, bool commit)
-    {
-        if (_isLayoutEditMode == editing)
-        {
-            return;
-        }
-
-        _isLayoutEditMode = editing;
-
-        if (editing)
-        {
-            _layoutSnapshot = _viewModel.SnapshotPanelLayouts();
-        }
-        else
-        {
-            _layoutSnapshot = null;
-            if (commit)
-            {
-                DebouncePersistLayout();
-            }
-        }
-
-        _editLayoutButton.Text = editing ? "Done" : "Edit layout";
-        _editLayoutButton.IsActive = editing;
-        _editLayoutButton.IsFilled = editing;
-        _cancelLayoutButton.Visibility = editing ? Visibility.Visible : Visibility.Collapsed;
-
-        // Leaving edit mode mid-gesture must not strand a card in its floating preview state
-        // (explicit size, top-left aligned, raised z-index) with no release event coming.
-        if (!editing)
-        {
-            _resizeCard?.EndResizePreview();
-            _resizeCard = null;
-            _resizeOriginKey = null;
-            _resizeOriginLayout = null;
-            HidePlaceholder();
-        }
-
-        foreach (var card in _panelCards.Values)
-        {
-            card.SetLayoutEditMode(editing);
-        }
-
-        if (editing)
-        {
-            _viewModel.StatusText = "Edit layout - drag a panel to move it, drag its edges to resize";
-            UpdateStatusText();
-        }
-    }
-
-    private PanelLayout? _resizeOriginLayout;
-    private string? _resizeOriginKey;
-    private TelemetryPanelCard? _resizeCard;
-    private Windows.Foundation.Size _resizeOriginSize;
-    private Border? _layoutPlaceholder;
-
-    /// <summary>
-    /// The drop target preview. A bare Border - no chart, no text - so moving it through the
-    /// grid during a drag costs essentially nothing, which is the whole point: the expensive
-    /// real panels stay put until the gesture ends.
-    /// </summary>
-    private Border EnsurePlaceholder()
-    {
-        if (_layoutPlaceholder is null)
-        {
-            _layoutPlaceholder = new Border
-            {
-                Background = ResolveBrush("AccentSoftBrush", "#294A6B"),
-                BorderBrush = ResolveBrush("AccentBrush", "#79B8FF"),
-                BorderThickness = new Thickness(1.5),
-                CornerRadius = new CornerRadius(8),
-                Opacity = 0.35,
-                IsHitTestVisible = false,
-                Visibility = Visibility.Collapsed,
-            };
-            Canvas.SetZIndex(_layoutPlaceholder, 10);
-            _dashboardGrid.Children.Add(_layoutPlaceholder);
-        }
-
-        return _layoutPlaceholder;
-    }
-
-    private void ShowPlaceholderAt(PanelLayout layout)
-    {
-        var placeholder = EnsurePlaceholder();
-        Grid.SetColumn(placeholder, layout.X);
-        Grid.SetRow(placeholder, layout.Y);
-        Grid.SetColumnSpan(placeholder, layout.W);
-        Grid.SetRowSpan(placeholder, layout.H);
-        placeholder.Visibility = Visibility.Visible;
-    }
-
-    private void HidePlaceholder()
-    {
-        if (_layoutPlaceholder is not null)
-        {
-            _layoutPlaceholder.Visibility = Visibility.Collapsed;
-        }
-    }
-
-    /// <summary>Previews the cell a dragged panel will land in, without disturbing the board.</summary>
-    private void OnPanelDragMoved(object? sender, PanelResizeEventArgs e)
-    {
-        if (!_isLayoutEditMode || string.IsNullOrEmpty(e.PanelKey))
-        {
-            return;
-        }
-
-        if (_viewModel.GetPanelLayout(e.PanelKey) is not { } layout)
-        {
-            return;
-        }
-
-        var columnWidth = _dashboardGrid.ActualWidth / PanelLayout.Columns;
-        if (columnWidth <= 0)
-        {
-            return;
-        }
-
-        ShowPlaceholderAt(new PanelLayout(
-            layout.X + (int)Math.Round(e.DeltaX / columnWidth),
-            Math.Max(0, layout.Y + (int)Math.Round(e.DeltaY / DashboardRowUnitPx)),
-            layout.W,
-            layout.H).Normalize());
-    }
-
-    /// <summary>Captures the geometry and pixel size the drag starts from.</summary>
-    private void OnPanelResizeStarted(object? sender, PanelResizeEventArgs e)
-    {
-        if (!_isLayoutEditMode || string.IsNullOrEmpty(e.PanelKey) || sender is not TelemetryPanelCard card)
-        {
-            return;
-        }
-
-        _resizeOriginLayout = _viewModel.GetPanelLayout(e.PanelKey)?.Clone();
-        if (_resizeOriginLayout is null)
-        {
-            return;
-        }
-
-        _resizeOriginKey = e.PanelKey;
-        _resizeCard = card;
-        _resizeOriginSize = card.BeginResizePreview();
-        ShowPlaceholderAt(_resizeOriginLayout);
-    }
-
-    /// <summary>
-    /// Pixel feedback on the card, snapped preview on the placeholder. Nothing else in the grid
-    /// is touched until the gesture completes.
-    /// </summary>
-    private void OnPanelResizeDelta(object? sender, PanelResizeEventArgs e)
-    {
-        if (!_isLayoutEditMode
-            || _resizeOriginLayout is not { } origin
-            || _resizeCard is not { } card
-            || !string.Equals(_resizeOriginKey, e.PanelKey, StringComparison.OrdinalIgnoreCase))
-        {
-            return;
-        }
-
-        var columnWidth = _dashboardGrid.ActualWidth / PanelLayout.Columns;
-        if (columnWidth <= 0)
-        {
-            return;
-        }
-
-        var width = _resizeOriginSize.Width;
-        var height = _resizeOriginSize.Height;
-        var offsetX = 0d;
-        var offsetY = 0d;
-
-        if (e.Edge.HasFlag(TelemetryPanelCard.ResizeEdge.Right)) width += e.DeltaX;
-        if (e.Edge.HasFlag(TelemetryPanelCard.ResizeEdge.Bottom)) height += e.DeltaY;
-        if (e.Edge.HasFlag(TelemetryPanelCard.ResizeEdge.Left))
-        {
-            width -= e.DeltaX;
-            offsetX = e.DeltaX;
-        }
-        if (e.Edge.HasFlag(TelemetryPanelCard.ResizeEdge.Top))
-        {
-            height -= e.DeltaY;
-            offsetY = e.DeltaY;
-        }
-
-        card.UpdateResizePreview(width, height, offsetX, offsetY);
-
-        // Snapped destination, derived from the same origin geometry every time so the result
-        // depends only on where the pointer is now - never on the path it took.
-        var dCols = (int)Math.Round(e.DeltaX / columnWidth);
-        var dRows = (int)Math.Round(e.DeltaY / DashboardRowUnitPx);
-
-        var x = origin.X;
-        var y = origin.Y;
-        var w = origin.W;
-        var h = origin.H;
-
-        if (e.Edge.HasFlag(TelemetryPanelCard.ResizeEdge.Right)) w = origin.W + dCols;
-        if (e.Edge.HasFlag(TelemetryPanelCard.ResizeEdge.Bottom)) h = origin.H + dRows;
-        if (e.Edge.HasFlag(TelemetryPanelCard.ResizeEdge.Left))
-        {
-            var clamped = Math.Min(dCols, origin.W - PanelLayout.MinWidth);
-            x = origin.X + clamped;
-            w = origin.W - clamped;
-        }
-        if (e.Edge.HasFlag(TelemetryPanelCard.ResizeEdge.Top))
-        {
-            var clamped = Math.Min(dRows, origin.H - PanelLayout.MinHeight);
-            y = Math.Max(0, origin.Y + clamped);
-            h = origin.H - (y - origin.Y);
-        }
-
-        ShowPlaceholderAt(new PanelLayout(x, y, w, h).Normalize());
-    }
-
-    /// <summary>Commits once, on release. This is the only layout pass of the whole gesture.</summary>
-    private void OnPanelResizeCompleted(object? sender, EventArgs e)
-    {
-        var card = _resizeCard;
-        var key = _resizeOriginKey;
-        var placeholder = _layoutPlaceholder;
-
-        _resizeCard = null;
-        _resizeOriginKey = null;
-        _resizeOriginLayout = null;
-
-        card?.EndResizePreview();
-        HidePlaceholder();
-
-        if (!_isLayoutEditMode || key is null || placeholder is null)
-        {
-            return;
-        }
-
-        var target = new PanelLayout(
-            Grid.GetColumn(placeholder),
-            Grid.GetRow(placeholder),
-            Grid.GetColumnSpan(placeholder),
-            Grid.GetRowSpan(placeholder));
-
-        var placements = _viewModel.PanelLayouts
-            .Select(kv => new PanelPlacement(kv.Key, kv.Value))
-            .ToList();
-
-        _viewModel.ApplyPlacements(GridLayoutEngine.Apply(placements, key, target));
-        ReorderDashboardPanelsInPlace();
-        DebouncePersistLayout();
-    }
-
-    private void OnPanelSizePresetRequested(object? sender, PanelSizePresetRequestedEventArgs e)
-    {
-        if (!_viewModel.SetPanelSizePreset(e.PanelKey, e.Preset))
-        {
-            return;
-        }
-
-        ReorderDashboardPanelsInPlace();
-        DebouncePersistLayout();
-    }
-
     private bool _persistLayoutQueued;
 
     private void DebouncePersistLayout()
@@ -1453,7 +1134,7 @@ public sealed partial class ShellWindow : Window
         }
 
         _persistLayoutQueued = true;
-        if (!DispatcherQueue.TryEnqueue(DispatcherQueuePriority.Normal, () =>
+        if (!_uiQueue.TryEnqueue(DispatcherQueuePriority.Normal, () =>
         {
             _persistLayoutQueued = false;
             _ = PersistLayoutAsync();
@@ -1479,21 +1160,38 @@ public sealed partial class ShellWindow : Window
 
     private void OnSnapshotCollected(object? sender, MetricSnapshot snapshot)
     {
-        _overlayController?.OnSnapshot(snapshot);
+        // Runs on the collector's thread. Nothing here may throw: an exception used to escape
+        // into the collector loop and stop sampling for the rest of the session.
+        try
+        {
+            _overlayController?.OnSnapshot(snapshot);
+        }
+        catch (Exception ex)
+        {
+            StartupTrace.WriteException("Overlay snapshot", ex);
+        }
 
-        _pendingSnapshot = snapshot;
-        if (_snapshotApplyQueued)
+        Volatile.Write(ref _pendingSnapshot, snapshot);
+        QueueSnapshotApply();
+    }
+
+    /// <summary>Posts one apply pass unless one is already queued. Safe from any thread.</summary>
+    private void QueueSnapshotApply()
+    {
+        if (Interlocked.CompareExchange(ref _snapshotApplyQueued, 1, 0) != 0)
         {
             return;
         }
 
-        _snapshotApplyQueued = true;
-        _ = DispatcherQueue.TryEnqueue(DispatcherQueuePriority.Low, ApplyQueuedSnapshot);
+        if (!_uiQueue.TryEnqueue(DispatcherQueuePriority.Low, ApplyQueuedSnapshot))
+        {
+            Volatile.Write(ref _snapshotApplyQueued, 0);
+        }
     }
 
     private void OnCollectionFailed(object? sender, Exception ex)
     {
-        _ = DispatcherQueue.TryEnqueue(DispatcherQueuePriority.Low, () =>
+        _ = _uiQueue.TryEnqueue(DispatcherQueuePriority.Low, () =>
         {
             StartupTrace.WriteException("Collection failed", ex);
             if (!_hasReceivedFirstSnapshot)
@@ -1506,23 +1204,21 @@ public sealed partial class ShellWindow : Window
 
     private void ApplyQueuedSnapshot()
     {
-        _snapshotApplyQueued = false;
+        Volatile.Write(ref _snapshotApplyQueued, 0);
 
-        // During window resize, don't apply snapshots at all — keep them pending.
-        // Text/value updates cause WinUI layout invalidation which is the main
-        // source of resize stutter. The snapshot will be applied when resize ends.
-        if (_isWindowResizing)
+        // While the window is being resized or a panel is being arranged, keep the snapshot
+        // pending. Applying one re-renders every chart - a visible hitch mid-gesture. The old
+        // version re-queued itself here at Low priority, which spun the dispatcher for the
+        // whole resize; now it parks and ResumeDeferredSnapshot picks it up afterwards.
+        if (_isWindowResizing || IsLayoutMotionActive)
         {
-            if (_pendingSnapshot is not null)
-            {
-                _snapshotApplyQueued = true;
-                _ = DispatcherQueue.TryEnqueue(DispatcherQueuePriority.Low, ApplyQueuedSnapshot);
-            }
+            _snapshotDeferred = true;
             return;
         }
 
-        var snapshot = _pendingSnapshot;
-        _pendingSnapshot = null;
+        // Taken atomically: a non-atomic read-then-clear could discard a newer snapshot the
+        // collector stored in between.
+        var snapshot = Interlocked.Exchange(ref _pendingSnapshot, null);
         if (snapshot is null)
         {
             return;
@@ -1553,11 +1249,47 @@ public sealed partial class ShellWindow : Window
         SetPanelRenderingSuspended(false);
         UpdateStatusText();
 
-        if (_pendingSnapshot is not null && !_snapshotApplyQueued)
+        if (Volatile.Read(ref _pendingSnapshot) is not null)
         {
-            _snapshotApplyQueued = true;
-            _ = DispatcherQueue.TryEnqueue(DispatcherQueuePriority.Low, ApplyQueuedSnapshot);
+            QueueSnapshotApply();
         }
+    }
+
+    private bool _snapshotDeferred;
+
+    private void ResumeDeferredSnapshot()
+    {
+        if (!_snapshotDeferred || _isWindowResizing || IsLayoutMotionActive)
+        {
+            return;
+        }
+
+        _snapshotDeferred = false;
+        if (Volatile.Read(ref _pendingSnapshot) is not null)
+        {
+            QueueSnapshotApply();
+        }
+    }
+
+    private static void AnimateMeter(ScaleTransform scale, double fraction)
+    {
+        if (!Motion.AnimationsEnabled)
+        {
+            scale.ScaleX = fraction;
+            return;
+        }
+
+        var animation = new DoubleAnimation
+        {
+            To = fraction,
+            Duration = new Duration(TimeSpan.FromMilliseconds(MotionTokens.Emphasized)),
+            EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
+        };
+        Storyboard.SetTarget(animation, scale);
+        Storyboard.SetTargetProperty(animation, "ScaleX");
+        var storyboard = new Storyboard();
+        storyboard.Children.Add(animation);
+        storyboard.Begin();
     }
 
     private void DismissLoadingOverlay()
@@ -1569,6 +1301,11 @@ public sealed partial class ShellWindow : Window
 
         var overlay = _loadingOverlay;
         _loadingOverlay = null;
+
+        // Stop catching input the moment the fade starts. Removal waits for the storyboard's
+        // Completed event on the UI thread; if that was ever late, a fully transparent overlay
+        // sat over the window swallowing every click - the app looked ready but was dead.
+        overlay.IsHitTestVisible = false;
 
         var fadeOut = new DoubleAnimation
         {
@@ -1611,7 +1348,7 @@ public sealed partial class ShellWindow : Window
         }
 
         _dashboardRefreshQueued = true;
-        _ = DispatcherQueue.TryEnqueue(() =>
+        _ = _uiQueue.TryEnqueue(() =>
         {
             _dashboardRefreshQueued = false;
             if (!_initialized)
@@ -1634,7 +1371,7 @@ public sealed partial class ShellWindow : Window
             return;
         }
 
-        _ = DispatcherQueue.TryEnqueue(DispatcherQueuePriority.Normal, () => SetPanelRenderingSuspended(false));
+        _ = _uiQueue.TryEnqueue(DispatcherQueuePriority.Normal, () => SetPanelRenderingSuspended(false));
     }
 
     private void RunWithDeferredPanelRendering(Action action)
@@ -1669,11 +1406,47 @@ public sealed partial class ShellWindow : Window
 
     private void OnSettingsNavigationClick(object? sender, EventArgs e) => SetActiveShellView(settings: true);
 
+    private void EnsureSettingsViewBuilt()
+    {
+        if (_settingsViewBuilt)
+        {
+            return;
+        }
+
+        _settingsView.Children.Add(CreatePrimaryText("Settings", 22, true));
+        _settingsView.Children.Add(BuildControlsSurface());
+        SyncControlDeckDraftsFromViewModel();
+        _settingsViewBuilt = true;
+        RenderEditableControlDeck();
+    }
+
     private void SetActiveShellView(bool settings)
     {
+        if (settings)
+        {
+            // Leaving the board ends arranging it; the edits were deliberate, so they are kept.
+            if (_isLayoutEditMode)
+            {
+                SetLayoutEditMode(false, commit: true);
+            }
+
+            EnsureSettingsViewBuilt();
+        }
+
         if (_settingsViewActive == settings)
         {
             return;
+        }
+
+        // Each view keeps its own scroll position: coming back to the board should land where
+        // you left it, not at the top (HIG: preserve context across navigation).
+        if (_settingsViewActive)
+        {
+            _settingsScrollOffset = _scrollHost.VerticalOffset;
+        }
+        else
+        {
+            _overviewScrollOffset = _scrollHost.VerticalOffset;
         }
 
         _settingsViewActive = settings;
@@ -1683,17 +1456,17 @@ public sealed partial class ShellWindow : Window
         _overviewNavigationButton.IsFilled = !settings;
         _settingsNavigationButton.IsActive = settings;
         _settingsNavigationButton.IsFilled = settings;
-        // ChangeView(horizontalOffset, verticalOffset, zoomFactor, disableAnimation).
-        // This previously passed 0 in the THIRD slot, setting zoomFactor to 0 rather than
-        // scrolling to the top. Zero clamps to MinZoomFactor (0.1), so every switch into a view
-        // rendered the entire scroll content at one tenth scale — layout stayed correct, which is
-        // why ActualWidth looked right while the pixels did not.
-        _scrollHost.ChangeView(null, 0, null, true);
+        // ChangeView(horizontalOffset, verticalOffset, zoomFactor, disableAnimation). The
+        // offset goes in the SECOND slot: a 0 in the third set zoomFactor to 0 (clamped to 0.1),
+        // which once rendered a whole view at a tenth of its size.
+        var restoreOffset = settings ? _settingsScrollOffset : _overviewScrollOffset;
+        _scrollHost.UpdateLayout();
+        _scrollHost.ChangeView(null, restoreOffset, null, true);
         RefreshSettingsLayoutIfNeeded();
         if (settings && !_settingsIntroPlayed)
         {
             _settingsIntroPlayed = true;
-            _ = DispatcherQueue.TryEnqueue(DispatcherQueuePriority.Low, PlaySettingsEntrance);
+            _ = _uiQueue.TryEnqueue(DispatcherQueuePriority.Low, PlaySettingsEntrance);
         }
         else
         {
@@ -1702,7 +1475,10 @@ public sealed partial class ShellWindow : Window
         SetPanelRenderingSuspended(false);
     }
 
+    private double _overviewScrollOffset;
+    private double _settingsScrollOffset;
     private bool _isWindowResizing;
+    private int _resizeSafetyGeneration;
     private Border? _shellBorderRef;
 
     private void StartOverlay(VaktrConfig config)
@@ -1710,22 +1486,25 @@ public sealed partial class ShellWindow : Window
         try
         {
             var controller = new OverlayController();
+            // Captured here, on the UI thread. StatusMessage can be raised from the overlay's
+            // timer or ETW threads, which must not call into the Window, and RegisterHotKey only
+            // works from the thread that owns the window - so both go through the UI queue.
+            var shellHwnd = WindowNative.GetWindowHandle(this);
             controller.StatusMessage += msg =>
             {
                 if (msg == "__reregister_hotkey__")
                 {
-                    var hwnd = WindowNative.GetWindowHandle(this);
-                    controller.RegisterHotkey(hwnd);
+                    _ = _uiQueue.TryEnqueue(() => controller.RegisterHotkey(shellHwnd));
                     return;
                 }
-                _ = DispatcherQueue.TryEnqueue(DispatcherQueuePriority.Low, () =>
+
+                _ = _uiQueue.TryEnqueue(DispatcherQueuePriority.Low, () =>
                 {
                     _viewModel.StatusText = msg;
                     UpdateStatusText();
                 });
             };
 
-            var shellHwnd = WindowNative.GetWindowHandle(this);
             HotkeyInterop.Install(shellHwnd, id => controller.OnWmHotkey(id));
 
             _overlayController = controller;
@@ -1749,8 +1528,10 @@ public sealed partial class ShellWindow : Window
         {
             var hwnd = WindowNative.GetWindowHandle(this);
             ResizeInterop.Install(hwnd,
-                onEnterResize: () => DispatcherQueue.TryEnqueue(() =>
+                onEnterResize: () => _uiQueue.TryEnqueue(() =>
                 {
+                    CancelActiveLayoutGesture();
+                    CompleteFloatSettle();
                     _isWindowResizing = true;
 
                     if (_scrollHost.Content is UIElement scrollContent)
@@ -1769,27 +1550,34 @@ public sealed partial class ShellWindow : Window
                         card.SetResizeMode(true);
                     }
 
-                    // Safety: auto-clear resize flag after 5 seconds in case WM_EXITSIZEMOVE is missed
+                    // Safety: auto-clear after 5 seconds if WM_EXITSIZEMOVE is missed. A
+                    // generation check makes an old timeout harmless after a normal or newer resize.
+                    var safetyGeneration = System.Threading.Interlocked.Increment(ref _resizeSafetyGeneration);
                     _ = System.Threading.Tasks.Task.Delay(5000).ContinueWith(_ =>
                     {
-                        DispatcherQueue.TryEnqueue(() =>
+                        _uiQueue.TryEnqueue(() =>
                         {
-                            if (_isWindowResizing)
+                            if (safetyGeneration != System.Threading.Volatile.Read(ref _resizeSafetyGeneration)
+                                || !_isWindowResizing)
                             {
-                                _isWindowResizing = false;
-                                if (_scrollHost.Content is UIElement sc) sc.CacheMode = null;
-                                if (_shellBorderRef is not null) _shellBorderRef.CornerRadius = new CornerRadius(0);
-                                foreach (var card in _panelCards.Values)
-                                {
-                                    card.SetResizeMode(false);
-                                    card.SetRenderingSuspended(false);
-                                }
+                                return;
+                            }
+
+                            _isWindowResizing = false;
+                            ResumeDeferredSnapshot();
+                            if (_scrollHost.Content is UIElement sc) sc.CacheMode = null;
+                            if (_shellBorderRef is not null) _shellBorderRef.CornerRadius = new CornerRadius(0);
+                            foreach (var card in _panelCards.Values)
+                            {
+                                card.SetResizeMode(false);
+                                card.SetRenderingSuspended(false);
                             }
                         });
                     }, TaskScheduler.Default);
                 }),
-                onExitResize: () => DispatcherQueue.TryEnqueue(() =>
+                onExitResize: () => _uiQueue.TryEnqueue(() =>
                 {
+                    System.Threading.Interlocked.Increment(ref _resizeSafetyGeneration);
                     _isWindowResizing = false;
 
                     // Remove bitmap cache — back to live rendering
@@ -1808,6 +1596,10 @@ public sealed partial class ShellWindow : Window
                     {
                         QueueDashboardRefresh();
                     }
+                    else if (ResponsiveMinimumWidth() != _lastResponsiveMinimumWidth)
+                    {
+                        ReorderDashboardPanelsInPlace();
+                    }
                     else if (_summaryCardsBound && DetermineSummaryColumns() != _lastSummaryColumnCount)
                     {
                         BuildSummaryCards();
@@ -1820,6 +1612,8 @@ public sealed partial class ShellWindow : Window
                         card.SetResizeMode(false);
                         card.SetRenderingSuspended(false);
                     }
+
+                    ResumeDeferredSnapshot();
                 }));
         }
         catch
@@ -1836,18 +1630,57 @@ public sealed partial class ShellWindow : Window
             return;
         }
 
-        // Handle programmatic resizes (not drag) that don't trigger WM_ENTERSIZEMOVE
-        var nextColumnCount = DetermineDashboardColumns();
-        if (nextColumnCount != _lastDashboardColumnCount)
+        // SizeChanged can be raised while WinUI is still measuring/arranging the tree.
+        // Mutating Grid rows or rebuilding card children in that callback can produce a
+        // stowed XAML exception. Defer and coalesce all responsive tree changes to the next
+        // dispatcher turn, using the latest measured width when the callback runs.
+        var needsDashboard = DetermineDashboardColumns() != _lastDashboardColumnCount ||
+            ResponsiveMinimumWidth() != _lastResponsiveMinimumWidth;
+        var needsSummary = _summaryCardsBound && DetermineSummaryColumns() != _lastSummaryColumnCount;
+        var needsSettings = _settingsViewActive && DetermineSettingsColumns() != _lastSettingsColumnCount;
+        if (needsDashboard || needsSummary || needsSettings)
         {
-            QueueDashboardRefresh();
+            QueueResponsiveLayoutUpdate();
         }
-        else if (_summaryCardsBound && DetermineSummaryColumns() != _lastSummaryColumnCount)
+    }
+
+    private void QueueResponsiveLayoutUpdate()
+    {
+        if (_responsiveLayoutUpdateQueued)
         {
-            BuildSummaryCards();
+            return;
         }
 
-        RefreshSettingsLayoutIfNeeded();
+        _responsiveLayoutUpdateQueued = true;
+        if (!_uiQueue.TryEnqueue(DispatcherQueuePriority.Normal, () =>
+        {
+            _responsiveLayoutUpdateQueued = false;
+            if (!_initialized || _isWindowResizing)
+            {
+                return;
+            }
+
+            StartupTrace.Write("Responsive layout update // deferred after SizeChanged");
+            var nextColumnCount = DetermineDashboardColumns();
+            if (nextColumnCount != _lastDashboardColumnCount)
+            {
+                RefreshDashboardPanels();
+            }
+            else if (ResponsiveMinimumWidth() != _lastResponsiveMinimumWidth)
+            {
+                ReorderDashboardPanelsInPlace();
+            }
+
+            if (_summaryCardsBound && DetermineSummaryColumns() != _lastSummaryColumnCount)
+            {
+                BuildSummaryCards();
+            }
+
+            RefreshSettingsLayoutIfNeeded();
+        }))
+        {
+            _responsiveLayoutUpdateQueued = false;
+        }
     }
 
     private void OnDashboardPanelsChanged(object? sender, NotifyCollectionChangedEventArgs e)
@@ -1891,30 +1724,12 @@ public sealed partial class ShellWindow : Window
             string.Equals(e.PropertyName, nameof(MainViewModel.LaunchOnStartup), StringComparison.Ordinal) ||
             string.Equals(e.PropertyName, nameof(MainViewModel.MinimizeToTray), StringComparison.Ordinal))
         {
-            if (!_controlDeckEditableActive)
-            {
-                RenderControlDeckSummary();
-            }
+            // Settings are always edited in place; drafts already reflect the applied values.
         }
     }
 
     private void OnPanelTogglesChanged(object? sender, NotifyCollectionChangedEventArgs e)
     {
-    }
-
-    private void OnScrapeFieldClick(object? sender, EventArgs e)
-    {
-        BeginControlDeckEdit(DeckEditorMode.Scrape);
-    }
-
-    private void OnRetentionFieldClick(object? sender, EventArgs e)
-    {
-        BeginControlDeckEdit(DeckEditorMode.Retention);
-    }
-
-    private void OnStorageFieldClick(object? sender, EventArgs e)
-    {
-        BeginControlDeckEdit(DeckEditorMode.Storage);
     }
 
     private void OnRetentionInputChanged(object? sender, EventArgs e)
@@ -1941,36 +1756,20 @@ public sealed partial class ShellWindow : Window
         }
     }
 
-    private void OnEditSettingsClick(object? sender, EventArgs e)
-    {
-        BeginControlDeckEdit();
-    }
-
     private void OnCancelSettingsClick(object? sender, EventArgs e)
     {
+        // Settings are edited in place; Revert throws away unapplied edits and stays on the page.
         var persistedTheme = _viewModel.SelectedTheme;
         var restoreThemePreview = _draftThemeMode != persistedTheme;
         SyncControlDeckDraftsFromViewModel();
-        _controlDeckEditableActive = false;
         if (restoreThemePreview)
         {
             App.CurrentApp.ApplyTheme(persistedTheme);
         }
-        else
-        {
-            RenderControlDeckSummary();
-        }
 
-        _viewModel.StatusText = "Control deck unchanged";
-        UpdateStatusText();
-    }
-
-    private void BeginControlDeckEdit(DeckEditorMode mode = DeckEditorMode.Scrape)
-    {
-        SyncControlDeckDraftsFromViewModel();
-        _activeDeckEditor = mode;
         RenderEditableControlDeck();
-        _ = DispatcherQueue.TryEnqueue(DispatcherQueuePriority.Low, PlayControlEditorEntrance);
+        _viewModel.StatusText = "Settings reverted";
+        UpdateStatusText();
     }
 
     private void QueueEditableControlDeckRender()
@@ -1981,7 +1780,7 @@ public sealed partial class ShellWindow : Window
         }
 
         _controlDeckRenderQueued = true;
-        _ = DispatcherQueue.TryEnqueue(DispatcherQueuePriority.Low, () =>
+        _ = _uiQueue.TryEnqueue(DispatcherQueuePriority.Low, () =>
         {
             _controlDeckRenderQueued = false;
             if (_controlDeckEditableActive)
@@ -2164,6 +1963,10 @@ public sealed partial class ShellWindow : Window
                     }
 
                     await _collectorService.StartAsync(config, CancellationToken.None);
+                    // A storage-directory change can reopen an older database that has not
+                    // been maintained under the current policy. Apply the configured cutoff
+                    // before reporting settings as active.
+                    await _metricStore.PruneAsync(config, CancellationToken.None);
                 }
                 else if (retentionChanged)
                 {
@@ -2197,7 +2000,6 @@ public sealed partial class ShellWindow : Window
     {
         try
         {
-            _activeDeckEditor = DeckEditorMode.Storage;
             var picker = new FolderPicker
             {
                 SuggestedStartLocation = PickerLocationId.DocumentsLibrary,
@@ -2386,7 +2188,7 @@ public sealed partial class ShellWindow : Window
 
             // Back to the UI thread explicitly for the view-model update.
             var applied = new TaskCompletionSource();
-            if (DispatcherQueue.TryEnqueue(() =>
+            if (_uiQueue.TryEnqueue(() =>
             {
                 try
                 {
@@ -2406,45 +2208,57 @@ public sealed partial class ShellWindow : Window
         catch (Exception ex)
         {
             StartupTrace.WriteException("History load", ex);
-            if (!_hasReceivedFirstSnapshot)
+            _ = _uiQueue.TryEnqueue(() =>
             {
-                _viewModel.StatusText = "History unavailable, starting live telemetry";
-                UpdateStatusText();
-            }
+                if (!_hasReceivedFirstSnapshot)
+                {
+                    _viewModel.StatusText = "History unavailable, starting live telemetry";
+                    UpdateStatusText();
+                }
+            });
         }
     }
 
     private async Task EnsureCollectorRunningAsync(VaktrConfig config)
     {
         StartupTrace.Write("EnsureCollectorRunningAsync start");
-        _collectorService ??= new CollectorService(new WindowsMetricCollector(), _metricStore);
-        StartupTrace.Write("CollectorService created");
-        _collectorService.SnapshotCollected -= OnSnapshotCollected;
-        _collectorService.CollectionFailed -= OnCollectionFailed;
-        _collectorService.SnapshotCollected += OnSnapshotCollected;
-        _collectorService.CollectionFailed += OnCollectionFailed;
+        var collectorService = _collectorService;
+        if (collectorService is null)
+        {
+            // The collector's constructor opens a PDH query and expands wildcard counters over
+            // every processor, disk, NIC and GPU engine - ~0.45s that used to run on the UI
+            // thread, freezing the window in the middle of the launch animation.
+            var store = _metricStore;
+            var created = await Task.Run(() => new CollectorService(new WindowsMetricCollector(), store));
+            collectorService = _collectorService ??= created;
+        }
 
-        _viewModel.StatusText = "Starting telemetry";
-        UpdateStatusText();
+        StartupTrace.Write("CollectorService created");
+        collectorService.SnapshotCollected -= OnSnapshotCollected;
+        collectorService.CollectionFailed -= OnCollectionFailed;
+        collectorService.SnapshotCollected += OnSnapshotCollected;
+        collectorService.CollectionFailed += OnCollectionFailed;
+
         StartupTrace.Write("Calling CollectorService.StartAsync");
 
-        // StartAsync initializes the SQLite store before returning. Awaiting it
-        // here keeps history loading from racing that initialization; sampling
-        // itself continues on the collector's background loop.
-        await _collectorService.StartAsync(config, CancellationToken.None);
+        // StartAsync runs on a worker; the continuation resumes on the UI thread (no
+        // ConfigureAwait(false)), so nothing after this point touches UI objects off-thread.
+        await Task.Run(() => collectorService.StartAsync(config, CancellationToken.None));
         StartupTrace.Write("CollectorService.StartAsync complete");
 
-        // The shell is already visible; show a waiting status until the first sample.
-        DispatcherQueue.TryEnqueue(() =>
+        if (!_summaryCardsBound)
         {
-            if (!_summaryCardsBound)
-            {
-                BuildSummaryCards();
-            }
+            BuildSummaryCards();
+        }
+
+        // The first sample may already be in; don't regress its status line.
+        if (!_hasReceivedFirstSnapshot)
+        {
             _viewModel.StatusText = "Waiting for first sample";
             UpdateStatusText();
-            StartupTrace.Write($"EnsureCollectorRunningAsync complete // dashboardPanels={_viewModel.DashboardPanels.Count}");
-        });
+        }
+
+        StartupTrace.Write($"EnsureCollectorRunningAsync complete // dashboardPanels={_viewModel.DashboardPanels.Count}");
     }
 
     private void UpdateStatusText()
@@ -2470,13 +2284,15 @@ public sealed partial class ShellWindow : Window
 
     private void ApplyGlobalWindowRange(int minutes)
     {
+        StartupTrace.Write($"ApplyGlobalWindowRange start // minutes={minutes}");
         _globalAbsoluteStartUtc = null;
         _globalAbsoluteEndUtc = null;
         _viewModel.ApplyGlobalWindowRange(minutes);
         HideGlobalRangeEditor();
         RefreshGlobalRangeControls();
+        StartupTrace.Write($"ApplyGlobalWindowRange complete // minutes={minutes}");
 
-        // If the user selects a wider range than what we last loaded from the database,
+        // If the user selects a wider range than we last loaded from the database,
         // re-query to ensure the data covers the full requested window.
         if (minutes > _lastLoadedHistoryMinutes)
         {
@@ -2488,14 +2304,17 @@ public sealed partial class ShellWindow : Window
     {
         try
         {
+            StartupTrace.Write($"ReloadHistoryForRangeAsync start // minutes={minutes}");
             var fromUtc = DateTimeOffset.UtcNow.AddMinutes(-minutes);
             var history = await _metricStore.LoadHistoryAsync(fromUtc, CancellationToken.None);
+            StartupTrace.Write($"ReloadHistoryForRangeAsync read complete // panels={history.Count}");
             _viewModel.LoadHistory(history);
             _lastLoadedHistoryMinutes = minutes;
+            StartupTrace.Write($"ReloadHistoryForRangeAsync applied // minutes={minutes}");
         }
-        catch
+        catch (Exception ex)
         {
-            // Best-effort — live data will still flow
+            StartupTrace.WriteException("ReloadHistoryForRangeAsync", ex);
         }
     }
 
@@ -2521,7 +2340,7 @@ public sealed partial class ShellWindow : Window
         _globalRangeButton.IsActive = _globalRangeEditorVisible;
         _globalRangeButton.IsFilled = true;
         var hasZoomedPanels = _viewModel.DashboardPanels.Any(panel => panel.IsZoomed);
-        _globalResetZoomButton.Visibility = hasZoomedPanels ? Visibility.Visible : Visibility.Collapsed;
+        _globalResetZoomButton.Visibility = hasZoomedPanels && !_isLayoutEditMode ? Visibility.Visible : Visibility.Collapsed;
         _globalResetZoomButton.Opacity = 1d;
     }
 
@@ -2581,174 +2400,154 @@ public sealed partial class ShellWindow : Window
         }
     }
 
+    private Flyout? _rangeFlyout;
+    private InlineTextEntry? _rangeFromEntry;
+    private InlineTextEntry? _rangeToEntry;
+
+    /// <summary>
+    /// The time range is a popover anchored to its chip. It used to be a full-width panel
+    /// inserted into the page - three titled sections, five explanatory sentences and two info
+    /// boxes restating what the chip already said - which shoved the board down a whole screen,
+    /// burying the very panels the choice applies to. The board now stays put.
+    /// </summary>
+    private Flyout EnsureRangeFlyout()
+    {
+        if (_rangeFlyout is not null)
+        {
+            return _rangeFlyout;
+        }
+
+        ActionChip[] chips =
+        [
+            _globalOneMinuteButton, _globalFiveMinuteButton, _globalFifteenMinuteButton, _globalThirtyMinuteButton, _globalOneHourButton,
+            _globalTwelveHourButton, _globalTwentyFourHourButton, _globalTwoDayButton, _globalFiveDayButton, _globalSevenDayButton,
+            _globalThirtyDayButton, _globalNinetyDayButton, _globalOneYearButton,
+        ];
+
+        const int presetColumns = 5;
+        var presets = new Grid { ColumnSpacing = 6, RowSpacing = 6 };
+        for (var column = 0; column < presetColumns; column++)
+        {
+            presets.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        }
+
+        for (var index = 0; index < chips.Length; index++)
+        {
+            var chip = DetachFromParent(chips[index]);
+            chip.MinWidth = 0;
+            chip.MinHeight = 32;
+            chip.HorizontalAlignment = HorizontalAlignment.Stretch;
+            while (presets.RowDefinitions.Count <= index / presetColumns)
+            {
+                presets.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            }
+
+            presets.Children.Add(chip);
+            Grid.SetRow(chip, index / presetColumns);
+            Grid.SetColumn(chip, index % presetColumns);
+        }
+
+        _rangeFromEntry = CreateDeckInlineEntry(string.Empty, "2026-04-02 09:00");
+        _rangeToEntry = CreateDeckInlineEntry(string.Empty, "2026-04-02 09:30");
+        var nowChip = CreateActionChip("Now", (_, _) =>
+        {
+            if (_rangeToEntry is not null)
+            {
+                _rangeToEntry.Text = FormatRangeEntry(DateTimeOffset.Now);
+            }
+        });
+        nowChip.MinHeight = 40;
+        ToolTipService.SetToolTip(nowChip, "Set the end of the range to now");
+
+        var custom = new Grid { ColumnSpacing = 10, RowSpacing = 8 };
+        custom.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        custom.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        custom.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        custom.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        custom.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        var fromLabel = CreateInlineLabel("From");
+        var toLabel = CreateInlineLabel("To");
+        custom.Children.Add(fromLabel);
+        custom.Children.Add(_rangeFromEntry);
+        custom.Children.Add(toLabel);
+        custom.Children.Add(_rangeToEntry);
+        custom.Children.Add(nowChip);
+        Grid.SetColumn(_rangeFromEntry, 1);
+        Grid.SetColumnSpan(_rangeFromEntry, 2);
+        Grid.SetRow(toLabel, 1);
+        Grid.SetRow(_rangeToEntry, 1);
+        Grid.SetColumn(_rangeToEntry, 1);
+        Grid.SetRow(nowChip, 1);
+        Grid.SetColumn(nowChip, 2);
+
+        var apply = CreateActionChip("Apply range", (_, _) =>
+            ApplyAbsoluteGlobalRange(_rangeFromEntry?.Text ?? string.Empty, _rangeToEntry?.Text ?? string.Empty), filled: true);
+        var actions = CreateChipRow(apply);
+
+        var content = new StackPanel
+        {
+            Width = 380,
+            Spacing = 12,
+            Children =
+            {
+                CreatePrimaryText("Time range", 13, true),
+                presets,
+                new Border
+                {
+                    Height = 1,
+                    Margin = new Thickness(0, 4, 0, 4),
+                    Background = ResolveBrush("SurfaceStrokeBrush", "#2C3035"),
+                },
+                CreatePrimaryText("Custom range", 13, true),
+                custom,
+                actions,
+            },
+        };
+
+        var presenterStyle = new Style(typeof(FlyoutPresenter));
+        presenterStyle.Setters.Add(new Setter(Control.BackgroundProperty, ResolveBrush("SurfaceElevatedBrush", "#222529")));
+        presenterStyle.Setters.Add(new Setter(Control.BorderBrushProperty, ResolveBrush("SurfaceStrokeBrush", "#2C3035")));
+        presenterStyle.Setters.Add(new Setter(Control.BorderThicknessProperty, new Thickness(1)));
+        presenterStyle.Setters.Add(new Setter(Control.CornerRadiusProperty, new CornerRadius(10)));
+        presenterStyle.Setters.Add(new Setter(Control.PaddingProperty, new Thickness(16)));
+        presenterStyle.Setters.Add(new Setter(FrameworkElement.MaxWidthProperty, 460d));
+
+        _rangeFlyout = new Flyout
+        {
+            Content = content,
+            Placement = FlyoutPlacementMode.BottomEdgeAlignedRight,
+            FlyoutPresenterStyle = presenterStyle,
+        };
+        _rangeFlyout.Closed += (_, _) =>
+        {
+            _globalRangeEditorVisible = false;
+            RefreshGlobalRangeControls();
+        };
+
+        return _rangeFlyout;
+    }
+
     private void RenderGlobalRangeEditor()
     {
+        var flyout = EnsureRangeFlyout();
+        var start = _globalAbsoluteStartUtc ?? DateTimeOffset.Now.AddMinutes(-_viewModel.SelectedWindowMinutes);
+        var end = _globalAbsoluteEndUtc ?? DateTimeOffset.Now;
+        _rangeFromEntry!.Text = FormatRangeEntry(start);
+        _rangeToEntry!.Text = FormatRangeEntry(end);
         _globalRangeEditorVisible = true;
-        var startText = (_globalAbsoluteStartUtc ?? DateTimeOffset.Now.AddMinutes(-_viewModel.SelectedWindowMinutes)).LocalDateTime.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture);
-        var endText = (_globalAbsoluteEndUtc ?? DateTimeOffset.Now).LocalDateTime.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture);
-        var currentLabel = _globalAbsoluteStartUtc.HasValue && _globalAbsoluteEndUtc.HasValue
-            ? "Pinned window"
-            : $"Last {FormatGlobalRangeLabel(_viewModel.SelectedWindowMinutes)}";
-        var currentMode = _globalAbsoluteStartUtc.HasValue && _globalAbsoluteEndUtc.HasValue
-            ? "Absolute"
-            : "Rolling";
-
-        var fromEntry = CreateDeckInlineEntry(startText, "2026-04-02 09:00");
-        var toEntry = CreateDeckInlineEntry(endText, "2026-04-02 09:30");
-        var quickRangeRowPrimary = CreateChipWrapRow(
-            _globalOneMinuteButton,
-            _globalFiveMinuteButton,
-            _globalFifteenMinuteButton,
-            _globalThirtyMinuteButton,
-            _globalOneHourButton);
-        var quickRangeRowSecondary = CreateChipWrapRow(
-            _globalTwelveHourButton,
-            _globalTwentyFourHourButton,
-            _globalTwoDayButton,
-            _globalFiveDayButton,
-            _globalSevenDayButton);
-        var quickRangeRowTertiary = CreateChipWrapRow(
-            _globalThirtyDayButton,
-            _globalNinetyDayButton,
-            _globalOneYearButton);
-
-        var quickRangeCard = new Border
-        {
-            Background = ResolveBrush("SurfaceElevatedBrush", "#132235"),
-            BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E"),
-            BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(8),
-            Padding = new Thickness(14, 12, 14, 12),
-            Child = new StackPanel
-            {
-                Spacing = 10,
-                Children =
-                {
-                    CreateSectionHeader("QUICK RANGES", "Jump the whole board to a preset replay window."),
-                    quickRangeRowPrimary,
-                    quickRangeRowSecondary,
-                    quickRangeRowTertiary,
-                },
-            },
-        };
-
-        var fromColumn = new StackPanel
-        {
-            Spacing = 8,
-            Children =
-            {
-                CreateFieldLabel("From"),
-                fromEntry,
-            },
-        };
-        var toColumn = new StackPanel
-        {
-            Spacing = 8,
-            Children =
-            {
-                CreateFieldLabel("To"),
-                toEntry,
-            },
-        };
-        var absoluteGrid = new Grid
-        {
-            ColumnSpacing = 12,
-            ColumnDefinitions =
-            {
-                new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) },
-                new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) },
-            },
-        };
-        absoluteGrid.Children.Add(fromColumn);
-        absoluteGrid.Children.Add(toColumn);
-        Grid.SetColumn(toColumn, 1);
-
-        var absoluteRangeCard = new Border
-        {
-            Background = ResolveBrush("SurfaceElevatedBrush", "#132235"),
-            BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E"),
-            BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(8),
-            Padding = new Thickness(14, 12, 14, 12),
-            Child = new StackPanel
-            {
-                Spacing = 10,
-                Children =
-                {
-                    CreateSectionHeader("ABSOLUTE RANGE", "Pin every panel to one precise local time slice."),
-                    absoluteGrid,
-                    CreateSecondaryText("Use local time like 2026-04-02 21:30.", 12),
-                },
-            },
-        };
-
-        var infoRow = new Grid
-        {
-            ColumnSpacing = 12,
-        };
-        infoRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        infoRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(132) });
-        infoRow.Children.Add(CreateInfoPanel("Current", currentLabel));
-        var modePanel = CreateInfoPanel("Mode", currentMode);
-        infoRow.Children.Add(modePanel);
-        Grid.SetColumn(modePanel, 1);
-
-        var actionButtons = CreateChipRow(
-            CreateActionChip("Close", (_, _) => HideGlobalRangeEditor()),
-            CreateActionChip("Now", (_, _) =>
-            {
-                var next = DateTimeOffset.Now.LocalDateTime.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture);
-                toEntry.Text = next;
-            }),
-            CreateActionChip("Apply range", (_, _) => ApplyAbsoluteGlobalRange(fromEntry.Text, toEntry.Text), true));
-        var actionGrid = new Grid
-        {
-            ColumnSpacing = 12,
-            VerticalAlignment = VerticalAlignment.Center,
-            ColumnDefinitions =
-            {
-                new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) },
-                new ColumnDefinition { Width = GridLength.Auto },
-            },
-        };
-        actionGrid.Children.Add(CreateMutedText("Applies to every panel.", 12));
-        actionGrid.Children.Add(actionButtons);
-        Grid.SetColumn(actionButtons, 1);
-
-        var shell = new Border
-        {
-            Margin = new Thickness(0, 10, 0, 0),
-            Background = ResolveBrush("SurfaceBrush", "#1C1F22"),
-            BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E"),
-            BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(8),
-            Padding = new Thickness(16),
-            Child = new StackPanel
-            {
-                Spacing = 14,
-                Children =
-                {
-                    CreateSectionHeader("TIME RANGE", "Keep every panel in sync with one shared timeline."),
-                    infoRow,
-                    quickRangeCard,
-                    absoluteRangeCard,
-                    actionGrid,
-                },
-            },
-        };
-
-        _globalRangeEditorHost.Child = shell;
-        _globalRangeEditorHost.Visibility = Visibility.Visible;
         RefreshGlobalRangeControls();
+        flyout.ShowAt(_globalRangeButton);
     }
 
     private void HideGlobalRangeEditor()
     {
         _globalRangeEditorVisible = false;
-        _globalRangeEditorHost.Child = null;
-        _globalRangeEditorHost.Visibility = Visibility.Collapsed;
+        _rangeFlyout?.Hide();
         RefreshGlobalRangeControls();
     }
+
+    private static string FormatRangeEntry(DateTimeOffset value)
+        => value.LocalDateTime.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture);
 
     private void ApplyAbsoluteGlobalRange(string fromText, string toText)
     {
@@ -2847,13 +2646,6 @@ public sealed partial class ShellWindow : Window
         chip.IsFilled = isActive;
         chip.Opacity = isActive ? 1d : 0.82d;
     }
-}
-
-internal enum DeckEditorMode
-{
-    Scrape,
-    Retention,
-    Storage,
 }
 
 internal sealed record SummaryCardVisual(

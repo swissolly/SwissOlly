@@ -35,7 +35,10 @@ public sealed class ActionChip : UserControl
         _surface = new Border
         {
             CornerRadius = new CornerRadius(8),
-            BorderThickness = new Thickness(0.8),
+            // Constant. The ring is drawn by changing the brush only: switching thickness between
+            // 0, 1.0 and 1.2 by state re-ran layout on every hover and focus change and nudged the
+            // label by a pixel each time.
+            BorderThickness = new Thickness(1),
             Padding = new Thickness(10, 5, 10, 5),
             Background = ResolveBrush("SurfaceElevatedBrush", "#111D2A"),
             BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#243D55"),
@@ -58,7 +61,7 @@ public sealed class ActionChip : UserControl
         _label = new TextBlock
         {
             FontFamily = new FontFamily("Segoe UI Variable Text"),
-            FontSize = 11,
+            FontSize = 12,
             FontWeight = FontWeights.Medium,
             Foreground = ResolveBrush("TextPrimaryBrush", "#F2F8FF"),
             HorizontalAlignment = HorizontalAlignment.Center,
@@ -91,16 +94,17 @@ public sealed class ActionChip : UserControl
 
         IsTabStop = true;
         KeyDown += OnKeyDown;
+        // The focus ring is for keyboard navigation only. Showing it for pointer and programmatic
+        // focus - and treating focus as hover - made a chip that received focus when a flyout
+        // opened look like a second selected option.
         GotFocus += (_, _) =>
         {
-            _isFocused = true;
-            _isHovered = true;
+            _isFocused = FocusState == FocusState.Keyboard;
             UpdateVisualState();
         };
         LostFocus += (_, _) =>
         {
             _isFocused = false;
-            _isHovered = false;
             UpdateVisualState();
         };
 
@@ -229,12 +233,9 @@ public sealed class ActionChip : UserControl
         // control. Focus keeps its ring regardless — that is an accessibility affordance, not
         // decoration.
         var showBorder = useAccent || _isFocused;
-        _surface.BorderThickness = new Thickness(showBorder ? (_isFocused ? 1.2 : 1.0) : 0);
-
-        if (showBorder)
-        {
-            _surface.BorderBrush = ResolveBrush("AccentStrongBrush", isLight ? "#04506E" : "#9EEFFF");
-        }
+        _surface.BorderBrush = showBorder
+            ? ResolveBrush("AccentStrongBrush", isLight ? "#04506E" : "#9EEFFF")
+            : s_noBorder;
 
         // Selected chips read at full strength; the rest sit back so the active range is obvious
         // at a glance instead of having to be picked out of four identically-weighted labels.
@@ -300,6 +301,7 @@ public sealed class ActionChip : UserControl
 
     private Storyboard? _pressStoryboard;
     private bool _lastAppliedPressed;
+    private static readonly Brush s_noBorder = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
 
     private static Brush ResolveBrush(string key, string fallbackHex) => ThemeVisuals.ResolveBrush(key, fallbackHex);
 

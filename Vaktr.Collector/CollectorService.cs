@@ -110,18 +110,45 @@ public sealed class CollectorService : IAsyncDisposable
         {
             var snapshot = await _collector.CollectAsync(timeoutCancellation.Token).ConfigureAwait(false);
             await _store.AppendSnapshotAsync(snapshot, timeoutCancellation.Token).ConfigureAwait(false);
-            SnapshotCollected?.Invoke(this, snapshot);
+            RaiseSnapshotCollected(snapshot);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            CollectionFailed?.Invoke(this, new TimeoutException($"Telemetry sampling exceeded {timeout.TotalSeconds:0.#} seconds."));
+            RaiseCollectionFailed(new TimeoutException($"Telemetry sampling exceeded {timeout.TotalSeconds:0.#} seconds."));
         }
         catch (OperationCanceledException)
         {
         }
         catch (Exception ex)
         {
-            CollectionFailed?.Invoke(this, ex);
+            RaiseCollectionFailed(ex);
+        }
+    }
+
+    // Subscribers run on this loop's thread. An exception escaping one used to propagate out of
+    // the loop - first from SnapshotCollected, then again from the CollectionFailed raised in the
+    // catch - faulting a task nobody observes, so sampling stopped silently for the session.
+    private void RaiseSnapshotCollected(MetricSnapshot snapshot)
+    {
+        try
+        {
+            SnapshotCollected?.Invoke(this, snapshot);
+        }
+        catch (Exception ex)
+        {
+            RaiseCollectionFailed(ex);
+        }
+    }
+
+    private void RaiseCollectionFailed(Exception exception)
+    {
+        try
+        {
+            CollectionFailed?.Invoke(this, exception);
+        }
+        catch
+        {
+            // Nothing left to report to; keep sampling.
         }
     }
 

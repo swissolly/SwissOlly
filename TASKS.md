@@ -1,406 +1,151 @@
-# Vaktr — Dashboard Edit Mode
+# Vaktr v1.2.0 — Tasks
 
-**Status:** Steps 1-7 implemented. Two fix passes after hands-on feedback (janky/glitchy resize,
-then flicker). The second was an architectural change: the board no longer reflows during a
-gesture at all. Also fixed a crash: `ActionChip` started a Storyboard on every `UpdateVisualState`
-call (11 call sites), flooding XAML whenever a chip changed state — this is what crashed the app
-on "Show processes". Step 8 verification still needs hands-on confirmation.
-
-Grafana-style layout editing: an **Edit** button on Overview that unlocks free panel
-resize/reposition, with live reflow, then saves positions that stay locked.
-
-## Goal
-
-- Edit button on the Overview board header. Outside edit mode the board is read-only.
-- In edit mode: drag a panel to move it, drag its edges/corner to resize it.
-- Other panels move out of the way live while dragging.
-- Every panel can be freely sized and pinned to a fixed position.
-- Save persists the layout; Cancel reverts. Saved layouts survive restart and window resize.
-- **Chart drag-to-zoom keeps working after save** — resize handles must not steal those pointer
-  events outside edit mode.
-
-## Design decisions
-
-**Grid.** 12 columns. Divides cleanly by 2/3/4/6, so a third is `W=4`, a half `W=6`, full `W=12`.
-Rows are a fixed `RowUnitPx` so `H` means a real height — today rows are `Auto`, which is why only
-a column *span* is settable and height is whatever the content wants.
-
-**Panel geometry** is `{X, Y, W, H}` in grid units, replacing `PanelSizePreset` + flow order.
-Order-based flow cannot express "pinned at row 3, column 5", which is the whole ask.
-
-**Collision** uses Grafana's rule: a moved panel displaces others *downward*, never sideways, then
-the board compacts upward to close gaps. Predictable and stable under repeated drags.
-
-**Responsive.** Saved `W` is honoured at full width; below breakpoints panels are clamped wider
-(half, then full) so a narrow window stacks instead of producing unreadable slivers.
+**Status (2026-10-31):** Dashboard edit mode rebuilt after tracing a live gesture frame by frame;
+the crash on Reset zoom → 24h fixed; whole-UI UX pass done. Release x64 + ARM64 build clean,
+87/87 tests. **Needs hands-on confirmation:** drag/resize feel with a real mouse (all verification
+was driven in-process — see "Verifying" below), and Esc/touch paths.
 
 ---
 
-## Step 1 — Geometry model and persistence
+## Edit mode — how it works now
 
-- [x] `Vaktr.Core/Models/PanelLayout.cs` — `{ X, Y, W, H }` with clamping. Width clamps before X
-      so an over-wide panel shrinks rather than being shoved off the left edge.
-- [x] `VaktrConfig.PanelLayouts: Dictionary<string, PanelLayout>`; normalizes invalid entries.
-- [x] Migration via `GridLayoutEngine.FromLegacy` — runs at placement time, not in `ApplyConfig`,
-      because the panel list is not populated yet when config is applied.
-- [x] Tests: clamping, legacy packing (3 standard panels per row), free-slot search.
+Modelled on react-grid-layout (Grafana's grid), adapted to WinUI. Code: `ShellWindow.LayoutEditor.cs`.
 
-## Step 2 — Layout engine
+- The panel under the pointer **floats**: it spans the whole board (so its slot can never clip it),
+  follows the pointer 1:1 at its **real size** — content reflows, nothing is scaled.
+- The board is re-resolved through `GridLayoutEngine` only when the **snapped cell** changes.
+  Other panels spring to their resolved cells via `UIElement.Translation` — no layout pass.
+- A placeholder springs to exactly where the panel will land.
+- Release commits once; siblings' springs are re-based onto the committed layout (FLIP), so
+  nothing jumps. Pointer input is coalesced to one update per frame.
+- Edits are a draft until **Done** (saves) / **Cancel** (panels glide back). **Esc** cancels an
+  in-flight drag, then exits edit mode keeping edits. Switching to Settings exits edit mode.
+- Grips appear on the hovered panel only; whole card body is the move handle in edit mode.
 
-- [x] `Vaktr.Core/Models/GridLayoutEngine.cs` — pure, no XAML (lives in Core so it is directly
-      testable): `Resolve`, `Move`, `Resize`, `FindFreeSlot`, `FromLegacy`. Push-down displacement
-      then upward compaction; the dragged panel is pinned first so it keeps the cell it was
-      dropped on.
-- [x] 12 engine tests: push down not sideways, compaction, determinism/stability, move displaces
-      occupant, resize clamping, and 14 panels dropped on one cell (the push-down loop's
-      pathological case).
+## This pass — fixed
 
-## Step 3 — Render fixed geometry
+Root causes of the jank, found by tracing a real gesture (UI-thread tick now 0.12–0.14ms/frame):
 
-- [x] `_dashboardGrid`: 12 star columns, fixed 48px rows.
-- [x] Cards placed by `Grid.SetColumn/Row/ColumnSpan/RowSpan` from resolved geometry.
-- [x] Responsive clamping derived from measured width (the breakpoint *count* is 0 on first
-      placement and forced everything full width).
-- [x] Card `MinHeight` 320 → 140 and `VerticalAlignment` Stretch so height comes from `H`.
-- [x] Fixed a rebuild loop: `ReorderDashboardPanelsInPlace` compared the grid's column count
-      against the responsive breakpoint count (1-3), which never matches 12, so every reorder
-      queued a rebuild that queued another.
-- [x] Kept the existing **Size** chip working by translating presets into geometry through the
-      engine — otherwise it silently became a no-op.
-- [ ] Verify small `H`: charts/gauges/process tables at the minimum allowed height.
+- [x] **Resize preview scaled the card** (Codex's version): title, chips and chart magnified like a
+      zoom and re-rasterised every frame — 28–76ms frames vs 7ms idle.
+- [x] **Drop placeholder never visible** — `RefreshDashboardPanels` cleared its canvas and nothing
+      re-added it (`canvasAttached=False` on every traced frame).
+- [x] **Snap ran 29% ahead of the pointer** — pixels divided by the 48px row unit, ignoring the 14px
+      gap (real pitch 62px). Pitch-correct geometry throughout.
+- [x] **Left/top resize fed back on itself** — pointer read in the card's own (moving) space.
+- [x] **Growing a panel was clipped** at its original cell (WinUI layout clip on oversized children).
+- [x] **Panels didn't fill their height** — chart was a fixed 176px, so taller panels were dead
+      space and released content popped. Card is now rows; chart fills, process list shares height.
+- [x] **Everything snapped on release** — now springs (velocity-preserving, interruptible).
+- [x] Snapshots deferred during motion (no chart re-render mid-gesture). The old window-resize
+      deferral re-queued itself at Low priority and spun the dispatcher for the whole resize.
 
-## Step 4 — Edit mode shell
+Startup (reported stuck on "Starting telemetry", nothing clickable):
 
-- [x] `Edit layout` / `Done` + `Cancel` chips in the board section header.
-- [x] `_isLayoutEditMode` gates everything; geometry snapshotted on entry for Cancel.
-- [x] Edit affordances: accent card borders and a visible corner handle. Verified by screenshot.
-- [x] **Critical gate done:** the handle layer is `Visibility.Collapsed` *and*
-      `IsHitTestVisible = false` outside edit mode, `_chart.IsHitTestVisible` is restored, and the
-      header drag returns early. Verified the handles disappear on Done.
-- [ ] Still to prove by hand: chart drag-to-zoom after saving a layout.
-- [ ] Nice-to-have: grid overlay while editing, so target cells are visible.
+- [x] **Workers called into the UI-thread `Window`.** The startup continuation and every snapshot
+      posted via `Window.DispatcherQueue` from background threads - a cross-apartment COM call into
+      the UI thread that can stall or be rejected depending on what the UI thread is doing. The
+      trace stopped exactly there. All posts now use a `DispatcherQueue` captured on the UI thread
+      (agile); startup continuations resume on the UI thread.
+- [x] **One throwing subscriber killed sampling for the session.** `SnapshotCollected` threw inside
+      the collector's try, `CollectionFailed` threw again from the catch, and the unobserved loop
+      task died. Subscribers are now isolated; snapshot handoff is `Interlocked`.
+- [x] **A transparent loading overlay could swallow every click** if its removal was late; it now
+      stops hit-testing the moment it starts fading.
+- [x] Faster: collector PDH setup (~0.45s) moved off the UI thread; store opens first and history
+      loads in parallel with collector setup. Board populated ~1.2s after launch (was ~2.5s), first
+      live sample ~1.6s (was ~2.9s). `PublishReadyToRun` on for Release publishes.
 
-## Step 5 — Drag to move
+Crashes and correctness:
 
-- [x] Pointer capture + render-transform translation already existed from the legacy reorder.
-- [x] Drop converts the card's pixel `DragOffset` into grid cells and calls `GridLayoutEngine.Move`.
-- [x] Legacy swap-reorder suppressed in edit mode so the two cannot disagree about one gesture.
-- [ ] **Untested by hand.** Displaced panels currently snap to their new cells rather than
-      animating — add the reflow animation once the gesture is confirmed correct.
-- [ ] Live preview while dragging (the move is currently only applied on drop).
+- [x] **0x800F1000 crash on Reset zoom → 24h.** The range editor re-added persistent chips that were
+      still parented to the previous (detached, not-yet-collected) rows — GC-timing dependent.
+      `DetachFromParent` now guards every chip re-parent. Same exception class closed in the legend
+      and process lists (duplicate keys added one element twice).
+- [x] **Cards silently stopped updating after a board rebuild** — `Loaded` never re-attached the
+      view model that `Unloaded` released. Attach is now idempotent and re-runs on load.
+- [x] `TelemetryChart` retained rendering: one `PolyLineSegment` per series, pooled grid/labels
+      (was ~4,400 objects per scrape). Redraws in the same layout pass during resize.
+- [x] Theme brushes cached by key (palette recolours in place) — was ~150 dictionary probes/scrape.
+- [x] Summary meters animate a scale instead of setting `Width` each sample.
 
-## Step 6 — Drag to resize
+UI/UX pass:
 
-- [x] **All 8 handles**: 4 edges + 4 corners, each with the correct cursor. Edges are inset by the
-      corner size so a corner hotspot is reachable along its whole length — previously the edge
-      handles covered the corners and the diagonal cursors only appeared in stray pixels.
-- [x] Corner grips render at 32% opacity in edit mode, 95% on hover. Invisible-until-hover hides
-      the affordance: you have to already know the grip is there to find it.
-- [x] Left/top edges move position and size together, so the opposite edge stays anchored.
-- [x] Min/max enforced by `PanelLayout.Normalize`, with left/top clamped before applying so a
-      panel cannot invert through its own minimum.
+- [x] Time range is a compact flyout on its chip (was a full-width panel that shoved the board down).
+- [x] Settings edit in place — no read-only summary + Edit step. Theme applies and saves on click.
+- [x] Card header: removed the per-card **Size** chip (edit mode resizes) and per-card **range** chip
+      (it changed every panel — duplicated and misleading). Only **Processes** remains.
+- [x] Board header: Done replaces Edit in place, Cancel beside it; range controls step aside in edit
+      mode. Edit instructions sit beside the title (no longer truncated in the status line).
+- [x] Type ramp on cards/summary/chart (14 title / 12 body / 11 caption / 10.5 label / 10 axis);
+      tabular figures on every live number; one numeral family per card; no Opacity stacking on
+      muted text (process headers were ~2.4:1).
+- [x] Thresholds: 2-point hysteresis; temperatures now warn at 80°C and go critical at 90°C.
+- [x] `ActionChip`: keyboard-only focus ring (focus no longer fakes hover); constant 1px border;
+      12px label. Preset chips no longer widen when selected.
+- [x] Motion tokens (`MotionTokens`: 90/150/220/320ms + spring responses); `SpringValue`;
+      reduced-motion setting now refreshes live; each view keeps its scroll position.
+- [x] Settings: palette accent for section icons (was hardcoded cyan); proper glyphs for
+      Appearance/Overlay; short fields sized to their values; 8 themes on one row when wide.
+- [x] Dead UI removed: `_perProcessChartButton`, `_edgeGlow`, settings summary + `AddStatusField`,
+      per-field editor surfaces, swap-reorder path.
 
-### Fix pass 1 — compounding, thrash, and edge expression
+## Open — next up (ranked)
 
-1. **Compounding deltas (the glitching).** The handle reports a delta absolute from pointer-down,
-   but the shell added it to the *live* geometry it had already been mutating. Move one cell →
-   `W=5`; move two → `W=5+2=7` instead of 6. Fixed by capturing geometry at drag start. Covered by
-   `Apply_Repeated_Growth_Does_Not_Compound`.
-2. **`Resize` could not express an edge drag.** Dragging a left edge changes X *and* W together.
-   Added `GridLayoutEngine.Apply(key, layout)`; `Move`/`Resize` are now wrappers over it.
-3. **Missing corner cursors.** Only 3 handles existed, and the edge handles covered the corners so
-   diagonal cursors appeared in stray pixels. Now 8 handles with edges inset by the corner size.
+- [ ] Optional: `WindowsAppSDKSelfContained` would drop the Windows App Runtime bootstrap from
+      launch (~0.1-0.3s) at the cost of a larger install — a deployment decision.
+- [ ] **Hands-on check of drag/resize with a real mouse**, Cancel glide-back, Esc, and chart
+      drag-zoom after saving a layout. (Frame times measured while a game held the GPU at 86–91% and
+      the window was occluded — re-measure with no game running.)
+- [ ] `InlineTextEntry` simulates a text box (no caret/selection/clipboard/IME). Replace — the app
+      skips `XamlControlsResources`, so a styled `TextBox` needs those resources merged or restyled.
+- [ ] Status channel: severity is substring-matched English; give it a real severity field.
+- [ ] Keyboard: accelerators for views/range, resize handles as tab stops, chart gestures.
+- [ ] Chart: cold-start axis (clamp to available data), gesture hints (drag-zoom/click-pin/double-
+      click reset have no cursor or tooltip), colour-blind series differentiation.
+- [ ] Remaining consistency: corner-radius and border-weight scales; contrast sweep of all 8
+      themes (Nord, Sandstone lowest); hit targets below 32px.
+- [ ] View switch is a fade-rise; consider a directional transition.
+- [ ] Perf: `GridLayoutEngine.Compact` skyline (O(n·W)); hover tooltip caching; collector timeout
+      never fires and shutdown races the PDH buffer; cross-thread snapshot fields lack
+      `volatile`; overlay GDI handles leak on exception path; `SetLastError = true` on P/Invokes.
+- [x] `App.cs` first-chance COMException logger (added for diagnosis) now Debug-only; remove it
+      once the 0x800F1000 crash is confirmed gone.
 
-### Fix pass 2 — the flicker (architectural)
+## Security and robustness
 
-Coalescing reflow to one per frame was not enough: **reflowing the real grid during a gesture at
-all** is the wrong model. Re-spanning grid cells re-measures the dragged card, its chart, and all
-13 siblings on every update.
-
-Replaced with the standard editor pattern (react-grid-layout, Grafana):
-
-- [x] The dragged card leaves grid layout for the gesture: explicit pixel size, pinned top-left,
-      raised z-index, so it grows over neighbours without moving them.
-- [x] Size feedback is **continuous and un-snapped** — the panel tracks the pointer exactly.
-      Snapping the card itself is what made it feel steppy.
-- [x] A cheap `Border` placeholder (no chart, no text) shows the snapped destination cell. Only
-      the placeholder moves through the grid during the gesture.
-- [x] Chart and gauge rendering suspended on the dragged card — redrawing mid-gesture is wasted
-      work and the most visible flicker source.
-- [x] Exactly **one** layout pass, on release.
-- [x] Drag-to-move gets the same placeholder preview.
-- [x] Leaving edit mode mid-gesture restores a stranded card rather than leaving it floating.
-
-This matches Apple's HIG split between **direct manipulation** (immediate, visible, proportional
-response — the card follows the pointer exactly) and **feedback** (communicating the result —
-the placeholder shows where it will land).
-
-## Step 7 — Save / Cancel
-
-- [x] `Done` writes `PanelLayouts` through the debounced persist path — verified, 14 entries.
-- [x] `Cancel` restores the entry snapshot and re-renders.
-- [x] Leaving edit mode re-enables chart interaction.
-- [ ] Cancel untested by hand (needs a real drag to revert).
-
-## Step 8 — Verify
-
-- [ ] Resize the window across all breakpoints with a saved layout — no overlap, no clipping.
-- [ ] Restart: layout restored exactly.
-- [ ] **Chart drag-zoom works after saving a layout** (the regression this feature most risks).
-- [ ] Reduced-motion honoured for reflow animation.
-- [ ] Panel reflow stays smooth with 14 panels; no layout thrash during drag.
+- [ ] Audit the Performance Log Users grant (system-wide trace rights); confirm honest docs and
+      clean degradation when declined.
+- [ ] Installer runs `powershell -ExecutionPolicy Bypass` elevated; prefer `net localgroup` by SID.
+- [ ] Validate the storage path (reject UNC / outside-profile).
+- [ ] Prove the "no network calls" README claim with a static check or blocked-egress run.
+- [ ] Confirm a corrupt/partial config fails safe to defaults.
+- [ ] Review the `HKCU\...\Run` auto-launch write for quoting/path injection.
 
 ---
 
 ## Picking this up
 
-**State:** builds clean on x64 + ARM64, 71/71 tests. Board renders from saved geometry; the Size
-chip still works. Nothing is worse than before this feature started.
+**Where things are:** `ShellWindow.LayoutEditor.cs` (gesture, reflow, placeholder, settle,
+auto-scroll, Esc), `TelemetryPanelCard` (gesture input + float API: `BeginFloat` /
+`SetFloatGeometry` / `EndFloat` / `SetReflowOffset`), `GridLayoutEngine` (`Apply`, `ResizeByDelta`,
+`ResolveResponsive` — keep collision logic there), `Motion.cs` (`MotionTokens`, `SpringValue`).
 
-### Where things are
+**Traps already hit — do not re-learn these:**
 
-| Thing | File |
-|---|---|
-| Geometry model | `Vaktr.Core/Models/PanelLayout.cs` |
-| Collision engine (pure, testable) | `Vaktr.Core/Models/GridLayoutEngine.cs` |
-| Engine tests | `Vaktr.Tests/GridLayoutEngineTests.cs` |
-| Geometry state + migration | `DashboardViewModels.EnsureLayoutsFor` / `ApplyPlacements` |
-| Placement into the grid | `ShellWindow.Polished.cs` → `PlaceDashboardPanels` |
-| Drag-to-reorder (existing, pre-dates this) | `TelemetryPanelCard` drag handlers |
+- Grid pitch includes spacing: `columnPitch = (width + ColumnSpacing) / 12`, `rowPitch = 48 + 14`.
+- Read gesture pointers in window-content space, never the card's own (it moves).
+- A WinUI child larger than its grid slot is clipped to the slot — float spans the whole board.
+- Adding an element that still has a parent throws 0x800F1000, even if that parent is detached.
+- `Children.Clear()` + re-add fires `Unloaded` — anything released there must re-attach on `Loaded`.
+- `RefreshDashboardPanels` clears the grid: re-add every overlay element it owns.
+- Never compare `ColumnDefinitions.Count` to `DetermineDashboardColumns()` (12 vs 1–3 → rebuild loop).
+- Don't assign geometry in `ApplyConfig` (panel list not populated yet).
+- Bad layout poisons the config: delete `panelLayouts` in `%LocalAppData%\Vaktr\vaktr-settings.json`.
 
-### The engine already does the hard part
-
-`Move(panels, key, x, y)` and `Resize(panels, key, w, h)` return a fully resolved board with the
-dragged panel pinned to its target cell. Step 5/6 only need to convert pointer position into grid
-units, call these, and animate cards to the result. Do **not** re-implement collision in the UI
-layer — it is the part that is already proven.
-
-Pixel to grid: `col = round(pointerX / (gridWidth / 12))`, `row = round(pointerY / 48)`.
-
-### Traps already hit — do not re-learn these
-
-- **Never compare `_dashboardGrid.ColumnDefinitions.Count` against `DetermineDashboardColumns()`.**
-  The grid is always 12; that helper returns the responsive breakpoint count (1-3). Mismatching
-  them caused an infinite rebuild loop.
-- **Responsive clamping must read measured width**, not the breakpoint count — the count is 0 on
-  first placement and forces every panel full width.
-- **Do not assign geometry in `ApplyConfig`.** The dashboard panel list is not populated yet.
-  `EnsureLayoutsFor` runs from the render path for this reason.
-- **Writing a bad layout poisons the config.** `%LocalAppData%\Vaktr\vaktr-settings.json` →
-  delete the `panelLayouts` key to reset the board while iterating.
-
-### Step 4's real risk
-
-Chart drag-zoom shares the pointer with any move/resize affordance. Handles must be
-`IsHitTestVisible = false` outside edit mode — not merely invisible. Verify by dragging a time
-range on a chart *after* saving a layout; that is the regression this feature most likely causes.
-
-### Verifying UI changes in this repo
-
-`dotnet` is not on PATH — use `C:\Program Files\dotnet\dotnet.exe`. Kill `Vaktr.exe` before
-building or the DLL copy fails.
-
-Screenshot without stealing focus (the user games on this machine — never force foreground):
-`PrintWindow(hwnd, hdc, 2)` against the `WinUIDesktopWin32WindowClass` window. Synthesised clicks
-(`mouse_event`, `SendInput`, UIA) have been unreliable here; prefer a temporary env-var flag that
-drives the app into the state you need, then capture.
-
-When layout looks wrong but `ActualWidth` looks right, paint container backgrounds a solid colour
-and screenshot — that localised the ScrollViewer zoom bug in one step after a long hunt.
-
----
-
-# UI/UX Audit
-
-A deliberate pass over the whole surface rather than spot fixes. Items below are grounded in
-things actually observed in this codebase — not a generic checklist.
-
-## A — Button and control organisation
-
-- [ ] **Card header is the busiest element left.** Every panel carries `Processes | Size | 15m` as
-      three separate pills. Decide: collapse into one overflow menu (Grafana-style kebab), make
-      them icon-only, or show them on hover. Three equal-weight pills per card × 14 cards is the
-      single largest source of visual noise.
-- [ ] Audit chip *grouping* semantics: range chips are a segmented control (one choice of four),
-      but `Processes` is a toggle and `Size` opens a picker. Three different behaviours currently
-      share one visual treatment.
-- [ ] Decide where global vs per-panel controls live. The global range chip sits in the section
-      header while per-panel range sits in each card — confirm that reads as a hierarchy.
-- [ ] Settings "Edit" button placement and label consistency against the new board Edit button.
-
-## B — Startup animation
-
-- [ ] Re-time after the Step 1-3 grid change: the cascade was tuned for flowing rows, and fixed
-      geometry may want a different order (top-left outward rather than list order).
-- [ ] Decide whether summary cards and panels should share one cascade or read as two groups.
-- [ ] Confirm the loading screen → dashboard handoff has no flash of unstyled/empty panels.
-- [ ] Verify `UISettings.AnimationsEnabled` is respected on *every* animated path, not just
-      `Motion` (panel card Storyboards and the new drop settle included).
-
-## C — Hover and focus
-
-- [ ] Sweep for any remaining hover handler that touches a layout property. `BorderThickness` was
-      fixed in three places; audit `Margin`, `Padding`, `Width`, `FontSize` for the same mistake.
-- [ ] Unify hover vocabulary. Cards lift 1px, chips scale on press, legend rows change background,
-      process rows brighten a gradient — four different idioms. Pick a system.
-- [ ] Focus rings: `ActionChip` has one; confirm `InlineTextEntry`, legend rows, process rows and
-      nav buttons are all keyboard-reachable and visibly focused.
-- [ ] Hit targets: verify chips and rows meet a sensible minimum height for pointer accuracy.
-
-## D — Panel dragging
-
-- [ ] Drag affordance is currently invisible until you try it. Needs a grip cue (on hover, or in
-      edit mode once Step 4 lands).
-- [ ] Drop target indication: confirm where a panel will land *before* releasing.
-- [ ] Verify the drop settle animation tuning once drag is exercised by hand (untested).
-- [ ] Decide whether dragging stays available outside edit mode or becomes edit-only — currently
-      reorder-drag and the new edit mode would overlap.
-
-## E — Charts
-
-- [ ] **Cold start looks broken.** On first launch the plot is empty across most of its width
-      until history accumulates. Either clamp the axis to available data or show an explicit
-      "collecting" state — this is the first thing a new user sees.
-- [ ] Last-point marker: 14px glow ellipse at 0.22 opacity plus a 5.5px dot. Review whether the
-      glow still reads correctly against the richer gradient fill (now `120→38→0`).
-- [ ] Review area fill opacity for multi-series panels (CPU Cores, 16 overlapping fills at 0.45) —
-      check it does not turn to mud.
-- [ ] Gridlines are now near-invisible hairlines; confirm they still orient the eye at large `H`.
-- [ ] Series colour palette is blue-heavy (CPU cyan, GPU blue, Network blue, System blue). Disk
-      moved to violet for threshold reasons; consider whether the rest needs separating.
-- [ ] Non-colour series differentiation for colour-blind users (dash pattern or marker).
-
-## F — Typography
-
-- [ ] The eyebrow/hero treatment (10.5px tracked label over a 36px tight value) was applied to
-      panel cards only. Audit summary cards, settings cards and section headers for the same
-      hierarchy — right now they each set their own sizes.
-- [ ] Consolidate the type scale. Sizes currently range across 9.5/10/10.5/11/11.5/12.5/13/15.5/
-      22/36 set ad hoc at call sites; define a small named scale and use it.
-- [ ] Mixed font families: `Bahnschrift` for numerals, `Segoe UI Variable Text/Display` for UI.
-      Confirm that is intentional and applied consistently.
-- [ ] Verify tabular figures everywhere a number updates live, so values do not reflow.
-
-## G — Consistency and theming
-
-- [ ] Audit all 8 themes, not just Dark. Sweep for remaining hardcoded hex fallbacks that drift
-      when the palette changes (this already bit `ActionChip` and `InlineTextEntry`).
-- [ ] Verify WCAG AA contrast for text and threshold colours in every theme — `Nord` and
-      `Sandstone` are the lowest-contrast and most likely to fail.
-- [ ] Corner radius inventory: 3/8/9/10/11/14/16/20 appear across controls. Reduce to a scale.
-- [ ] Spacing inventory: confirm padding and gaps come from shared constants rather than literals.
-- [ ] Confirm threshold colours are reserved for thresholds everywhere (the Disk accent collision
-      was one instance; check gauges, summary bars and the overlay agree).
-- [ ] Empty, loading and error states: give them the same care as the populated state.
-
----
-
-# Audit findings
-
-Two read-only audits (performance/correctness, and UI/UX against Apple's HIG). Items marked `[x]`
-were fixed in this pass; the rest are ranked and ready to pick up.
-
-## P0 — fixed
-
-- [x] **Crash on "Show processes."** `ActionChip.ApplyPressScale` ran from all 11 `UpdateVisualState`
-      call sites, starting a Storyboard on every hover, focus, `IsActive`/`IsFilled` change and
-      theme refresh. One click cascaded into a storyboard flood across every chip. Now only
-      animates on a real press transition. Verified with 40 rapid toggles.
-- [x] **UI-thread deadlock on close.** `OnWindowClosed` blocked on `_pendingHistoryLoad`, whose
-      continuation was posted back to the very `DispatcherQueue` it was blocking. Closing during a
-      long-retention history load hung the process with no window and no exit. Now
-      `ConfigureAwait(false)` + an explicit marshal back, and the close wait is bounded to 2s.
-- [x] **Leaked kernel ETW session.** Every failure path after a successful `StartTrace` freed the
-      properties buffer and zeroed the handle without stopping the session, leaving
-      `VaktrFpsSession` live with DXGI+D3D9 enabled for the rest of the OS boot — and
-      unrecoverable, since `StopTracking` then early-returns. `Cleanup` now stops first.
-- [x] **Native callback could be collected mid-trace.** The delegate field is the only GC root for
-      the thunk ETW holds; it was nulled after a 2s join timeout even if `ProcessTrace` had not
-      returned. Next event → access violation on the consumer thread. Root is now kept unless the
-      consumer demonstrably exited (join raised to 5s).
-- [x] **Off-screen panel gate never engaged.** `EffectiveViewport` is in the element's own
-      coordinate space, so `Width > 0 && Height > 0` was true even for panels scrolled far away —
-      all 14 panels kept redrawing charts when four were visible. Now an intersection test.
-- [x] **Zombie cards.** `TelemetryPanelCard` never unsubscribed from its view model, and the view
-      models are permanent — every toggled-off panel stayed alive redrawing its chart forever.
-      Added `Unloaded` detach.
-- [x] **Blocking file I/O per overlay frame, during gameplay.** `OverlayLog.Write` did a
-      synchronous open/append/close on the overlay message-loop thread 2-3×/second while gaming,
-      from four threads, unbounded in size. Now off by default (`VAKTR_OVERLAY_LOG=1`), queued,
-      single background writer, size-capped.
-- [x] **Panels could be resized into overlap.** `ApplySizePreset` forced `MinHeight` 280-392px
-      while the grid reserved only `MinHeight = 3` rows (144px). Grid floor raised to 7 rows
-      (336px) and the per-preset override removed, so the two floors agree.
-- [x] **Wrong-axis clamp.** `UpdateResizePreview` clamped *width* with `MinHeight / 2`.
-- [x] **Two contradictory drop previews.** A proximity swap highlighted a neighbour ("I'll swap
-      with this") while the authoritative placeholder said otherwise — and the swap was discarded
-      in edit mode anyway, so the louder preview was simply wrong. Dead path removed entirely.
-- [x] **Hover erased the edit affordance.** `SetHoverState` was not gated on edit mode, so moving
-      the pointer toward a panel wiped the accent border telling you it was draggable.
-- [x] **`MotionTicker` had no per-callback exception isolation.** One throwing animator aborted
-      the whole frame, was never removed, and threw again at 60Hz forever.
-
-## P1 — performance, not yet done
-
-- [ ] **`TelemetryChart.Redraw` rebuilds ~4,400 XAML objects per scrape** (~9,000/s at a 1s
-      interval). One `LineSegment` *per point*, twice when a fill is drawn, plus a full grid
-      rebuild even when only data changed. Two fixes: a single `PolyLineSegment` with a mutable
-      `PointCollection` (N→1 objects, and retainable the way `UsageGauge` already retains its
-      `ArcSegment`), and a separate dirty flag for the grid. **Highest-value remaining item.**
-- [ ] Summary-card meter sets `Width` every snapshot — use `ScaleTransform.ScaleX`.
-- [ ] `GridLayoutEngine.Compact` is O(n²·Y) walking one row at a time with a clone per step
-      (~15,000 overlap tests per drop). A per-column skyline makes it O(n·W).
-- [ ] Hover tooltip rebuilds strings and re-measures every frame; cache on anchor timestamp.
-- [ ] Collector: `CollectAsync` is synchronous so its timeout can never fire; shutdown disposes
-      the collector without awaiting the loop task (races the PDH buffer).
-- [ ] The 5s resize safety timer is never cancelled and can abort a second resize mid-gesture.
-- [ ] `ThemeVisuals.ResolveBrush` does a `ResourceDictionary` probe ~150×/scrape; cache it.
-- [ ] Snapshot handoff fields are cross-thread without `volatile`/`Interlocked`.
-- [ ] GDI handles leak on the overlay's exception path (no try/finally); `Dispose` never calls
-      `DestroyWindow`.
-- [ ] `Marshal.GetLastWin32Error()` read from P/Invokes declared without `SetLastError = true` —
-      the reported codes are garbage and will mislead the next ETW/ULW investigation.
-
-## P1 — UI/UX, not yet done
-
-- [ ] **Promote `Motion.cs` to a real token set** (durations + 2 easings) and route hover, edit-mode
-      entry, process expand/collapse, legend dim, threshold colour and view switching through it.
-      The app currently has **7 animations total**; nearly every deliberate state change snaps.
-      This is the bulk of the "extremely smooth" gap.
-- [ ] Reduced motion is honoured in only 3 of 7 animations, and `AnimationsEnabled` caches once
-      per process and never refreshes.
-- [ ] `InlineTextEntry` simulates a text box: no caret, selection, arrow keys, Ctrl+A/C/V, IME or
-      undo — and it governs every settings field. Biggest interaction-correctness debt.
-- [ ] Status text is the only feedback channel: one truncating 300px caption with severity decided
-      by substring-matching English prose. Edit-mode instructions overflow it.
-- [ ] View switching is a hard cut and discards scroll position (HIG: preserve context).
-- [ ] Card border thickness drifts across five code paths, each a layout pass — contradicting the
-      comment that says it must stay constant. `ActionChip` does the same on focus.
-- [ ] The 30px live value has no tabular figures, so the headline number reflows every tick.
-      Two numeral typefaces in one card.
-- [ ] Threshold colour has no hysteresis (flickers at 74.8/75.2) and is percent-only, so
-      temperature panels — the hottest readings in the app — never turn amber or red.
-- [ ] Keyboard support is one `if`: Enter/Space on `ActionChip`. No accelerators, no Escape from
-      edit mode, resize handles aren't tab stops, chart gestures are pointer-only.
-- [ ] Contrast failures, all from stacking `Opacity` on already-muted brushes: process column
-      headers measure **2.2-2.6:1** in every theme (AA needs 4.5). Use the semantic text brushes.
-- [ ] Focus is conflated with hover — `GotFocus` sets `_isHovered = true`.
-- [ ] Hit targets are 22-36px across five sizes, below both HIG (44pt) and Windows (32px).
-- [ ] Dead UI: `_perProcessChartButton` is fully wired but never added to the tree; `_edgeGlow`
-      can never render; three of four arms of `AddStatusField`'s accent switch are unreachable.
-- [ ] Legacy cyan hardcoded into settings cards bypasses the palette, so Sandstone/Ember/Violet
-      still show cyan icons. Off-palette resource *fallbacks* compound it.
-- [ ] Scale inventories to consolidate: **19 font sizes**, **8 corner radii**, **8 border weights**.
-- [ ] Chart has three gestures (drag-zoom, click-pin, double-click-reset) with no cursor, tooltip
-      or hint.
-
-## Security and robustness
-
-- [ ] Audit the Performance Log Users grant — it permits system-wide trace collection, not just
-      Vaktr's. Confirm it is documented honestly and that declining degrades cleanly (it does).
-- [ ] Installer uses `powershell -ExecutionPolicy Bypass` from an elevated context; prefer a
-      direct API or `net localgroup` by SID.
-- [ ] Validate the user-configurable storage path (reject outside-profile and UNC paths).
-- [ ] Prove the "no network calls" README claim with a static check or blocked-egress run.
-- [ ] Confirm a corrupt/partial config fails safe to defaults.
-- [ ] Review the `HKCU\...\Run` auto-launch write for quoting/path injection.
+**Verifying:** `C:\Program Files\dotnet\dotnet.exe`; kill `Vaktr.exe` before building. Capture with
+`PrintWindow(hwnd, hdc, 2)` on the `WinUIDesktopWin32WindowClass` window — never force foreground
+(the owner games on this machine; the in-game overlay also appears over a running game whenever the
+app launches). Real input can't be injected safely, so gestures were driven in-process: a temporary
+env-gated probe called the card's gesture events with window-space points each frame and logged
+geometry + frame timing; frames were captured externally. Re-create it rather than shipping it.

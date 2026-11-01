@@ -4,6 +4,7 @@ using Microsoft.UI.Dispatching;
 using Microsoft.UI.Input;
 using Microsoft.UI.Text;
 using Microsoft.UI.Xaml.Controls.Primitives;
+using Microsoft.UI.Xaml.Hosting;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media.Animation;
@@ -16,16 +17,6 @@ namespace Vaktr.App.Controls;
 
 public sealed class TelemetryPanelCard : UserControl
 {
-    private static readonly (TimeRangePreset Preset, string ShortLabel, string MenuLabel)[] RangeChoices =
-    [
-        (TimeRangePreset.OneMinute, "1m", "1 minute"),
-        (TimeRangePreset.FiveMinutes, "5m", "5 minutes"),
-        (TimeRangePreset.FifteenMinutes, "15m", "15 minutes"),
-        (TimeRangePreset.OneHour, "1h", "1 hour"),
-        (TimeRangePreset.TwoDays, "2d", "2 days"),
-        (TimeRangePreset.FiveDays, "5d", "5 days"),
-    ];
-
     public static readonly DependencyProperty PanelProperty =
         DependencyProperty.Register(
             nameof(Panel),
@@ -35,7 +26,6 @@ public sealed class TelemetryPanelCard : UserControl
 
     private readonly Border _cardBorder;
     private readonly Border _badgeBorder;
-    private readonly Border _edgeGlow;
     private readonly Grid _badgeIconHost;
     private readonly TextBlock _footerText;
     private readonly TextBlock _scaleText;
@@ -44,6 +34,7 @@ public sealed class TelemetryPanelCard : UserControl
     private readonly TextBlock _secondaryValueText;
     private readonly TelemetryChart _chart;
     private readonly UsageGauge _gauge;
+    private readonly Viewbox _gaugeHost;
     private readonly Grid _visualGrid;
     private readonly Border _chartFrame;
     private readonly Border _rangeShell;
@@ -57,16 +48,13 @@ public sealed class TelemetryPanelCard : UserControl
     private readonly TextBlock _valueLabelText;
     private readonly StackPanel _processRowsHost;
     private readonly ScrollViewer _processScroller;
-    private readonly ActionChip _rangeButton;
-    private readonly Dictionary<TimeRangePreset, SymbolIcon> _rangeMenuChecks = [];
     private readonly ActionChip _sortHighestButton;
     private readonly ActionChip _sortLowestButton;
     private readonly ActionChip _sortNameButton;
-    private readonly ActionChip _perProcessChartButton;
     private readonly ActionChip _processToggleButton;
-    private readonly ActionChip _sizeButton;
     private readonly Border _legendDivider;
-    private readonly Dictionary<PanelSizePreset, SymbolIcon> _sizeMenuChecks = [];
+    private readonly Grid _contentGrid;
+    private readonly RowDefinition _processRow;
     private readonly Dictionary<string, (ClickableBorder Row, Border InnerBorder, TextBlock NameText, TextBlock ValueText, Ellipse Dot)> _legendRows = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, (ClickableBorder Row, TextBlock NameText, TextBlock ValueText, TextBlock CaptionText, LinearGradientBrush FillBrush, Border RowBorder, Ellipse? ChartDot)> _processRowParts = new(StringComparer.OrdinalIgnoreCase);
     private bool _processScrollLoadQueued;
@@ -77,27 +65,38 @@ public sealed class TelemetryPanelCard : UserControl
     private Brush? _lastBadgeAccentBrush;
     private IReadOnlyList<ChartSeriesViewModel>? _lastRenderedSeries;
     private IReadOnlyList<ProcessListItemViewModel>? _lastRenderedProcessRows;
-    private PanelSizePreset _lastRenderedSizePreset = PanelSizePreset.Standard;
     private DateTimeOffset _lastRenderedWindowStartUtc;
     private DateTimeOffset _lastRenderedWindowEndUtc;
     private double _lastRenderedCeilingValue = double.NaN;
     private MetricUnit _lastRenderedUnit;
-    private TimeRangePreset _lastRenderedRange;
     private ProcessSortMode _lastRenderedSortMode;
-    private bool _lastRenderedZoomState;
     private bool _lastRenderedSupportsProcessTable;
     private bool _lastRenderedGaugeMode;
-    private bool _isHeaderPointerDown;
-    private bool _isHeaderDragActive;
-    private FrameworkElement? _headerDragHandle;
-    private readonly TranslateTransform _dragTranslate = new();
-    private readonly ScaleTransform _dropSettleScale = new() { ScaleX = 1d, ScaleY = 1d };
-    private Windows.Foundation.Point _dragMouseStart;
+    // Layout-edit geometry. One offset serves both roles a card plays in a gesture: the
+    // floating card's position on the board, or a sibling's displacement while it makes room.
+    // It is UIElement.Translation, not a RenderTransform: a RenderTransform change re-runs the
+    // effective-viewport pass and moves every ScrollViewer's DirectManipulation viewport inside
+    // the card, which cost 20-40ms per frame with ten panels in motion. Translation is applied
+    // purely in the compositor.
+    private double _offsetX;
+    private double _offsetY;
+    private readonly ScaleTransform _liftScale = new() { ScaleX = 1d, ScaleY = 1d };
+    private readonly Grid _shadowHost = new() { IsHitTestVisible = false };
+    private Microsoft.UI.Composition.DropShadow? _liftShadow;
+    private Microsoft.UI.Composition.SpriteVisual? _liftCaster;
+    private bool _isFloating;
+    private bool _gesturePointerDown;
+    private bool _gestureActive;
+    private ResizeEdge _gestureEdge;
+    private Windows.Foundation.Point _gesturePressPoint;
+    private UIElement? _gestureCaptureElement;
+    private ResizeEdge? _hoveredHandleEdge;
+    private bool _bodyHovered;
+    private bool _handlesRevealed;
+    private readonly List<(Border Visual, ResizeEdge Edge)> _handleVisuals = [];
     private bool _isEffectivelyVisible = true;
     private bool _isRenderingSuspended;
     private bool _deferredRefreshPending;
-
-    public event EventHandler<TimeRangePresetRequestedEventArgs>? RangePresetRequested;
 
     public event EventHandler<ChartZoomSelectionEventArgs>? PanelZoomSelectionRequested;
 
@@ -105,26 +104,21 @@ public sealed class TelemetryPanelCard : UserControl
 
 
 
-    public event EventHandler<PanelSizePresetRequestedEventArgs>? PanelSizePresetRequested;
+    /// <summary>
+    /// A move (edge None) or resize crossed its drag threshold. Points are in window-content
+    /// coordinates, which stay put while this card moves - unlike the card's own space, where
+    /// reading the pointer during a left/top resize fed the card's motion back into the input.
+    /// </summary>
+    public event EventHandler<LayoutGestureEventArgs>? LayoutGestureStarted;
 
-    public event EventHandler? PanelDragEnded;
+    /// <summary>The pointer moved during a gesture. Raised per input event; the shell coalesces.</summary>
+    public event EventHandler<LayoutGestureEventArgs>? LayoutGestureMoved;
 
-    /// <summary>Raised while a panel is being dragged, so the shell can preview the drop cell.</summary>
-    public event EventHandler<PanelResizeEventArgs>? PanelDragMoved;
-
-    /// <summary>Raised on pointer-down so the shell can capture the geometry to resize from.</summary>
-    public event EventHandler<PanelResizeEventArgs>? PanelResizeStarted;
-
-    /// <summary>Raised while a resize handle is dragged. Deltas are pixels, absolute from pointer-down.</summary>
-    public event EventHandler<PanelResizeEventArgs>? PanelResizeDelta;
-
-    /// <summary>Raised when a resize drag completes, so the shell can persist.</summary>
-    public event EventHandler? PanelResizeCompleted;
+    /// <summary>The gesture finished: released (commit) or cancelled (capture lost).</summary>
+    public event EventHandler<LayoutGestureEndedEventArgs>? LayoutGestureEnded;
 
     private Grid _resizeHandleLayer = null!;
     private bool _isLayoutEditMode;
-    private ResizeEdge _activeResizeEdge = ResizeEdge.None;
-    private Windows.Foundation.Point _resizeStart;
 
     /// <summary>Which edges a handle drags. Flags so a corner is just two edges combined.</summary>
     [Flags]
@@ -141,23 +135,16 @@ public sealed class TelemetryPanelCard : UserControl
         BottomRight = Bottom | Right,
     }
 
-    public bool IsDragging => _isHeaderDragActive;
-
-    /// <summary>
-    /// Pixel offset the card has been dragged from its placed position. Valid inside the
-    /// <see cref="PanelDragEnded"/> handler — the transform is cleared immediately after.
-    /// </summary>
-    public Windows.Foundation.Point DragOffset => new(_dragTranslate.X, _dragTranslate.Y);
+    /// <summary>True while a gesture has lifted the card out of grid layout.</summary>
+    public bool IsFloating => _isFloating;
 
     public TelemetryPanelCard()
     {
-        // Height now comes from the panel's H in grid units, so the card stretches to fill the
-        // rows it spans instead of sizing to its content. MinHeight only guards the smallest
-        // allowed span (H=3) from collapsing below something usable.
-        MinHeight = CardMinimumHeight;
+        // Height comes from the panel's H in grid units, so the card stretches to fill the rows
+        // it spans. The grid's minimum (PanelLayout.MinHeight) is the only floor: a second floor
+        // here is what once let a card overflow the space the grid had reserved for it.
         HorizontalAlignment = HorizontalAlignment.Stretch;
         VerticalAlignment = VerticalAlignment.Stretch;
-        RenderTransform = _dragTranslate;
 
         _badgeIconHost = new Grid
         {
@@ -166,13 +153,14 @@ public sealed class TelemetryPanelCard : UserControl
             HorizontalAlignment = HorizontalAlignment.Center,
             VerticalAlignment = VerticalAlignment.Center,
         };
-        _footerText = CreateTextBlock(fontSize: 10);
-        _footerText.Opacity = 0.72;
-        _scaleText = CreateTextBlock("Segoe UI Variable Text", 10, FontWeights.Normal);
+        // Text contrast comes from the semantic text brushes alone. Stacking Opacity on an already
+        // muted brush is what pushed captions and column headers to ~2.4:1 against the card.
+        _footerText = CreateTextBlock(fontSize: 11);
+        _scaleText = CreateTextBlock("Segoe UI Variable Text", 11, FontWeights.Normal);
         _scaleText.TextWrapping = TextWrapping.NoWrap;
         _scaleText.TextTrimming = TextTrimming.CharacterEllipsis;
         _scaleText.MaxWidth = 200;
-        _titleText = CreateTextBlock("Segoe UI Variable Text", 13.5, FontWeights.SemiBold);
+        _titleText = CreateTextBlock("Segoe UI Variable Text", 14, FontWeights.SemiBold);
         _titleText.TextTrimming = TextTrimming.CharacterEllipsis;
         _titleText.TextWrapping = TextWrapping.NoWrap;
         _titleText.Foreground = ResolveBrush("TextPrimaryBrush", "#F2F8FF");
@@ -180,8 +168,10 @@ public sealed class TelemetryPanelCard : UserControl
         _currentValueText = CreateTextBlock("Segoe UI Variable Display", 30, FontWeights.SemiBold);
         _currentValueText.TextTrimming = TextTrimming.CharacterEllipsis;
         _currentValueText.TextWrapping = TextWrapping.NoWrap;
-        _secondaryValueText = CreateTextBlock(fontSize: 11.5);
-        _secondaryValueText.Opacity = 0.78;
+        // Tabular figures: every digit the same width, so the headline number holds still
+        // instead of shuffling sideways each time a 1 becomes an 8.
+        UseTabularFigures(_currentValueText);
+        _secondaryValueText = CreateTextBlock(fontSize: 12);
 
         _badgeBorder = new Border
         {
@@ -193,53 +183,6 @@ public sealed class TelemetryPanelCard : UserControl
             Child = _badgeIconHost,
         };
 
-        _edgeGlow = new Border
-        {
-            Width = 0,
-            Height = 184,
-            CornerRadius = new CornerRadius(2),
-            HorizontalAlignment = HorizontalAlignment.Left,
-            VerticalAlignment = VerticalAlignment.Center,
-            Margin = new Thickness(-2, 6, 0, 6),
-            Opacity = 0,
-            Visibility = Visibility.Collapsed,
-            IsHitTestVisible = false,
-        };
-
-        _rangeButton = new ActionChip
-        {
-            MinHeight = 30,
-            MinWidth = 58,
-            Text = "15m",
-        };
-        ToolTipService.SetToolTip(_rangeButton, "Choose this chart's time range");
-        var rangeMenu = new MenuFlyout();
-        foreach (var choice in RangeChoices)
-        {
-            var item = CreateCheckedMenuItem(choice.Preset, choice.MenuLabel, OnRangeClick, out var check);
-            rangeMenu.Items.Add(item);
-            _rangeMenuChecks.Add(choice.Preset, check);
-        }
-        FlyoutBase.SetAttachedFlyout(_rangeButton, rangeMenu);
-        _rangeButton.Click += (_, _) => FlyoutBase.ShowAttachedFlyout(_rangeButton);
-
-        _sizeButton = new ActionChip { Text = "Size", MinHeight = 30, MinWidth = 54 };
-        ToolTipService.SetToolTip(_sizeButton, "Choose this panel's size");
-        var sizeMenu = new MenuFlyout();
-        foreach (var (preset, label) in new[]
-        {
-            (PanelSizePreset.Compact, "Compact"),
-            (PanelSizePreset.Standard, "Standard"),
-            (PanelSizePreset.Wide, "Wide"),
-            (PanelSizePreset.Large, "Large"),
-        })
-        {
-            var item = CreateCheckedMenuItem(preset, label, OnPanelSizeClick, out var check);
-            sizeMenu.Items.Add(item);
-            _sizeMenuChecks.Add(preset, check);
-        }
-        FlyoutBase.SetAttachedFlyout(_sizeButton, sizeMenu);
-        _sizeButton.Click += (_, _) => FlyoutBase.ShowAttachedFlyout(_sizeButton);
 
         _visualGrid = new Grid
         {
@@ -252,15 +195,15 @@ public sealed class TelemetryPanelCard : UserControl
         {
             Width = 144,
             Height = 144,
-            VerticalAlignment = VerticalAlignment.Center,
-            Visibility = Visibility.Collapsed,
         };
 
+        // The chart fills whatever height the panel's grid span leaves. MinHeight is the
+        // smallest plot that still reads as a trend line.
         _chart = new TelemetryChart
         {
-            Height = 176,
-            MinHeight = 176,
+            MinHeight = 96,
             HorizontalAlignment = HorizontalAlignment.Stretch,
+            VerticalAlignment = VerticalAlignment.Stretch,
         };
         _chart.ZoomSelectionRequested += OnChartZoomSelectionRequested;
         _chart.ZoomResetRequested += OnChartZoomResetRequested;
@@ -275,9 +218,18 @@ public sealed class TelemetryPanelCard : UserControl
             Padding = new Thickness(4, 4, 4, 3),
             Child = _chart,
         };
-        ApplySizePreset(PanelSizePreset.Standard);
+        // A gauge is fixed artwork; scale it down rather than clip it in a short panel.
+        _gaugeHost = new Viewbox
+        {
+            Child = _gauge,
+            MaxWidth = 144,
+            MaxHeight = 144,
+            Stretch = Stretch.Uniform,
+            VerticalAlignment = VerticalAlignment.Center,
+            Visibility = Visibility.Collapsed,
+        };
 
-        _visualGrid.Children.Add(_gauge);
+        _visualGrid.Children.Add(_gaugeHost);
         _visualGrid.Children.Add(_chartFrame);
         Grid.SetColumn(_chartFrame, 1);
 
@@ -295,6 +247,7 @@ public sealed class TelemetryPanelCard : UserControl
         };
         _legendScroller = new ScrollViewer
         {
+            Margin = new Thickness(0, 8, 0, 0),
             MaxHeight = 400,
             VerticalScrollMode = ScrollMode.Enabled,
             VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
@@ -317,10 +270,8 @@ public sealed class TelemetryPanelCard : UserControl
         _processToggleButton = new ActionChip { Text = "Processes", MinHeight = 30, MinWidth = 96 };
         ToolTipService.SetToolTip(_processToggleButton, "Show the top processes for this metric");
         _processToggleButton.Click += OnProcessSectionToggleClick;
-        _perProcessChartButton = new ActionChip { Text = "Chart", MinHeight = 26, MinWidth = 36 };
-        _perProcessChartButton.Click += OnPerProcessChartToggle;
 
-        _processSectionTitleText = CreateTextBlock("Segoe UI Variable Text", 11, FontWeights.Medium);
+        _processSectionTitleText = CreateTextBlock("Segoe UI Variable Text", 12, FontWeights.SemiBold);
         _processRowsHost = new StackPanel
         {
             Spacing = 0,
@@ -328,7 +279,6 @@ public sealed class TelemetryPanelCard : UserControl
         // Click handlers are attached per-row in the slow path of RefreshProcessRows
         _processScroller = new ScrollViewer
         {
-            MaxHeight = 320,
             VerticalScrollMode = ScrollMode.Enabled,
             VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
             HorizontalScrollMode = ScrollMode.Disabled,
@@ -369,22 +319,22 @@ public sealed class TelemetryPanelCard : UserControl
         processColumns.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(32) });
         processColumns.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
-        _processLabelText = CreateTextBlock(fontSize: 10);
+        _processLabelText = CreateTextBlock(fontSize: 10.5);
         _processLabelText.Foreground = ResolveBrush("TextMutedBrush", "#7D9AB6");
-        _processLabelText.Opacity = 0.6;
+        _processLabelText.CharacterSpacing = 40;
         _processLabelText.Text = "PROCESS";
         processColumns.Children.Add(_processLabelText);
 
-        _activityLabelText = CreateTextBlock(fontSize: 10);
+        _activityLabelText = CreateTextBlock(fontSize: 10.5);
         _activityLabelText.Foreground = ResolveBrush("TextMutedBrush", "#7D9AB6");
-        _activityLabelText.Opacity = 0.6;
+        _activityLabelText.CharacterSpacing = 40;
         _activityLabelText.Text = "DETAILS";
         processColumns.Children.Add(_activityLabelText);
         Grid.SetColumn(_activityLabelText, 1);
 
-        _valueLabelText = CreateTextBlock(fontSize: 10);
+        _valueLabelText = CreateTextBlock(fontSize: 10.5);
         _valueLabelText.Foreground = ResolveBrush("TextMutedBrush", "#7D9AB6");
-        _valueLabelText.Opacity = 0.6;
+        _valueLabelText.CharacterSpacing = 40;
         _valueLabelText.Text = "VALUE";
         _valueLabelText.HorizontalAlignment = HorizontalAlignment.Right;
         processColumns.Children.Add(_valueLabelText);
@@ -431,22 +381,26 @@ public sealed class TelemetryPanelCard : UserControl
             }
         };
 
+        // A grid rather than a stack, so the list fills the section's row and scrolls inside it
+        // instead of pushing the card taller than its grid span.
+        var processLayout = new Grid { RowSpacing = 10 };
+        processLayout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        processLayout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        processLayout.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+        processLayout.Children.Add(processHeader);
+        processLayout.Children.Add(processColumns);
+        processLayout.Children.Add(_processScroller);
+        Grid.SetRow(processColumns, 1);
+        Grid.SetRow(_processScroller, 2);
+
         _processSection = new Border
         {
             Background = BrushFactory.CreateBrush("#00FFFFFF"),
             BorderThickness = new Thickness(0),
             Padding = new Thickness(0, 8, 0, 0),
+            Margin = new Thickness(0, 12, 0, 0),
             Visibility = Visibility.Collapsed,
-            Child = new StackPanel
-            {
-                Spacing = 10,
-                Children =
-                {
-                    processHeader,
-                    processColumns,
-                    _processScroller,
-                },
-            },
+            Child = processLayout,
         };
 
         var panelActions = new StackPanel
@@ -456,8 +410,6 @@ public sealed class TelemetryPanelCard : UserControl
             Children =
             {
                 _processToggleButton,
-                _sizeButton,
-                _rangeButton,
             },
         };
         _rangeShell = new Border
@@ -491,7 +443,6 @@ public sealed class TelemetryPanelCard : UserControl
             Child = _scaleText,
             HorizontalAlignment = HorizontalAlignment.Right,
             VerticalAlignment = VerticalAlignment.Center,
-            Opacity = 0.78,
         };
         titleRow.Children.Add(_scalePill);
         Grid.SetColumn(_scalePill, 2);
@@ -531,11 +482,29 @@ public sealed class TelemetryPanelCard : UserControl
         headerGrid.Children.Add(headerContent);
         headerGrid.Children.Add(_rangeShell);
         Grid.SetColumn(_rangeShell, 1);
-        headerGrid.PointerPressed += OnHeaderPointerPressed;
-        headerGrid.PointerMoved += OnHeaderPointerMoved;
-        headerGrid.PointerReleased += OnHeaderPointerReleased;
-        headerGrid.PointerCaptureLost += OnHeaderPointerCaptureLost;
-        _headerDragHandle = headerGrid;
+
+        // Rows, not a stack: the chart row takes whatever height the panel's grid span leaves,
+        // so a taller panel means a taller chart. In a stack the chart kept a fixed 176px and
+        // every extra row of panel height became dead space beneath it. Spacing lives on the
+        // children (not RowSpacing) so collapsed rows cost nothing.
+        _visualGrid.Margin = new Thickness(0, 12, 0, 0);
+        _legendDivider.Margin = new Thickness(8, 12, 8, 0);
+        _processRow = new RowDefinition { Height = GridLength.Auto };
+        _contentGrid = new Grid();
+        _contentGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        _contentGrid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star), MinHeight = 108 });
+        _contentGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        _contentGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        _contentGrid.RowDefinitions.Add(_processRow);
+        _contentGrid.Children.Add(headerGrid);
+        _contentGrid.Children.Add(_visualGrid);
+        _contentGrid.Children.Add(_legendDivider);
+        _contentGrid.Children.Add(_legendScroller);
+        _contentGrid.Children.Add(_processSection);
+        Grid.SetRow(_visualGrid, 1);
+        Grid.SetRow(_legendDivider, 2);
+        Grid.SetRow(_legendScroller, 3);
+        Grid.SetRow(_processSection, 4);
 
         _cardBorder = new Border
         {
@@ -544,30 +513,37 @@ public sealed class TelemetryPanelCard : UserControl
             BorderThickness = new Thickness(1),
             CornerRadius = new CornerRadius(8),
             Padding = new Thickness(16),
-            RenderTransform = _dropSettleScale,
+            RenderTransform = _liftScale,
             RenderTransformOrigin = new Windows.Foundation.Point(0.5, 0.5),
-            Child = new Grid
-            {
-                Children =
-                {
-                    _edgeGlow,
-                    new StackPanel
-                    {
-                        Spacing = 12,
-                        Children =
-                        {
-                            headerGrid,
-                            _visualGrid,
-                            _legendDivider,
-                            _legendScroller,
-                            _processSection,
-                        },
-                    },
-                },
-            },
+            Child = _contentGrid,
         };
-        _cardBorder.PointerEntered += (_, _) => SetHoverState(true);
-        _cardBorder.PointerExited += (_, _) => SetHoverState(false);
+        _cardBorder.PointerEntered += (_, _) =>
+        {
+            _bodyHovered = true;
+            SetHoverState(true);
+            UpdateCursor();
+        };
+        _cardBorder.PointerExited += (_, _) =>
+        {
+            _bodyHovered = false;
+            SetHoverState(false);
+            UpdateCursor();
+        };
+        _cardBorder.SizeChanged += (_, e) =>
+        {
+            // The legend may claim up to a third of the card before it scrolls; a fixed cap let
+            // a 16-core legend crowd the chart out of a short panel.
+            _legendScroller.MaxHeight = Math.Max(48, e.NewSize.Height * 0.3);
+        };
+
+        // In edit mode the whole card body is the move handle.
+        _cardBorder.PointerPressed += (_, e) => BeginGesturePointer(ResizeEdge.None, _cardBorder, e);
+        _cardBorder.PointerMoved += OnGesturePointerMoved;
+        _cardBorder.PointerReleased += OnGesturePointerReleased;
+        _cardBorder.PointerCaptureLost += OnGesturePointerCaptureLost;
+
+        PointerEntered += (_, _) => SetHandlesRevealed(_isLayoutEditMode);
+        PointerExited += (_, _) => SetHandlesRevealed(_isLayoutEditMode && _gesturePointerDown);
         EffectiveViewportChanged += OnEffectiveViewportChanged;
 
         // Handles live in an overlay above the card so they can be switched off entirely
@@ -576,127 +552,283 @@ public sealed class TelemetryPanelCard : UserControl
         _resizeHandleLayer = BuildResizeHandleLayer();
         Content = new Grid
         {
-            Children = { _cardBorder, _resizeHandleLayer },
+            Children = { _shadowHost, _cardBorder, _resizeHandleLayer },
         };
-        Loaded += (_, _) => RefreshFromPanel();
+        Loaded += (_, _) =>
+        {
+            // Re-attach on every load. The shell rebuilds the board by removing and re-adding the
+            // same cards, and Unloaded below has already let go of the view model - without this
+            // a rebuilt board kept rendering but its panels silently stopped updating.
+            if (!ReferenceEquals(_observedPanel, Panel))
+            {
+                DetachPanel(_observedPanel);
+                AttachPanel(Panel);
+            }
+
+            RefreshFromPanel();
+        };
 
         // Without this the card stays subscribed to its MetricPanelViewModel after the shell
         // drops it. The view models are permanent, so every toggled-off panel left an orphaned
         // card alive - still running RefreshFromPanel and rebuilding its chart on every scrape.
-        Unloaded += (_, _) => DetachPanel(Panel);
+        // WinUI can raise Unloaded after a remove-and-re-add in the same tick, by which point the
+        // card is back in the tree; only let go if it really left.
+        Unloaded += (_, _) =>
+        {
+            if (!IsLoaded)
+            {
+                DetachPanel(_observedPanel);
+            }
+        };
     }
 
     /// <summary>
     /// Edit mode gates every layout affordance. Outside it the handle layer is collapsed *and*
-    /// non-hit-testable, and the header drag is refused, so panels behave exactly as before this
-    /// feature existed — which is what keeps chart drag-to-zoom working after a layout is saved.
+    /// non-hit-testable and the card ignores presses, so panels behave exactly as before this
+    /// feature existed - which is what keeps chart drag-to-zoom working after a layout is saved.
     /// </summary>
     public void SetLayoutEditMode(bool editing)
     {
+        if (!editing)
+        {
+            AbortLayoutGesture();
+        }
+
         _isLayoutEditMode = editing;
         _resizeHandleLayer.Visibility = editing ? Visibility.Visible : Visibility.Collapsed;
         _resizeHandleLayer.IsHitTestVisible = editing;
+        SetHandlesRevealed(false);
 
-        _cardBorder.BorderBrush = editing
+        if (editing)
+        {
+            // Edit mode replaces hover; clear any hover lift the pointer left behind.
+            _cardBorder.Background = ResolveBrush("SurfaceBrush", "#1C1F22");
+            _cardBorder.Translation = System.Numerics.Vector3.Zero;
+        }
+
+        _cardBorder.BorderBrush = ResolveEditBorderBrush();
+
+        // In edit mode the whole card is one drag surface. Anything inside that reacts to the
+        // pointer - chart zoom, legend rows, the process list, the header chips - would steal
+        // the press and the panel would refuse to move.
+        _chart.IsHitTestVisible = !editing;
+        _legendScroller.IsHitTestVisible = !editing;
+        _processSection.IsHitTestVisible = !editing;
+        _rangeShell.IsHitTestVisible = !editing;
+        FadeTo(_rangeShell, editing ? 0d : 1d);
+        UpdateCursor();
+    }
+
+    private Brush ResolveEditBorderBrush() => _isFloating
+        ? ResolveBrush("AccentStrongBrush", "#9FEFFF")
+        : _isLayoutEditMode
             ? ResolveBrush("AccentBrush", "#79B8FF")
             : ResolveBrush("SurfaceStrokeBrush", "#2C3035");
 
-        // Charts must not react to the pointer while the board is being rearranged, or a drag
-        // that starts inside a plot would zoom instead of move the panel.
-        _chart.IsHitTestVisible = !editing;
-    }
-
-    // ---- Live resize preview -------------------------------------------------------------
+    // ---- Floating geometry ---------------------------------------------------------------
     //
-    // During a resize the card must not participate in grid layout. Re-spanning grid cells on
-    // every pointer move re-measures this card, its chart, and every sibling - which is what
-    // made resizing flicker and lurch. Instead the card is given an explicit pixel size and
-    // pinned to the top-left of its cell, so it grows over its neighbours without moving them.
-    // A cheap placeholder (owned by the shell) shows the snapped cell it will land in, and the
-    // real layout is committed exactly once, on release.
+    // During a gesture the shell spans this card across the whole board, pins it top-left and
+    // drives its real Width/Height and offset every frame. Real size, not a scale transform:
+    // scaling magnified the title, chips and chart like a zoom and re-rasterised all of it on
+    // every frame (28-76ms frames against 7ms idle). At real size the content simply reflows,
+    // the way a window's does while you drag its edge.
 
-    /// <summary>Smallest the card can render without clipping; must match PanelLayout.MinHeight * row unit.</summary>
-    private const double CardMinimumHeight = 320;
-    private const double CardMinimumWidth = 220;
-
-    private bool _resizePreviewActive;
-    private double _previewOriginWidth;
-    private double _previewOriginHeight;
-
-    /// <summary>Pixel size of the card as the drag begins, so the shell can offset from it.</summary>
-    public Windows.Foundation.Size BeginResizePreview()
+    /// <summary>Lifts the card above the board. <paramref name="lift"/> adds the pick-up scale used for moves.</summary>
+    public void BeginFloat(bool lift)
     {
-        _previewOriginWidth = ActualWidth;
-        _previewOriginHeight = ActualHeight;
-        _resizePreviewActive = true;
+        if (_isFloating)
+        {
+            return;
+        }
 
-        // Float above siblings and stop stretching, so an explicit size grows right/down from
-        // this cell's origin rather than being overridden by the grid.
-        Canvas.SetZIndex(this, 50);
+        _isFloating = true;
+        Canvas.SetZIndex(this, 100);
         HorizontalAlignment = HorizontalAlignment.Left;
         VerticalAlignment = VerticalAlignment.Top;
-        Width = _previewOriginWidth;
-        Height = _previewOriginHeight;
-
-        // A chart redrawing mid-gesture is wasted work and the most visible source of flicker.
-        _chart.SetRenderingSuspended(true);
-        _gauge.SetRenderingSuspended(true);
-
-        return new Windows.Foundation.Size(_previewOriginWidth, _previewOriginHeight);
+        _cardBorder.BorderBrush = ResolveEditBorderBrush();
+        AnimateLiftScale(lift ? LiftScale : 1d);
+        if (lift)
+        {
+            AnimateLiftShadow(lifted: true);
+        }
     }
 
-    /// <summary>
-    /// Continuous, un-snapped pixel feedback. The panel follows the pointer exactly; the snapped
-    /// destination is communicated by the placeholder instead. Snapping the card itself is what
-    /// made the gesture feel steppy.
-    /// </summary>
-    public void UpdateResizePreview(double width, double height, double offsetX, double offsetY)
+    /// <summary>Board-relative geometry for this frame. Width/Height are real layout sizes.</summary>
+    public void SetFloatGeometry(double x, double y, double width, double height)
     {
-        if (!_resizePreviewActive)
+        ApplyOffset(x, y);
+
+        // Written only when changed: an identical Width still invalidates measure.
+        if (!(Math.Abs(Width - width) < 0.01))
+        {
+            Width = width;
+        }
+
+        if (!(Math.Abs(Height - height) < 0.01))
+        {
+            Height = height;
+        }
+    }
+
+    /// <summary>Hands the card back to its grid cell. The shell assigns the cell first.</summary>
+    public void EndFloat()
+    {
+        if (!_isFloating)
         {
             return;
         }
 
-        // Width floor is a width, not half a height. The previous clamp used MinHeight / 2,
-        // which is the wrong axis entirely and imposed a ~160px floor that varied with preset.
-        Width = Math.Max(CardMinimumWidth, width);
-        Height = Math.Max(CardMinimumHeight, height);
-
-        // Left/top drags move the card as well as resize it; translation is composition-only.
-        _dragTranslate.X = offsetX;
-        _dragTranslate.Y = offsetY;
-    }
-
-    /// <summary>Hands the card back to the grid. The shell commits geometry immediately after.</summary>
-    public void EndResizePreview()
-    {
-        if (!_resizePreviewActive)
-        {
-            return;
-        }
-
-        _resizePreviewActive = false;
+        _isFloating = false;
         Width = double.NaN;
         Height = double.NaN;
         HorizontalAlignment = HorizontalAlignment.Stretch;
         VerticalAlignment = VerticalAlignment.Stretch;
-        _dragTranslate.X = 0;
-        _dragTranslate.Y = 0;
+        ApplyOffset(0, 0);
         Canvas.SetZIndex(this, 0);
+        _cardBorder.BorderBrush = ResolveEditBorderBrush();
+        AnimateLiftScale(1d);
+        AnimateLiftShadow(lifted: false);
+    }
 
-        _chart.SetRenderingSuspended(false);
-        _gauge.SetRenderingSuspended(false);
+    /// <summary>Displaces a sibling toward its preview cell. The shell animates the values.</summary>
+    public void SetReflowOffset(double x, double y) => ApplyOffset(x, y);
+
+    private void ApplyOffset(double x, double y)
+    {
+        if (x == _offsetX && y == _offsetY)
+        {
+            return;
+        }
+
+        _offsetX = x;
+        _offsetY = y;
+        Translation = new System.Numerics.Vector3((float)x, (float)y, 0f);
+    }
+
+    private const double LiftScale = 1.012;
+
+    private void AnimateLiftScale(double to)
+    {
+        if (!Motion.AnimationsEnabled)
+        {
+            _liftScale.ScaleX = to;
+            _liftScale.ScaleY = to;
+            return;
+        }
+
+        var storyboard = new Storyboard();
+        foreach (var axis in new[] { "ScaleX", "ScaleY" })
+        {
+            var animation = new DoubleAnimation
+            {
+                To = to,
+                Duration = new Duration(TimeSpan.FromMilliseconds(to > 1d ? MotionTokens.Quick : MotionTokens.Standard)),
+                EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
+            };
+            Storyboard.SetTarget(animation, _liftScale);
+            Storyboard.SetTargetProperty(animation, axis);
+            storyboard.Children.Add(animation);
+        }
+
+        storyboard.Begin();
+    }
+
+    private void AnimateLiftShadow(bool lifted)
+    {
+        try
+        {
+            var shadow = EnsureLiftShadow();
+            var compositor = shadow.Compositor;
+            if (lifted && _liftCaster is not null)
+            {
+                _liftCaster.IsVisible = true;
+            }
+
+            var animation = compositor.CreateScalarKeyFrameAnimation();
+            animation.InsertKeyFrame(1f, lifted ? (IsLightPaletteActive() ? 0.20f : 0.5f) : 0f);
+            animation.Duration = TimeSpan.FromMilliseconds(lifted ? MotionTokens.Quick : MotionTokens.Standard);
+
+            var batch = compositor.CreateScopedBatch(Microsoft.UI.Composition.CompositionBatchTypes.Animation);
+            shadow.StartAnimation("Opacity", animation);
+            batch.End();
+            batch.Completed += (_, _) =>
+            {
+                // A zero-opacity shadow still costs a blur pass; stop drawing it once it's gone.
+                if (!_isFloating && _liftCaster is not null)
+                {
+                    _liftCaster.IsVisible = false;
+                }
+            };
+        }
+        catch
+        {
+            // A shadow is decoration; it must never fail a gesture.
+        }
+    }
+
+    private Microsoft.UI.Composition.DropShadow EnsureLiftShadow()
+    {
+        if (_liftShadow is not null)
+        {
+            return _liftShadow;
+        }
+
+        var hostVisual = ElementCompositionPreview.GetElementVisual(_shadowHost);
+        var compositor = hostVisual.Compositor;
+        var shadow = compositor.CreateDropShadow();
+        shadow.BlurRadius = 36f;
+        shadow.Offset = new System.Numerics.Vector3(0f, 14f, 0f);
+        shadow.Color = Microsoft.UI.Colors.Black;
+        shadow.Opacity = 0f;
+
+        // The shadow is cast by a plain rectangle inset under the card's rounded corners, so the
+        // caster itself is always hidden behind the opaque card.
+        var caster = compositor.CreateSpriteVisual();
+        caster.Brush = compositor.CreateColorBrush(ResolveColor("SurfaceBrush", "#1C1F22"));
+        caster.RelativeSizeAdjustment = System.Numerics.Vector2.One;
+        caster.Size = new System.Numerics.Vector2(-8f, -8f);
+        caster.Offset = new System.Numerics.Vector3(4f, 4f, 0f);
+        caster.Shadow = shadow;
+        ElementCompositionPreview.SetElementChildVisual(_shadowHost, caster);
+
+        _liftShadow = shadow;
+        _liftCaster = caster;
+        return shadow;
+    }
+
+    private static void FadeTo(UIElement element, double to, double milliseconds = MotionTokens.Quick)
+    {
+        if (!Motion.AnimationsEnabled)
+        {
+            element.Opacity = to;
+            return;
+        }
+
+        var animation = new DoubleAnimation
+        {
+            To = to,
+            Duration = new Duration(TimeSpan.FromMilliseconds(milliseconds)),
+            EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
+        };
+        Storyboard.SetTarget(animation, element);
+        Storyboard.SetTargetProperty(animation, "Opacity");
+        var storyboard = new Storyboard();
+        storyboard.Children.Add(animation);
+        storyboard.Begin();
     }
 
     private Grid BuildResizeHandleLayer()
     {
-        const double edge = 8;    // grab thickness along an edge
-        const double corner = 16; // corner hotspot, larger because it is the common grab
+        const double edge = 10;   // grab thickness, centred on the card's outline
+        const double corner = 22; // corner hotspot, larger because it is the common grab
 
         var layer = new Grid
         {
             Visibility = Visibility.Collapsed,
             IsHitTestVisible = false,
+            // Straddle the outline like a window border: the grab zone sits where the eye says
+            // the edge is, half inside the card and half in the gutter.
+            Margin = new Thickness(-5),
         };
 
         // Edges are inset by the corner size so they never sit under a corner hotspot. Without
@@ -745,90 +877,299 @@ public sealed class TelemetryPanelCard : UserControl
         return layer;
     }
 
-    private const double CornerIdleOpacity = 0.32;
-    private const double CornerHoverOpacity = 0.95;
+    private const double CornerIdleOpacity = 0.9;
+    private const double EdgeIdleOpacity = 0.55;
+
+    private static readonly Dictionary<InputSystemCursorShape, InputSystemCursor> s_cursors = [];
 
     private static InputSystemCursorShape CursorFor(ResizeEdge edge) => edge switch
     {
         ResizeEdge.TopLeft or ResizeEdge.BottomRight => InputSystemCursorShape.SizeNorthwestSoutheast,
         ResizeEdge.TopRight or ResizeEdge.BottomLeft => InputSystemCursorShape.SizeNortheastSouthwest,
         ResizeEdge.Left or ResizeEdge.Right => InputSystemCursorShape.SizeWestEast,
-        _ => InputSystemCursorShape.SizeNorthSouth,
+        ResizeEdge.Top or ResizeEdge.Bottom => InputSystemCursorShape.SizeNorthSouth,
+        _ => InputSystemCursorShape.SizeAll,
     };
+
+    /// <summary>
+    /// One place decides the cursor, from state rather than from whichever enter/exit event
+    /// fired last. Moving from the body onto a handle raises the body's exit after the handle's
+    /// enter on some paths, which used to wipe the resize arrows the instant they appeared.
+    /// </summary>
+    private void UpdateCursor()
+    {
+        InputSystemCursorShape? shape = null;
+        if (_gesturePointerDown)
+        {
+            shape = CursorFor(_gestureEdge);
+        }
+        else if (_isLayoutEditMode && _hoveredHandleEdge is { } edge)
+        {
+            shape = CursorFor(edge);
+        }
+        else if (_isLayoutEditMode && _bodyHovered)
+        {
+            shape = InputSystemCursorShape.SizeAll;
+        }
+
+        try
+        {
+            if (shape is not { } value)
+            {
+                ProtectedCursor = null;
+                return;
+            }
+
+            if (!s_cursors.TryGetValue(value, out var cursor))
+            {
+                cursor = InputSystemCursor.Create(value);
+                s_cursors[value] = cursor;
+            }
+
+            ProtectedCursor = cursor;
+        }
+        catch
+        {
+            // Cursor changes are cosmetic.
+        }
+    }
+
+    /// <summary>
+    /// Grips appear on the panel under the pointer only. Eight always-visible grips on fourteen
+    /// panels was 112 marks of noise; the outline already says "editable", the grips say "here".
+    /// </summary>
+    private void SetHandlesRevealed(bool revealed)
+    {
+        if (_handlesRevealed == revealed)
+        {
+            return;
+        }
+
+        _handlesRevealed = revealed;
+        foreach (var (visual, edge) in _handleVisuals)
+        {
+            FadeTo(visual, revealed ? IdleOpacityFor(edge) : 0d, revealed ? MotionTokens.Quick : MotionTokens.Standard);
+        }
+    }
+
+    private static bool IsCorner(ResizeEdge edge) => edge is ResizeEdge.TopLeft or ResizeEdge.TopRight
+        or ResizeEdge.BottomLeft or ResizeEdge.BottomRight;
+
+    private static double IdleOpacityFor(ResizeEdge edge) => IsCorner(edge) ? CornerIdleOpacity : EdgeIdleOpacity;
 
     private Border CreateHandle(ResizeEdge edge)
     {
-        var isCorner = edge is ResizeEdge.TopLeft or ResizeEdge.TopRight
-            or ResizeEdge.BottomLeft or ResizeEdge.BottomRight;
-        var cursor = CursorFor(edge);
-
+        var isCorner = IsCorner(edge);
         var handle = new Border
         {
-            Background = BrushFactory.CreateBrush("#01000000"), // hit-testable, visually absent
+            Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent), // hit target only
         };
 
+        // The visible grip. Corners are L-brackets hugging the card's own rounded corner, so they
+        // read as "this corner is draggable" rather than as stray squares; edges are short pills
+        // centred on the outline.
+        Border grip;
         if (isCorner)
         {
-            handle.Background = ResolveBrush("AccentBrush", "#79B8FF");
-            handle.CornerRadius = new CornerRadius(2);
-            // Visible but quiet in edit mode. Invisible-until-hover hides the affordance: you
-            // have to already know the grip is there to discover it.
-            handle.Opacity = CornerIdleOpacity;
-            handle.Margin = new Thickness(3);
+            var left = edge.HasFlag(ResizeEdge.Left);
+            var top = edge.HasFlag(ResizeEdge.Top);
+            grip = new Border
+            {
+                Width = 14,
+                Height = 14,
+                HorizontalAlignment = left ? HorizontalAlignment.Left : HorizontalAlignment.Right,
+                VerticalAlignment = top ? VerticalAlignment.Top : VerticalAlignment.Bottom,
+                // The layer overhangs the card by 5px; this lands the bracket on the outline.
+                Margin = new Thickness(left ? 5 : 0, top ? 5 : 0, left ? 0 : 5, top ? 0 : 5),
+                BorderThickness = new Thickness(left ? 2.5 : 0, top ? 2.5 : 0, left ? 0 : 2.5, top ? 0 : 2.5),
+                CornerRadius = new CornerRadius(
+                    left && top ? 8 : 0,
+                    !left && top ? 8 : 0,
+                    !left && !top ? 8 : 0,
+                    left && !top ? 8 : 0),
+                BorderBrush = ResolveBrush("AccentStrongBrush", "#9FEFFF"),
+            };
         }
+        else
+        {
+            var vertical = edge is ResizeEdge.Left or ResizeEdge.Right;
+            grip = new Border
+            {
+                Width = vertical ? 4 : 32,
+                Height = vertical ? 32 : 4,
+                CornerRadius = new CornerRadius(2),
+                Background = ResolveBrush("AccentStrongBrush", "#9FEFFF"),
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center,
+            };
+        }
+
+        grip.IsHitTestVisible = false;
+        grip.Opacity = 0;
+        handle.Child = grip;
+        _handleVisuals.Add((grip, edge));
 
         handle.PointerEntered += (_, _) =>
         {
-            if (!_isLayoutEditMode) return;
-            if (isCorner) handle.Opacity = CornerHoverOpacity;
-            try { ProtectedCursor = InputSystemCursor.Create(cursor); } catch { }
+            if (!_isLayoutEditMode)
+            {
+                return;
+            }
+
+            _hoveredHandleEdge = edge;
+            SetHandlesRevealed(true);
+            FadeTo(grip, 1d, MotionTokens.Instant);
+            UpdateCursor();
         };
 
         handle.PointerExited += (_, _) =>
         {
-            if (_activeResizeEdge != ResizeEdge.None) return;
-            if (isCorner) handle.Opacity = CornerIdleOpacity;
-            try { ProtectedCursor = null; } catch { }
+            if (_hoveredHandleEdge == edge)
+            {
+                _hoveredHandleEdge = null;
+            }
+
+            if (!(_gesturePointerDown && _gestureEdge == edge))
+            {
+                FadeTo(grip, _handlesRevealed ? IdleOpacityFor(edge) : 0d);
+            }
+
+            UpdateCursor();
         };
 
-        handle.PointerPressed += (_, e) =>
-        {
-            if (!_isLayoutEditMode) return;
-            _activeResizeEdge = edge;
-            _resizeStart = e.GetCurrentPoint(this).Position;
-            handle.CapturePointer(e.Pointer);
-            PanelResizeStarted?.Invoke(this, new PanelResizeEventArgs(Panel?.PanelKey ?? string.Empty, edge, 0, 0));
-            e.Handled = true;
-        };
-
-        handle.PointerMoved += (_, e) =>
-        {
-            if (_activeResizeEdge != edge) return;
-            var point = e.GetCurrentPoint(this).Position;
-
-            // Deltas are absolute from pointer-down. The shell applies them to the geometry
-            // captured at drag start, never to the running value - adding an absolute delta to
-            // an already-updated size is what made resizing compound and glitch.
-            PanelResizeDelta?.Invoke(this, new PanelResizeEventArgs(
-                Panel?.PanelKey ?? string.Empty, edge, point.X - _resizeStart.X, point.Y - _resizeStart.Y));
-            e.Handled = true;
-        };
-
-        void EndResize(Microsoft.UI.Xaml.Input.PointerRoutedEventArgs e)
-        {
-            if (_activeResizeEdge != edge) return;
-            _activeResizeEdge = ResizeEdge.None;
-            if (isCorner) handle.Opacity = CornerIdleOpacity;
-            try { ProtectedCursor = null; } catch { }
-            handle.ReleasePointerCaptures();
-            PanelResizeCompleted?.Invoke(this, EventArgs.Empty);
-            e.Handled = true;
-        }
-
-        handle.PointerReleased += (_, e) => EndResize(e);
-        handle.PointerCaptureLost += (_, e) => EndResize(e);
+        handle.PointerPressed += (_, e) => BeginGesturePointer(edge, handle, e);
+        handle.PointerMoved += OnGesturePointerMoved;
+        handle.PointerReleased += OnGesturePointerReleased;
+        handle.PointerCaptureLost += OnGesturePointerCaptureLost;
 
         return handle;
+    }
+
+    // ---- Gesture input --------------------------------------------------------------------
+    //
+    // The card only reports pointer positions; the shell owns geometry, snapping and the board.
+    // Positions are read in window-content space, which stays still while the card moves.
+
+    private void BeginGesturePointer(ResizeEdge edge, UIElement source, PointerRoutedEventArgs e)
+    {
+        if (!_isLayoutEditMode || _gesturePointerDown || Panel is null || XamlRoot?.Content is not UIElement root)
+        {
+            return;
+        }
+
+        var point = e.GetCurrentPoint(root);
+        if (!point.Properties.IsLeftButtonPressed)
+        {
+            return;
+        }
+
+        // On touch and pen the board's ScrollViewer would otherwise claim the drag as a pan and
+        // take the pointer away mid-gesture.
+        CancelDirectManipulations();
+
+        if (source.CapturePointer(e.Pointer))
+        {
+            _gesturePointerDown = true;
+            _gestureActive = false;
+            _gestureEdge = edge;
+            _gesturePressPoint = point.Position;
+            _gestureCaptureElement = source;
+            UpdateCursor();
+        }
+
+        e.Handled = true;
+    }
+
+    private void OnGesturePointerMoved(object sender, PointerRoutedEventArgs e)
+    {
+        if (!_gesturePointerDown
+            || !ReferenceEquals(sender, _gestureCaptureElement)
+            || XamlRoot?.Content is not UIElement root)
+        {
+            return;
+        }
+
+        var position = e.GetCurrentPoint(root).Position;
+        if (!_gestureActive)
+        {
+            // A resize grip is an explicit grab and engages almost at once; a press on the body
+            // needs a little travel so an ordinary click never nudges a panel.
+            var threshold = _gestureEdge == ResizeEdge.None ? 5d : 2d;
+            var dx = position.X - _gesturePressPoint.X;
+            var dy = position.Y - _gesturePressPoint.Y;
+            if ((dx * dx) + (dy * dy) < threshold * threshold)
+            {
+                e.Handled = true;
+                return;
+            }
+
+            _gestureActive = true;
+            LayoutGestureStarted?.Invoke(this, new LayoutGestureEventArgs(_gestureEdge, _gesturePressPoint));
+        }
+
+        LayoutGestureMoved?.Invoke(this, new LayoutGestureEventArgs(_gestureEdge, position));
+        e.Handled = true;
+    }
+
+    private void OnGesturePointerReleased(object sender, PointerRoutedEventArgs e)
+    {
+        if (!ReferenceEquals(sender, _gestureCaptureElement))
+        {
+            return;
+        }
+
+        FinishGesturePointer(cancelled: false);
+        e.Handled = true;
+    }
+
+    private void OnGesturePointerCaptureLost(object sender, PointerRoutedEventArgs e)
+    {
+        if (!ReferenceEquals(sender, _gestureCaptureElement))
+        {
+            return;
+        }
+
+        // Capture lost without a release (Alt+Tab, a system prompt): put everything back
+        // rather than commit a layout the user never actually let go of.
+        FinishGesturePointer(cancelled: true);
+    }
+
+    private void FinishGesturePointer(bool cancelled)
+    {
+        if (!_gesturePointerDown)
+        {
+            return;
+        }
+
+        var wasActive = _gestureActive;
+        var element = _gestureCaptureElement;
+        _gesturePointerDown = false;
+        _gestureActive = false;
+        _gestureCaptureElement = null;
+        element?.ReleasePointerCaptures();
+        UpdateCursor();
+        SetHandlesRevealed(_isLayoutEditMode && (_bodyHovered || _hoveredHandleEdge is not null));
+
+        if (wasActive)
+        {
+            LayoutGestureEnded?.Invoke(this, new LayoutGestureEndedEventArgs(cancelled));
+        }
+    }
+
+    /// <summary>Drops the pointer interaction without raising events; the shell cancelled it.</summary>
+    public void AbortLayoutGesture()
+    {
+        if (!_gesturePointerDown)
+        {
+            return;
+        }
+
+        var element = _gestureCaptureElement;
+        _gesturePointerDown = false;
+        _gestureActive = false;
+        _gestureCaptureElement = null;
+        element?.ReleasePointerCaptures();
+        UpdateCursor();
     }
 
     public MetricPanelViewModel? Panel
@@ -844,6 +1185,7 @@ public sealed class TelemetryPanelCard : UserControl
         {
             control._processSectionExpanded = false;
             control._lastRenderedProcessRows = null;
+            control._thresholdLevel = 0;
         }
 
         control.DetachPanel(args.OldValue as MetricPanelViewModel);
@@ -856,6 +1198,8 @@ public sealed class TelemetryPanelCard : UserControl
         _observedPanel = panel;
         if (panel is not null)
         {
+            // Idempotent: a second attach must not double every refresh.
+            panel.PropertyChanged -= OnPanelPropertyChanged;
             panel.PropertyChanged += OnPanelPropertyChanged;
         }
     }
@@ -918,7 +1262,6 @@ public sealed class TelemetryPanelCard : UserControl
             _processRowParts.Clear();
             _processSection.Visibility = Visibility.Collapsed;
             _processSectionExpanded = false;
-            RefreshRangeButtons(null);
             RefreshProcessSortButtons(null);
             RefreshVisualMode(null);
             _lastRenderedSeries = null;
@@ -950,12 +1293,6 @@ public sealed class TelemetryPanelCard : UserControl
         _chart.EmptyStateText = panel.EmptyStateText;
         _scalePill.Visibility = string.IsNullOrWhiteSpace(panel.ScaleLabel) ? Visibility.Collapsed : Visibility.Visible;
 
-        if (_lastRenderedSizePreset != panel.SizePreset)
-        {
-            ApplySizePreset(panel.SizePreset);
-            _lastRenderedSizePreset = panel.SizePreset;
-        }
-
         if (!_isEffectivelyVisible)
         {
             ApplyPalette(panel);
@@ -984,20 +1321,14 @@ public sealed class TelemetryPanelCard : UserControl
         }
 
         _gauge.Value = panel.GaugeValue;
-        _gauge.AccentBrush = ResolveUtilizationBrush(panel);
+        UpdateThresholdLevel(panel);
+        _gauge.AccentBrush = ResolveThresholdBrush(panel);
         _gauge.Caption = panel.PrefersGaugeVisual ? "Capacity" : "Live";
 
         if (_processSectionExpanded && !ReferenceEquals(_lastRenderedProcessRows, panel.ProcessRows))
         {
             RefreshProcessRows(panel);
             _lastRenderedProcessRows = panel.ProcessRows;
-        }
-
-        if (_lastRenderedRange != panel.SelectedRange || _lastRenderedZoomState != panel.IsZoomed)
-        {
-            RefreshRangeButtons(panel);
-            _lastRenderedRange = panel.SelectedRange;
-            _lastRenderedZoomState = panel.IsZoomed;
         }
 
         if (_lastRenderedSortMode != panel.ProcessSortMode)
@@ -1076,6 +1407,9 @@ public sealed class TelemetryPanelCard : UserControl
         _processSection.Visibility = !resizing && Panel?.SupportsProcessTable == true && _processSectionExpanded
             ? Visibility.Visible
             : Visibility.Collapsed;
+        _processRow.Height = _processSection.Visibility == Visibility.Visible
+            ? new GridLength(1.2, GridUnitType.Star)
+            : GridLength.Auto;
     }
 
     private static bool IsPriorityPanelProperty(string? propertyName)
@@ -1095,12 +1429,25 @@ public sealed class TelemetryPanelCard : UserControl
         var cardBg = ResolveBrush("SurfaceBrush", "#1C1F22");
 
         _cardBorder.Background = cardBg;
-        _cardBorder.BorderBrush = strokeBrush;
-        _cardBorder.BorderThickness = new Thickness(0.9);
-        if (_isLayoutEditMode)
+        // Constant 1px. Every thickness change is a layout pass, and 0.9 here vs 1 elsewhere
+        // shifted the card's content by a fraction of a pixel on each theme change.
+        _cardBorder.BorderThickness = new Thickness(1);
+        _cardBorder.BorderBrush = ResolveEditBorderBrush();
+        if (_liftCaster is not null)
         {
-            // Re-assert the edit affordance; a theme refresh would otherwise reset it.
-            _cardBorder.BorderBrush = ResolveBrush("AccentBrush", "#79B8FF");
+            _liftCaster.Brush = _liftCaster.Compositor.CreateColorBrush(ResolveColor("SurfaceBrush", "#1C1F22"));
+        }
+
+        foreach (var (grip, edge) in _handleVisuals)
+        {
+            if (IsCorner(edge))
+            {
+                grip.BorderBrush = ResolveBrush("AccentStrongBrush", "#9FEFFF");
+            }
+            else
+            {
+                grip.Background = ResolveBrush("AccentStrongBrush", "#9FEFFF");
+            }
         }
 
         _cardBorder.Opacity = 1.0;
@@ -1119,13 +1466,10 @@ public sealed class TelemetryPanelCard : UserControl
 
         _badgeBorder.Background = ResolveBrush("SurfaceInsetBrush", "#091321");
 
-        _rangeButton.RefreshThemeResources();
-        _sizeButton.RefreshThemeResources();
         _processToggleButton.RefreshThemeResources();
         _sortHighestButton.RefreshThemeResources();
         _sortLowestButton.RefreshThemeResources();
         _sortNameButton.RefreshThemeResources();
-        _perProcessChartButton.RefreshThemeResources();
 
         var secondaryBrush = ResolveBrush("TextSecondaryBrush", "#B7CCE1");
         var primaryBrush = ResolveBrush("TextPrimaryBrush", "#F2F8FF");
@@ -1149,8 +1493,7 @@ public sealed class TelemetryPanelCard : UserControl
         {
             UpdateBadgeIcon(panel);
             ApplyPalette(panel);
-            // Re-apply range/sort button states so active highlights use new theme colors
-            RefreshRangeButtons(panel);
+            // Re-apply sort button states so active highlights use the new theme colors.
             RefreshProcessSortButtons(panel);
         }
         else
@@ -1199,7 +1542,11 @@ public sealed class TelemetryPanelCard : UserControl
             _legendHost.Children.Clear();
         }
 
-        var activeKeys = new HashSet<string>(panel.VisibleSeries.Select(series => series.Name), StringComparer.OrdinalIgnoreCase);
+        // Rows are keyed by series key, not display name. Two series can share a name (sensors
+        // from different hardware, or a renamed adapter in loaded history), and keying by name
+        // put the same row in the list twice - adding an element that already has a parent is
+        // a hard COMException (0x800F1000) in WinUI.
+        var activeKeys = new HashSet<string>(panel.VisibleSeries.Select(LegendKey), StringComparer.OrdinalIgnoreCase);
         foreach (var staleKey in _legendRows.Keys.Where(key => !activeKeys.Contains(key)).ToArray())
         {
             _legendHost.Children.Remove(_legendRows[staleKey].Row);
@@ -1207,17 +1554,24 @@ public sealed class TelemetryPanelCard : UserControl
         }
 
         var orderedRows = new List<UIElement>(panel.VisibleSeries.Count);
+        var seenKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         for (var index = 0; index < panel.VisibleSeries.Count; index++)
         {
             var series = panel.VisibleSeries[index];
+            var legendKey = LegendKey(series);
+            if (!seenKeys.Add(legendKey))
+            {
+                continue;
+            }
+
             var value = series.Points.Count == 0
                 ? "--"
                 : FormatValue(series.Points[^1].Value, panel.Unit);
 
-            if (!_legendRows.TryGetValue(series.Name, out var rowParts))
+            if (!_legendRows.TryGetValue(legendKey, out var rowParts))
             {
                 rowParts = CreateLegendRow(series.Name, series.StrokeBrush);
-                _legendRows.Add(series.Name, rowParts);
+                _legendRows.Add(legendKey, rowParts);
                 _legendHost.Children.Add(rowParts.Row);
 
                 // Click legend row to isolate/focus that series on the chart
@@ -1245,6 +1599,9 @@ public sealed class TelemetryPanelCard : UserControl
         }
     }
 
+    private static string LegendKey(ChartSeriesViewModel series)
+        => string.IsNullOrEmpty(series.Key) ? series.Name : series.Key;
+
     private void RefreshProcessRows(MetricPanelViewModel panel)
     {
         if (!panel.SupportsProcessTable)
@@ -1265,9 +1622,13 @@ public sealed class TelemetryPanelCard : UserControl
             return;
         }
 
+        // One row per key. A repeated key would add the same element twice (a WinUI
+        // COMException) on the fast path, or throw a duplicate-key exception on the slow one.
+        var seenRowKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var rows = panel.ProcessRows.Where(row => seenRowKeys.Add(row.Key)).ToList();
+
         // Fast path: if all rows already exist as UI elements, just reorder + update in-place.
         // Skip fast path if a pin state changed (need full rebuild for bold/dot visuals).
-        var rows = panel.ProcessRows;
         var forceRebuild = panel._forceProcessRowRebuild;
         if (forceRebuild) panel._forceProcessRowRebuild = false; // consume the flag
         var allExist = !forceRebuild && rows.Count <= _processRowParts.Count;
@@ -1371,7 +1732,7 @@ public sealed class TelemetryPanelCard : UserControl
     private void RefreshVisualMode(MetricPanelViewModel? panel)
     {
         var showGauge = panel?.PrefersGaugeVisual == true;
-        _gauge.Visibility = showGauge ? Visibility.Visible : Visibility.Collapsed;
+        _gaugeHost.Visibility = showGauge ? Visibility.Visible : Visibility.Collapsed;
         Grid.SetColumn(_chartFrame, showGauge ? 1 : 0);
         Grid.SetColumnSpan(_chartFrame, showGauge ? 1 : 2);
         _legendScroller.Visibility = panel?.SupportsProcessTable == true ? Visibility.Collapsed : Visibility.Visible;
@@ -1383,6 +1744,12 @@ public sealed class TelemetryPanelCard : UserControl
         _processSection.Visibility = supportsProcesses && _processSectionExpanded
             ? Visibility.Visible
             : Visibility.Collapsed;
+
+        // Expanded, the list shares the card's height with the chart instead of growing the
+        // card past its grid span; collapsed, the row takes nothing.
+        _processRow.Height = _processSection.Visibility == Visibility.Visible
+            ? new GridLength(1.2, GridUnitType.Star)
+            : GridLength.Auto;
     }
 
     private void OnProcessSectionToggleClick(object? sender, EventArgs e)
@@ -1400,20 +1767,11 @@ public sealed class TelemetryPanelCard : UserControl
         }
 
         RefreshVisualMode(Panel);
-    }
-
-    private void RefreshRangeButtons(MetricPanelViewModel? panel)
-    {
-        var selected = panel?.SelectedRange ?? TimeRangePreset.FifteenMinutes;
-        var isZoomed = panel?.IsZoomed == true;
-        var choice = RangeChoices.FirstOrDefault(item => item.Preset == selected);
-        _rangeButton.Text = isZoomed ? "Zoomed" : choice.ShortLabel ?? "15m";
-        _rangeButton.IsActive = panel is not null && !isZoomed;
-        _rangeButton.IsFilled = panel is not null && !isZoomed;
-
-        foreach (var item in _rangeMenuChecks)
+        if (_processSectionExpanded && Motion.AnimationsEnabled)
         {
-            item.Value.Opacity = !isZoomed && item.Key == selected ? 1 : 0;
+            // The list arrives rather than pops in; the chart's row resizes underneath it.
+            _processSection.Opacity = 0;
+            FadeTo(_processSection, 1d, MotionTokens.Standard);
         }
     }
 
@@ -1433,26 +1791,6 @@ public sealed class TelemetryPanelCard : UserControl
         control.Opacity = isActive ? 1 : 0.76;
     }
 
-    private static MenuFlyoutItem CreateCheckedMenuItem(
-        object tag,
-        string text,
-        RoutedEventHandler clickHandler,
-        out SymbolIcon check)
-    {
-        check = new SymbolIcon(Symbol.Accept) { Opacity = 0 };
-        var item = new MenuFlyoutItem
-        {
-            Tag = tag,
-            Text = text,
-            Icon = check,
-            MinHeight = 36,
-            Padding = new Thickness(12, 0, 16, 0),
-            FontSize = 13,
-        };
-        item.Click += clickHandler;
-        return item;
-    }
-
     private void ApplyPalette(MetricPanelViewModel panel)
     {
         _badgeBorder.Background = ResolveBrush("SurfaceInsetBrush", "#091321");
@@ -1462,45 +1800,70 @@ public sealed class TelemetryPanelCard : UserControl
         _secondaryValueText.Foreground = ResolveBrush("TextSecondaryBrush", "#B7CCE1");
         _processSectionTitleText.Foreground = ResolveBrush("TextSecondaryBrush", "#B7CCE1");
 
-        // Color-code current value, badge, and edge glow based on utilization thresholds
-        var thresholdBrush = ResolveUtilizationBrush(panel);
-        _badgeBorder.BorderBrush = thresholdBrush;
-        _edgeGlow.Background = thresholdBrush;
-
-        var util = panel.UtilizationPercent;
-        if (util > 90)
+        // Colour-code the value and badge by threshold state.
+        var level = UpdateThresholdLevel(panel);
+        _badgeBorder.BorderBrush = ResolveThresholdBrush(panel);
+        _currentValueText.Foreground = level switch
         {
-            _currentValueText.Foreground = ResolveBrush("CriticalBrush", "#FF9761");
-        }
-        else if (util > 75)
-        {
-            _currentValueText.Foreground = ResolveBrush("WarningBrush", "#F0C968");
-        }
-        else
-        {
-            _currentValueText.Foreground = ResolveBrush("TextPrimaryBrush", "#F2F8FF"); // default
-        }
+            2 => ResolveBrush("CriticalBrush", "#FF9761"),
+            1 => ResolveBrush("WarningBrush", "#F0C968"),
+            _ => ResolveBrush("TextPrimaryBrush", "#F2F8FF"),
+        };
     }
 
-    // Cached threshold brushes — avoids allocating new brushes on every utilization update
-    private static Brush ResolveUtilizationBrush(MetricPanelViewModel panel)
+    private const double ThresholdHysteresis = 2d;
+    private int _thresholdLevel;
+
+    /// <summary>
+    /// Normal (0), warning (1) or critical (2), with hysteresis: rising crosses at the threshold,
+    /// falling must clear it by a margin. A reading hovering at 74.8/75.2 used to flip the
+    /// colour on every sample. Temperatures have their own thresholds - previously none at all,
+    /// so the hottest readings in the app were the only ones that never turned amber or red.
+    /// </summary>
+    private int UpdateThresholdLevel(MetricPanelViewModel panel)
     {
-        if (panel.UtilizationPercent <= 0 || panel.Unit != MetricUnit.Percent)
+        var (value, warning, critical) = panel.Unit == MetricUnit.Celsius
+            ? (HottestReading(panel), 80d, 90d)
+            : (panel.UtilizationPercent, 75d, 90d);
+
+        _thresholdLevel = value > critical ? 2
+            : _thresholdLevel == 2 && value > critical - ThresholdHysteresis ? 2
+            : value > warning ? 1
+            : _thresholdLevel >= 1 && value > warning - ThresholdHysteresis ? 1
+            : 0;
+        return _thresholdLevel;
+    }
+
+    private static double HottestReading(MetricPanelViewModel panel)
+    {
+        var hottest = 0d;
+        foreach (var series in panel.VisibleSeries)
+        {
+            if (series.Points.Count > 0)
+            {
+                hottest = Math.Max(hottest, series.Points[^1].Value);
+            }
+        }
+
+        return hottest;
+    }
+
+    /// <summary>Badge and gauge accent: threshold colour for load and heat, the panel accent otherwise.</summary>
+    private Brush ResolveThresholdBrush(MetricPanelViewModel panel)
+    {
+        var applies = panel.Unit == MetricUnit.Celsius
+            || (panel.Unit == MetricUnit.Percent && panel.UtilizationPercent > 0);
+        if (!applies)
         {
             return panel.AccentBrush;
         }
 
-        if (panel.UtilizationPercent > 90)
+        return _thresholdLevel switch
         {
-            return ResolveBrush("CriticalBrush", "#FF9761");
-        }
-
-        if (panel.UtilizationPercent > 75)
-        {
-            return ResolveBrush("WarningBrush", "#F0C968");
-        }
-
-        return panel.AccentBrush;
+            2 => ResolveBrush("CriticalBrush", "#FF9761"),
+            1 => ResolveBrush("WarningBrush", "#F0C968"),
+            _ => panel.AccentBrush,
+        };
     }
 
     private void SetHoverState(bool isHovered)
@@ -1508,7 +1871,7 @@ public sealed class TelemetryPanelCard : UserControl
         // In edit mode the accent border IS the affordance saying "this panel is draggable".
         // Letting hover overwrite it meant the signal vanished the moment you moved the pointer
         // toward a panel to grab it.
-        if (_isHeaderDragActive || _isLayoutEditMode)
+        if (_isFloating || _isLayoutEditMode)
         {
             return;
         }
@@ -1540,223 +1903,6 @@ public sealed class TelemetryPanelCard : UserControl
 
         button.Click += OnProcessSortClick;
         return button;
-    }
-
-    private void OnHeaderPointerPressed(object sender, PointerRoutedEventArgs e)
-    {
-        // Moving panels is an edit-mode action. Outside it the header is inert so clicks fall
-        // through to the chips and the chart behaves normally.
-        if (!_isLayoutEditMode)
-        {
-            return;
-        }
-
-        if (Panel is null || IsInteractiveHeaderElement(e.OriginalSource as DependencyObject))
-        {
-            return;
-        }
-
-        if (!e.GetCurrentPoint(null).Properties.IsLeftButtonPressed)
-        {
-            return;
-        }
-
-        _isHeaderPointerDown = true;
-        _isHeaderDragActive = false;
-
-        if (XamlRoot?.Content is UIElement root)
-        {
-            _dragMouseStart = e.GetCurrentPoint(root).Position;
-        }
-
-        this.CancelDirectManipulations();
-        FindAncestor<ScrollViewer>(this)?.CancelDirectManipulations();
-        if (sender is UIElement senderElement)
-        {
-            senderElement.CapturePointer(e.Pointer);
-        }
-
-        e.Handled = true;
-    }
-
-    // TEMPORARY probe hook: replays the exact pointer semantics of the real handlers.
-    internal void ProbePointer(int phase, ResizeEdge edge, Windows.Foundation.Point windowPoint)
-    {
-        if (edge == ResizeEdge.None)
-        {
-            if (phase == 0)
-            {
-                _isHeaderPointerDown = true;
-                _isHeaderDragActive = false;
-                _dragMouseStart = windowPoint;
-            }
-            else if (phase == 1)
-            {
-                HandleHeaderMove(windowPoint);
-            }
-            else
-            {
-                EndHeaderDragInteraction();
-            }
-
-            return;
-        }
-
-        // GetCurrentPoint(this): the pointer in this element's own space, render transform included.
-        var local = TransformToVisual(null).Inverse.TransformPoint(windowPoint);
-        if (phase == 0)
-        {
-            _activeResizeEdge = edge;
-            _resizeStart = local;
-            PanelResizeStarted?.Invoke(this, new PanelResizeEventArgs(Panel?.PanelKey ?? string.Empty, edge, 0, 0));
-        }
-        else if (phase == 1)
-        {
-            PanelResizeDelta?.Invoke(this, new PanelResizeEventArgs(
-                Panel?.PanelKey ?? string.Empty, edge, local.X - _resizeStart.X, local.Y - _resizeStart.Y));
-        }
-        else
-        {
-            _activeResizeEdge = ResizeEdge.None;
-            PanelResizeCompleted?.Invoke(this, EventArgs.Empty);
-        }
-    }
-
-    private void OnHeaderPointerMoved(object sender, PointerRoutedEventArgs e)
-    {
-        if (!_isHeaderPointerDown || XamlRoot?.Content is not UIElement root)
-        {
-            return;
-        }
-
-        HandleHeaderMove(e.GetCurrentPoint(root).Position);
-        e.Handled = true;
-    }
-
-    private void HandleHeaderMove(Windows.Foundation.Point rootPoint)
-    {
-
-        if (!_isHeaderDragActive)
-        {
-            var dx = rootPoint.X - _dragMouseStart.X;
-            var dy = rootPoint.Y - _dragMouseStart.Y;
-            if ((dx * dx) + (dy * dy) < 64d)
-            {
-                return;
-            }
-
-            _isHeaderDragActive = true;
-
-            _cardBorder.BorderBrush = ResolveBrush("AccentStrongBrush", "#9FEFFF");
-            _cardBorder.BorderThickness = new Thickness(2);
-            _cardBorder.Background = ResolveBrush("SurfaceElevatedBrush", "#222529");
-            _cardBorder.Opacity = 0.92;
-            _cardBorder.Translation = new System.Numerics.Vector3(0f, -2f, 0f);
-            ProtectedCursor = InputSystemCursor.Create(InputSystemCursorShape.SizeAll);
-            Canvas.SetZIndex(this, 50);
-        }
-
-        // Pure mouse delta — card moves exactly with the mouse, no feedback loops
-        _dragTranslate.X = rootPoint.X - _dragMouseStart.X;
-        _dragTranslate.Y = rootPoint.Y - _dragMouseStart.Y;
-
-        PanelDragMoved?.Invoke(this, new PanelResizeEventArgs(
-            Panel?.PanelKey ?? string.Empty,
-            ResizeEdge.None,
-            _dragTranslate.X,
-            _dragTranslate.Y));
-
-        // The swap-on-proximity preview used to live here. It highlighted whichever neighbour
-        // the pointer came near, implying "I will swap with this" - but dragging is edit-mode
-        // only now, and the shell discards reorder requests in edit mode, so the swap never
-        // happened. Two drop previews disagreed and the louder one was wrong. The placeholder
-        // rectangle is the single authoritative answer.
-    }
-
-    private void OnHeaderPointerReleased(object sender, PointerRoutedEventArgs e)
-    {
-        if (!_isHeaderPointerDown)
-        {
-            return;
-        }
-
-        EndHeaderDragInteraction();
-        if (sender is UIElement senderElement)
-        {
-            senderElement.ReleasePointerCaptures();
-        }
-
-        e.Handled = true;
-    }
-
-    private void OnHeaderPointerCaptureLost(object sender, PointerRoutedEventArgs e)
-    {
-        if (_isHeaderPointerDown)
-        {
-            EndHeaderDragInteraction();
-        }
-    }
-
-    private void OnRangeClick(object sender, RoutedEventArgs e)
-    {
-        if (sender is not MenuFlyoutItem { Tag: TimeRangePreset preset })
-        {
-            return;
-        }
-
-        if (RangePresetRequested is not null)
-        {
-            RangePresetRequested.Invoke(this, new TimeRangePresetRequestedEventArgs(preset));
-            return;
-        }
-
-        Panel?.ApplyRangePreset(preset);
-    }
-
-    private void OnPanelSizeClick(object sender, RoutedEventArgs e)
-    {
-        if (sender is not MenuFlyoutItem { Tag: PanelSizePreset preset } ||
-            Panel is null ||
-            !Enum.IsDefined(typeof(PanelSizePreset), preset) ||
-            preset == Panel.SizePreset)
-        {
-            return;
-        }
-
-        PanelSizePresetRequested?.Invoke(this, new PanelSizePresetRequestedEventArgs(Panel.PanelKey, preset));
-    }
-
-    private void ApplySizePreset(PanelSizePreset preset)
-    {
-        var (chartHeight, minCardHeight) = preset switch
-        {
-            PanelSizePreset.Compact => (136d, 280d),
-            PanelSizePreset.Wide => (184d, 328d),
-            PanelSizePreset.Large => (248d, 392d),
-            _ => (176d, 320d),
-        };
-
-        // Card MinHeight is deliberately NOT set per preset any more. The grid owns height, and
-        // a preset-specific floor of 280-392px silently exceeded what the grid reserved for the
-        // panel - which is how a resized panel ended up overlapping its neighbour.
-        _ = minCardHeight;
-        _chart.Height = chartHeight;
-        _chart.MinHeight = chartHeight;
-        _sizeButton.IsActive = preset != PanelSizePreset.Standard;
-        _sizeButton.IsFilled = preset != PanelSizePreset.Standard;
-        foreach (var (choice, check) in _sizeMenuChecks)
-        {
-            check.Opacity = choice == preset ? 1 : 0;
-        }
-    }
-
-    private void OnPerProcessChartToggle(object? sender, EventArgs e)
-    {
-        if (Panel is { } panel)
-        {
-            panel.PerProcessChartsEnabled = !panel.PerProcessChartsEnabled;
-            _perProcessChartButton.IsActive = panel.PerProcessChartsEnabled;
-        }
     }
 
     private void OnProcessSortClick(object? sender, EventArgs e)
@@ -1805,143 +1951,6 @@ public sealed class TelemetryPanelCard : UserControl
         Panel?.ResetZoom();
     }
 
-    public void PlaySwapSettleAnimation()
-    {
-        // Quick opacity pulse — card briefly dims then returns, indicating it just moved
-        var ease = new QuadraticEase { EasingMode = EasingMode.EaseOut };
-        var fadeOut = new DoubleAnimation
-        {
-            From = 0.6,
-            To = 1.0,
-            Duration = new Duration(TimeSpan.FromMilliseconds(200)),
-            EasingFunction = ease,
-        };
-
-        Storyboard.SetTarget(fadeOut, _cardBorder);
-        Storyboard.SetTargetProperty(fadeOut, "Opacity");
-        var sb = new Storyboard();
-        sb.Children.Add(fadeOut);
-        sb.Begin();
-    }
-
-    private void EndHeaderDragInteraction()
-    {
-        var wasDragging = _isHeaderDragActive;
-        _isHeaderPointerDown = false;
-        _isHeaderDragActive = false;
-
-        if (wasDragging)
-        {
-            ProtectedCursor = null;
-            _cardBorder.BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#2C3035");
-            _cardBorder.BorderThickness = new Thickness(1);
-            _cardBorder.Background = ResolveBrush("SurfaceBrush", "#1C1F22");
-            _cardBorder.Opacity = 1.0;
-            _cardBorder.Translation = new System.Numerics.Vector3(0f, 0f, 0f);
-
-            // Finalize grid position and clear translate instantly — no swoop
-            PanelDragEnded?.Invoke(this, EventArgs.Empty);
-            _dragTranslate.X = 0;
-            _dragTranslate.Y = 0;
-
-            // Settle, not a flash. The old confirmation faded the card up from 0.7 opacity, which
-            // read as the panel blinking rather than landing. A small scale release reads as the
-            // card seating into its new cell, and runs on the render transform so the freshly
-            // reflowed grid is never re-measured.
-            var storyboard = new Storyboard();
-            foreach (var axis in new[] { "ScaleX", "ScaleY" })
-            {
-                var settle = new DoubleAnimation
-                {
-                    From = 1.025,
-                    To = 1.0,
-                    Duration = new Duration(TimeSpan.FromMilliseconds(170)),
-                    EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
-                };
-                Storyboard.SetTarget(settle, _dropSettleScale);
-                Storyboard.SetTargetProperty(settle, axis);
-                storyboard.Children.Add(settle);
-            }
-            storyboard.Completed += (_, _) => Canvas.SetZIndex(this, 0);
-            storyboard.Begin();
-        }
-        else
-        {
-            _dragTranslate.X = 0;
-            _dragTranslate.Y = 0;
-        }
-    }
-
-    private static bool IsInteractiveHeaderElement(DependencyObject? source)
-    {
-        while (source is not null)
-        {
-            if (source is ActionChip)
-            {
-                return true;
-            }
-
-            source = VisualTreeHelper.GetParent(source);
-        }
-
-        return false;
-    }
-
-    private static T? FindAncestor<T>(DependencyObject? source)
-        where T : class
-    {
-        while (source is not null)
-        {
-            if (source is T match)
-            {
-                return match;
-            }
-
-            source = VisualTreeHelper.GetParent(source);
-        }
-
-        return null;
-    }
-
-    private static IEnumerable<TelemetryPanelCard> EnumeratePanelCards(DependencyObject root)
-    {
-        var childCount = VisualTreeHelper.GetChildrenCount(root);
-        for (var index = 0; index < childCount; index++)
-        {
-            var child = VisualTreeHelper.GetChild(root, index);
-            if (child is TelemetryPanelCard panelCard)
-            {
-                yield return panelCard;
-            }
-
-            foreach (var nested in EnumeratePanelCards(child))
-            {
-                yield return nested;
-            }
-        }
-    }
-
-    private static bool TryGetBounds(FrameworkElement element, UIElement root, out Windows.Foundation.Rect bounds)
-    {
-        bounds = default;
-        if (element.ActualWidth <= 0 || element.ActualHeight <= 0)
-        {
-            return false;
-        }
-
-        try
-        {
-            var transform = element.TransformToVisual(root);
-            var topLeft = transform.TransformPoint(new Windows.Foundation.Point(0, 0));
-            bounds = new Windows.Foundation.Rect(topLeft.X, topLeft.Y, element.ActualWidth, element.ActualHeight);
-            return true;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
     private static (ClickableBorder Row, Border InnerBorder, TextBlock NameText, TextBlock ValueText, Ellipse Dot) CreateLegendRow(string name, Brush strokeBrush)
     {
         var row = new Grid();
@@ -1960,7 +1969,7 @@ public sealed class TelemetryPanelCard : UserControl
 
         var nameText = new TextBlock
         {
-            FontSize = 11,
+            FontSize = 12,
             Foreground = ResolveBrush("TextSecondaryBrush", "#B7CCE1"),
             Text = name,
             TextTrimming = TextTrimming.CharacterEllipsis,
@@ -1968,16 +1977,18 @@ public sealed class TelemetryPanelCard : UserControl
         row.Children.Add(nameText);
         Grid.SetColumn(nameText, 1);
 
+        // Same family as the headline, tabular. Bahnschrift here made two numeral styles in one card.
         var valueText = new TextBlock
         {
-            FontFamily = new FontFamily("Bahnschrift"),
-            FontSize = 11,
+            FontFamily = new FontFamily("Segoe UI Variable Text"),
+            FontSize = 12,
             FontWeight = FontWeights.SemiBold,
             Foreground = ResolveBrush("TextPrimaryBrush", "#F2F8FF"),
             Text = "--",
             MinWidth = 42,
             TextAlignment = TextAlignment.Right,
         };
+        UseTabularFigures(valueText);
         row.Children.Add(valueText);
         Grid.SetColumn(valueText, 2);
 
@@ -2015,7 +2026,7 @@ public sealed class TelemetryPanelCard : UserControl
         var nameContent = (FrameworkElement)new TextBlock
         {
             FontFamily = new FontFamily("Segoe UI Variable Text"),
-            FontSize = 11.5,
+            FontSize = 12,
             Foreground = ResolveBrush("TextPrimaryBrush", "#F2F8FF"),
             Text = item.Name,
             TextTrimming = TextTrimming.CharacterEllipsis,
@@ -2050,7 +2061,7 @@ public sealed class TelemetryPanelCard : UserControl
         var captionText = new TextBlock
         {
             FontFamily = new FontFamily("Segoe UI Variable Text"),
-            FontSize = 9.5,
+            FontSize = 11,
             Foreground = ResolveBrush("TextMutedBrush", "#7D9AB6"),
             Text = item.Caption,
             TextTrimming = TextTrimming.CharacterEllipsis,
@@ -2060,8 +2071,8 @@ public sealed class TelemetryPanelCard : UserControl
 
         var valueText = new TextBlock
         {
-            FontFamily = new FontFamily("Bahnschrift"),
-            FontSize = 11.5,
+            FontFamily = new FontFamily("Segoe UI Variable Text"),
+            FontSize = 12,
             FontWeight = FontWeights.SemiBold,
             Foreground = ResolveBrush("TextPrimaryBrush", "#F2F8FF"),
             Text = item.Value,
@@ -2070,6 +2081,7 @@ public sealed class TelemetryPanelCard : UserControl
             MinWidth = 46,
             TextAlignment = TextAlignment.Right,
         };
+        UseTabularFigures(valueText);
 
         // Table row: Name | Caption | Value
         var rowGrid = new Grid
@@ -2185,10 +2197,13 @@ public sealed class TelemetryPanelCard : UserControl
             TextWrapping = TextWrapping.WrapWholeWords,
         };
 
+    private static void UseTabularFigures(TextBlock text)
+        => Microsoft.UI.Xaml.Documents.Typography.SetNumeralAlignment(text, FontNumeralAlignment.Tabular);
+
     private static TextBlock CreateEmptyText(string text) =>
         new()
         {
-            FontSize = 11,
+            FontSize = 12,
             Foreground = ResolveBrush("TextMutedBrush", "#7D9AB6"),
             Text = text,
         };
@@ -2216,51 +2231,16 @@ public sealed class TelemetryPanelCard : UserControl
 
 }
 
-public sealed class TimeRangePresetRequestedEventArgs : EventArgs
+/// <summary>A layout gesture's pointer position, in window-content coordinates.</summary>
+public sealed class LayoutGestureEventArgs(TelemetryPanelCard.ResizeEdge edge, Windows.Foundation.Point point) : EventArgs
 {
-    public TimeRangePresetRequestedEventArgs(TimeRangePreset preset)
-    {
-        Preset = preset;
-    }
-
-    public TimeRangePreset Preset { get; }
-}
-
-public sealed class PanelReorderRequestedEventArgs : EventArgs
-{
-    public PanelReorderRequestedEventArgs(string sourcePanelKey, string targetPanelKey)
-    {
-        SourcePanelKey = sourcePanelKey;
-        TargetPanelKey = targetPanelKey;
-    }
-
-    public string SourcePanelKey { get; }
-
-    public string TargetPanelKey { get; }
-}
-
-public sealed class PanelSizePresetRequestedEventArgs : EventArgs
-{
-    public PanelSizePresetRequestedEventArgs(string panelKey, PanelSizePreset preset)
-    {
-        PanelKey = panelKey;
-        Preset = preset;
-    }
-
-    public string PanelKey { get; }
-
-    public PanelSizePreset Preset { get; }
-}
-
-/// <summary>Pixel deltas from a resize-handle drag; the shell converts them to grid units.</summary>
-public sealed class PanelResizeEventArgs(
-    string panelKey,
-    TelemetryPanelCard.ResizeEdge edge,
-    double deltaX,
-    double deltaY) : EventArgs
-{
-    public string PanelKey { get; } = panelKey;
+    /// <summary>The edges being dragged; <see cref="TelemetryPanelCard.ResizeEdge.None"/> for a move.</summary>
     public TelemetryPanelCard.ResizeEdge Edge { get; } = edge;
-    public double DeltaX { get; } = deltaX;
-    public double DeltaY { get; } = deltaY;
+
+    public Windows.Foundation.Point Point { get; } = point;
+}
+
+public sealed class LayoutGestureEndedEventArgs(bool cancelled) : EventArgs
+{
+    public bool Cancelled { get; } = cancelled;
 }

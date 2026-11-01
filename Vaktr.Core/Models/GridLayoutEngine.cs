@@ -53,12 +53,52 @@ public static class GridLayoutEngine
     }
 
     /// <summary>
+    /// Creates a collision-free display layout for a responsive breakpoint without changing
+    /// persisted geometry. Narrow windows widen cards to the breakpoint minimum, which can make
+    /// previously side-by-side panels overlap; resolve those collisions before assigning them to
+    /// the visual grid.
+    /// </summary>
+    public static List<PanelPlacement> ResolveResponsive(IEnumerable<PanelPlacement> panels, int minimumWidth)
+    {
+        minimumWidth = Math.Clamp(minimumWidth, PanelLayout.MinWidth, PanelLayout.Columns);
+        var responsive = panels
+            .Select(panel =>
+            {
+                var layout = panel.Layout.Clone();
+                layout.W = Math.Max(layout.W, minimumWidth);
+                return new PanelPlacement(panel.Key, layout.Normalize());
+            })
+            .OrderBy(panel => panel.Layout.Y)
+            .ThenBy(panel => panel.Layout.X)
+            .ToList();
+
+        // Preserve deliberate vertical gaps in the saved layout. Only push a panel down when
+        // widening at this breakpoint makes it collide with a panel already placed.
+        var placed = new List<PanelPlacement>(responsive.Count);
+        foreach (var panel in responsive)
+        {
+            while (placed.FirstOrDefault(other => other.Layout.Overlaps(panel.Layout)) is { } blocker)
+            {
+                panel.Layout.Y = blocker.Layout.Bottom;
+            }
+
+            placed.Add(panel);
+        }
+
+        return placed;
+    }
+
+    /// <summary>
     /// Pulls every panel as far up as it will go, preserving relative order. Without this, moving
     /// a panel out of the top row would leave a permanent hole.
     /// </summary>
-    private static void Compact(List<PanelPlacement> placed)
+    private static void Compact(List<PanelPlacement> placed, PanelPlacement? pinned = null)
     {
-        foreach (var panel in placed.OrderBy(p => p.Layout.Y).ThenBy(p => p.Layout.X).ToList())
+        foreach (var panel in placed
+            .Where(panel => !ReferenceEquals(panel, pinned))
+            .OrderBy(panel => panel.Layout.Y)
+            .ThenBy(panel => panel.Layout.X)
+            .ToList())
         {
             while (panel.Layout.Y > 0)
             {
@@ -122,6 +162,54 @@ public static class GridLayoutEngine
         return ResolveWithPriority(list, moving);
     }
 
+    /// <summary>
+    /// Applies snapped edge deltas to one panel while keeping the opposite edge anchored.
+    /// Responsive minimum width is supplied by the display breakpoint; persisted geometry stays
+    /// at its own width until the caller commits the returned target.
+    /// </summary>
+    public static PanelLayout ResizeByDelta(
+        PanelLayout origin,
+        bool left,
+        bool right,
+        bool top,
+        bool bottom,
+        int deltaColumns,
+        int deltaRows,
+        int minimumWidth = PanelLayout.MinWidth)
+    {
+        origin = origin.Clone().Normalize();
+        minimumWidth = Math.Clamp(minimumWidth, PanelLayout.MinWidth, PanelLayout.Columns);
+
+        var x = origin.X;
+        var y = origin.Y;
+        var w = origin.W;
+        var h = origin.H;
+
+        if (left)
+        {
+            x = Math.Clamp(origin.X + deltaColumns, 0, origin.Right - minimumWidth);
+            w = origin.Right - x;
+        }
+        else if (right)
+        {
+            w = Math.Clamp(origin.W + deltaColumns, minimumWidth, PanelLayout.Columns - origin.X);
+        }
+
+        if (top)
+        {
+            var minY = Math.Max(0, origin.Bottom - PanelLayout.MaxHeight);
+            var maxY = origin.Bottom - PanelLayout.MinHeight;
+            y = Math.Clamp(origin.Y + deltaRows, minY, maxY);
+            h = origin.Bottom - y;
+        }
+        else if (bottom)
+        {
+            h = Math.Clamp(origin.H + deltaRows, PanelLayout.MinHeight, PanelLayout.MaxHeight);
+        }
+
+        return new PanelLayout(x, y, w, h).Normalize();
+    }
+
     /// <summary>Resizes one panel, then resolves the rest of the board around it.</summary>
     public static List<PanelPlacement> Resize(IEnumerable<PanelPlacement> panels, string key, int newW, int newH)
     {
@@ -168,9 +256,8 @@ public static class GridLayoutEngine
             placed.Add(panel);
         }
 
-        // Compaction must not drag the pinned panel back up past where the user dropped it,
-        // so it is compacted along with the rest only after its row is already settled.
-        Compact(placed);
+        // The target remains fixed; only surrounding panels close gaps around it.
+        Compact(placed, priority);
         return placed;
     }
 

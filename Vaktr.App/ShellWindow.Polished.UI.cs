@@ -72,7 +72,7 @@ public sealed partial class ShellWindow
         // After this screen renders, build the full UI on the next frame
         root.Loaded += (_, _) =>
         {
-            _ = DispatcherQueue.TryEnqueue(Microsoft.UI.Dispatching.DispatcherQueuePriority.Normal, BuildFullUi);
+            _ = _uiQueue.TryEnqueue(Microsoft.UI.Dispatching.DispatcherQueuePriority.Normal, BuildFullUi);
         };
 
         return root;
@@ -126,9 +126,6 @@ public sealed partial class ShellWindow
         _overviewView.Children.Add(BuildSummarySurface());
         _overviewView.Children.Add(BuildBoardSectionBand());
         _overviewView.Children.Add(_dashboardGrid);
-
-        _settingsView.Children.Add(CreatePrimaryText("Settings", 22, true));
-        _settingsView.Children.Add(BuildControlsSurface());
 
         return new StackPanel
         {
@@ -247,13 +244,15 @@ public sealed partial class ShellWindow
 
     private FrameworkElement BuildThemePicker()
     {
-        // Eight themes do not fit on one row at the narrow breakpoint, so wrap them four per row.
+        // All eight themes on one row when the section spans the full window (it does at the
+        // three-column breakpoint); four per row below that, where eight would not fit. On one
+        // row the choice reads as a single strip instead of a block filling a quarter of a card.
         //
         // Deliberately rows of StackPanels rather than a Grid with star-width columns: this
         // picker is measured by a parent that offers infinite width, and star columns resolve to
         // zero under an infinite constraint — which collapsed the entire settings view to a
         // ~195px sliver. Content-sized panels measure correctly under any constraint.
-        const int columns = 4;
+        var columns = DetermineSettingsColumns() >= 3 ? 8 : 4;
         var modes = Enum.GetValues<ThemeMode>();
         var options = new StackPanel { Spacing = PanelSpacing };
         StackPanel? currentRow = null;
@@ -337,64 +336,6 @@ public sealed partial class ShellWindow
     internal static bool IsLightTheme(ThemeMode mode)
         => mode is ThemeMode.Light or ThemeMode.Sandstone;
 
-    private void RenderControlDeckSummary()
-    {
-        StartupTrace.Write("RenderControlDeckSummary // polished-v19");
-        _controlDeckEditableActive = false;
-        var settingsGrid = new Grid
-        {
-            ColumnSpacing = PanelSpacing,
-            RowSpacing = PanelSpacing,
-        };
-        var settingsColumns = DetermineSettingsColumns();
-        _lastSettingsColumnCount = settingsColumns;
-        for (var column = 0; column < settingsColumns; column++)
-        {
-            settingsGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        }
-
-        var statusFields = new[]
-        {
-            ("Interval", FormatScrapeInterval(_viewModel.EffectiveScrapeIntervalSeconds), "Sample cadence"),
-            ("Retention", GetRetentionFieldValue(), "History window"),
-            ("Appearance", GetThemeLabel(_viewModel.SelectedTheme), "Visual theme"),
-            ("Storage", GetStorageFieldTitle(), GetStorageFieldCaption()),
-        };
-        for (var index = 0; index < statusFields.Length; index++)
-        {
-            var field = statusFields[index];
-            AddStatusField(settingsGrid, index / settingsColumns, index % settingsColumns, field.Item1, field.Item2, field.Item3);
-        }
-
-        var ov = _viewModel.OverlayConfig;
-        var overlaySummary = BuildOverlaySummaryCard(ov);
-        var overlayRow = (statusFields.Length + settingsColumns - 1) / settingsColumns;
-        AddCardToGrid(settingsGrid, overlayRow, 0, overlaySummary, columnSpan: settingsColumns);
-
-        var actionRow = new Grid
-        {
-            ColumnSpacing = PanelSpacing,
-            VerticalAlignment = VerticalAlignment.Center,
-        };
-        actionRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        actionRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-
-        var editButton = CreateChipRow(
-            CreateActionChip("Edit", OnEditSettingsClick, filled: true));
-        actionRow.Children.Add(editButton);
-        Grid.SetColumn(editButton, 1);
-
-        _controlsBodyHost.Child = new StackPanel
-        {
-            Spacing = 12,
-            Children =
-            {
-                settingsGrid,
-                actionRow,
-            },
-        };
-    }
-
     private void RenderEditableControlDeck()
     {
         StartupTrace.Write("RenderEditableControlDeck // polished-v19");
@@ -403,9 +344,13 @@ public sealed partial class ShellWindow
         var scrapeBox = CreateDeckInlineEntry(
             string.IsNullOrWhiteSpace(_draftScrapeIntervalInput) ? string.Empty : _draftScrapeIntervalInput,
             "2");
+        scrapeBox.Width = 160;
+        scrapeBox.HorizontalAlignment = HorizontalAlignment.Left;
         scrapeBox.TextChanged += OnScrapeInputChanged;
 
         var retentionBox = CreateDeckInlineEntry(_draftRetentionInput, "24h");
+        retentionBox.Width = 160;
+        retentionBox.HorizontalAlignment = HorizontalAlignment.Left;
         retentionBox.TextChanged += OnRetentionInputChanged;
 
         var storageBox = CreateDeckInlineEntry(
@@ -539,7 +484,7 @@ public sealed partial class ShellWindow
         actionRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
         var actionChips = CreateChipRow(
-            CreateActionChip("Cancel", OnCancelSettingsClick),
+            CreateActionChip("Revert", OnCancelSettingsClick),
             CreateActionChip("Apply", OnSaveSettingsClick, filled: true));
         actionRow.Children.Add(actionChips);
         Grid.SetColumn(actionChips, 1);
@@ -573,37 +518,6 @@ public sealed partial class ShellWindow
         return surface;
     }
 
-    private static void AddControlField(Grid grid, int row, int column, string label, FrameworkElement control, int columnSpan = 1)
-    {
-        while (grid.RowDefinitions.Count <= row)
-        {
-            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        }
-
-        FrameworkElement element;
-        if (string.IsNullOrWhiteSpace(label))
-        {
-            element = control;
-        }
-        else
-        {
-            element = new StackPanel
-            {
-                Spacing = 8,
-                Children =
-                {
-                    CreateFieldLabel(label),
-                    control,
-                },
-            };
-        }
-
-        grid.Children.Add(element);
-        Grid.SetRow(element, row);
-        Grid.SetColumn(element, column);
-        Grid.SetColumnSpan(element, columnSpan);
-    }
-
     private static void AddCardToGrid(Grid grid, int row, int column, FrameworkElement element, int columnSpan = 1)
     {
         while (grid.RowDefinitions.Count <= row)
@@ -615,219 +529,6 @@ public sealed partial class ShellWindow
         Grid.SetRow(element, row);
         Grid.SetColumn(element, column);
         Grid.SetColumnSpan(element, columnSpan);
-    }
-
-    private static void AddStatusField(Grid grid, int row, int column, string label, string value, string caption)
-    {
-        while (grid.RowDefinitions.Count <= row)
-        {
-            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        }
-
-        var accentHex = label switch
-        {
-            "Collection" => "#5DE6FF",
-            "Retention" => "#67B7FF",
-            "Storage path" => "#6EE7C8",
-            _ => "#66E7FF",
-        };
-
-        var accentBrush = BrushFactory.CreateBrush(accentHex);
-        var card = new Border
-        {
-            Background = ResolveBrush("SurfaceBrush", "#1C1F22"),
-            BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E"),
-            BorderThickness = new Thickness(0.9),
-            CornerRadius = new CornerRadius(8),
-            Padding = new Thickness(16),
-            MinHeight = 88,
-            Child = new StackPanel
-            {
-                Orientation = Orientation.Horizontal,
-                Spacing = 12,
-                VerticalAlignment = VerticalAlignment.Center,
-                Children =
-                {
-                    IconFactory.CreateTile(label, accentBrush, 42, 16),
-                    new StackPanel
-                    {
-                        Spacing = 2,
-                        VerticalAlignment = VerticalAlignment.Center,
-                        Children =
-                        {
-                            CreateMutedText(label, 10),
-                            CreatePrimaryText(value, 18, true),
-                            CreateSecondaryText(caption, 11),
-                        },
-                    },
-                },
-            },
-        };
-
-        grid.Children.Add(card);
-        Grid.SetRow(card, row);
-        Grid.SetColumn(card, column);
-    }
-
-    private UIElement CreateActiveDeckEditorSurface()
-    {
-        return _activeDeckEditor switch
-        {
-            DeckEditorMode.Retention => CreateRetentionEditorSurface(),
-            DeckEditorMode.Storage => CreateStorageEditorSurface(),
-            _ => CreateScrapeEditorSurface(),
-        };
-    }
-
-    private Border CreateScrapeEditorSurface()
-    {
-        var scrapeBox = CreateDeckInlineEntry(
-            string.IsNullOrWhiteSpace(_viewModel.ScrapeIntervalInput)
-                ? string.Empty
-                : _viewModel.ScrapeIntervalInput,
-            "2");
-        scrapeBox.TextChanged += OnScrapeInputChanged;
-
-        return CreateFocusedEditorSurface(
-            "SCRAPE",
-            "Choose how often Vaktr samples the local node. Type seconds directly or snap to a preset.",
-            new StackPanel
-            {
-                Spacing = 12,
-                Children =
-                {
-                    new StackPanel
-                    {
-                        Spacing = 8,
-                        Children =
-                        {
-                            CreateFieldLabel("Scrape interval (seconds)"),
-                            scrapeBox,
-                            CreateMutedText("1–60 seconds. Leave blank for the default 2s.", 12),
-                        },
-                    },
-                    CreateChipWrapRow(
-                        CreatePresetChip("1s", _viewModel.EffectiveScrapeIntervalSeconds == 1, (_, _) => SetScrapeInterval(1)),
-                        CreatePresetChip("2s", string.IsNullOrWhiteSpace(_viewModel.ScrapeIntervalInput), (_, _) => ResetScrapeInterval()),
-                        CreatePresetChip("5s", _viewModel.EffectiveScrapeIntervalSeconds == 5, (_, _) => SetScrapeInterval(5)),
-                        CreatePresetChip("10s", _viewModel.EffectiveScrapeIntervalSeconds == 10, (_, _) => SetScrapeInterval(10)),
-                        CreatePresetChip("15s", _viewModel.EffectiveScrapeIntervalSeconds == 15, (_, _) => SetScrapeInterval(15)),
-                        CreatePresetChip("30s", _viewModel.EffectiveScrapeIntervalSeconds == 30, (_, _) => SetScrapeInterval(30)),
-                        CreatePresetChip("60s", _viewModel.EffectiveScrapeIntervalSeconds == 60, (_, _) => SetScrapeInterval(60))),
-                },
-            },
-            "2 seconds is the default because it feels live without making the collector noisy.");
-    }
-
-    private Border CreateRetentionEditorSurface()
-    {
-        var retentionBox = CreateDeckInlineEntry(_viewModel.RetentionHoursInput, "24h");
-        retentionBox.TextChanged += OnRetentionInputChanged;
-
-        return CreateFocusedEditorSurface(
-            "RETENTION",
-            "Type retention with m, h, or d units, then keep it simple with a preset when that is faster.",
-            new StackPanel
-            {
-                Spacing = 12,
-                Children =
-                {
-                    new StackPanel
-                    {
-                        Spacing = 8,
-                        Children =
-                        {
-                            CreateFieldLabel("Retention window"),
-                            retentionBox,
-                            CreateMutedText("Format: 30m, 24h, or 7d.", 12),
-                        },
-                    },
-                    CreateChipWrapRow(
-                        CreatePresetChip("6h", _viewModel.EffectiveRetentionHours == 6, (_, _) => SetRetentionInput("6h")),
-                        CreatePresetChip("12h", _viewModel.EffectiveRetentionHours == 12, (_, _) => SetRetentionInput("12h")),
-                        CreatePresetChip("24h", _viewModel.EffectiveRetentionHours == 24, (_, _) => ResetRetentionHours()),
-                        CreatePresetChip("7d", _viewModel.EffectiveRetentionHours == 168, (_, _) => SetRetentionInput("7d")),
-                        CreatePresetChip("30d", _viewModel.EffectiveRetentionHours == 720, (_, _) => SetRetentionInput("30d")),
-                        CreatePresetChip("90d", _viewModel.EffectiveRetentionHours == 2160, (_, _) => SetRetentionInput("90d"))),
-                },
-            },
-            "Blank keeps the smart 24h default. Older samples are pruned to the exact retention window you apply.");
-    }
-
-    private Border CreateStorageEditorSurface()
-    {
-        var storageBox = CreateDeckInlineEntry(
-            string.IsNullOrWhiteSpace(_viewModel.StorageDirectory)
-                ? string.Empty
-                : _viewModel.StorageDirectory.Trim(),
-            VaktrConfig.DefaultStorageDirectory);
-        storageBox.TextChanged += OnStorageInputChanged;
-
-        var dropSurface = new Border
-        {
-            Background = ResolveBrush("SurfaceInsetBrush", "#141619"),
-            BorderBrush = ResolveBrush("AccentStrongBrush", "#B7F7FF"),
-            BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(8),
-            Padding = new Thickness(14),
-            AllowDrop = true,
-            Child = new StackPanel
-            {
-                Spacing = 6,
-                Children =
-                {
-                    CreateFieldLabel("Storage directory"),
-                    storageBox,
-                    CreateMutedText("Browse, drop a folder, or type a path. Blank uses the default.", 12),
-                },
-            },
-        };
-        dropSurface.DragOver += OnStoragePathDragOver;
-        dropSurface.Drop += OnStoragePathDrop;
-
-        return new Border
-        {
-            Background = ResolveBrush("SurfaceStrongBrush", "#292D31"),
-            BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E"),
-            BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(8),
-            Padding = new Thickness(16),
-            Child = new StackPanel
-            {
-                Spacing = 12,
-                Children =
-                {
-                    CreateSectionHeader("STORAGE", "Vaktr keeps telemetry local, so Local App Data is the sensible default instead of Roaming."),
-                    dropSurface,
-                    CreateChipWrapRow(
-                        CreateActionChip("Browse folder", OnBrowseStorageClick, filled: true),
-                        CreateActionChip("Use default", (_, _) => ResetStorageDirectory())),
-                    CreateSecondaryText("Default: %LocalAppData%\\Vaktr\\Data", 12),
-                },
-            },
-        };
-    }
-
-    private Border CreateFocusedEditorSurface(string eyebrow, string description, Panel chips, string footer)
-    {
-        return new Border
-        {
-            Background = ResolveBrush("SurfaceStrongBrush", "#292D31"),
-            BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E"),
-            BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(8),
-            Padding = new Thickness(16),
-            Child = new StackPanel
-            {
-                Spacing = 12,
-                Children =
-                {
-                    CreateSectionHeader(eyebrow, description),
-                    chips,
-                    CreateSecondaryText(footer, 12),
-                },
-            },
-        };
     }
 
     private Border CreateSettingFieldCard(string title, string value, string caption, bool isActive, EventHandler onClick)
@@ -917,16 +618,46 @@ public sealed partial class ShellWindow
 
         foreach (var chip in chips)
         {
-            row.Children.Add(chip);
+            row.Children.Add(DetachFromParent(chip));
         }
 
         return row;
+    }
+
+    /// <summary>
+    /// Removes an element from whatever currently owns it so it can be added somewhere new.
+    ///
+    /// The time-range editor is rebuilt on every open but reuses the same persistent chips. Closing
+    /// it only detaches the editor from the window - the chips stay children of the old, now
+    /// orphaned rows until the GC happens to collect them. Re-adding a chip that still has a parent
+    /// throws COMException 0x800F1000 ("No installed components were detected"), so reopening the
+    /// editor crashed or not depending purely on GC timing.
+    /// </summary>
+    private static T DetachFromParent<T>(T element) where T : FrameworkElement
+    {
+        switch (element.Parent)
+        {
+            case Panel panel:
+                panel.Children.Remove(element);
+                break;
+            case Border border when ReferenceEquals(border.Child, element):
+                border.Child = null;
+                break;
+            case ContentControl control when ReferenceEquals(control.Content, element):
+                control.Content = null;
+                break;
+        }
+
+        return element;
     }
 
     private static ActionChip CreatePresetChip(string text, bool isActive, EventHandler onClick)
     {
         var chip = CreateActionChip(text, onClick, isActive);
         chip.IsActive = isActive;
+        // Width must not depend on selection. CreateActionChip widens filled chips for primary
+        // buttons, so a preset grew 60px the moment it was chosen and shoved its row sideways.
+        chip.MinWidth = 44;
         return chip;
     }
 
@@ -981,7 +712,7 @@ public sealed partial class ShellWindow
 
         foreach (var chip in chips)
         {
-            stack.Children.Add(chip);
+            stack.Children.Add(DetachFromParent(chip));
         }
 
         return stack;
@@ -1076,20 +807,32 @@ public sealed partial class ShellWindow
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
+        // The edit-mode instructions live beside the title they describe. They used to go to the
+        // status line, a 300px caption at the far end of the window that truncated them.
+        _editModeHint = CreateSecondaryText("Drag a panel to move it \u00B7 drag an edge or corner to resize \u00B7 Esc when done", 12);
+        _editModeHint.Opacity = 0;
+        _editModeHint.VerticalAlignment = VerticalAlignment.Center;
+        _editModeHint.TextTrimming = TextTrimming.CharacterEllipsis;
+        _editModeHint.TextWrapping = TextWrapping.NoWrap;
+        _editModeHint.IsHitTestVisible = false;
         grid.Children.Add(new StackPanel
         {
-            Spacing = 0,
+            Orientation = Orientation.Horizontal,
+            Spacing = 16,
             Children =
             {
                 CreatePrimaryText("Performance", 18, true),
+                _editModeHint,
             },
         });
 
+        // Edit/Done is the trailing control so the mode toggle never moves: Done appears exactly
+        // where Edit was, with Cancel beside it.
         var actions = CreateChipRow(
-            _editLayoutButton,
-            _cancelLayoutButton,
+            _globalResetZoomButton,
             _globalRangeButton,
-            _globalResetZoomButton);
+            _cancelLayoutButton,
+            _editLayoutButton);
         actions.VerticalAlignment = VerticalAlignment.Center;
         grid.Children.Add(actions);
         Grid.SetColumn(actions, 1);
@@ -1100,7 +843,6 @@ public sealed partial class ShellWindow
             Children =
             {
                 grid,
-                _globalRangeEditorHost,
             },
         };
     }
@@ -1127,7 +869,9 @@ public sealed partial class ShellWindow
 
     private static Border CreateControlEditorCard(string iconKey, string eyebrow, string headline, string caption, string accentHex, FrameworkElement body)
     {
-        var accentBrush = BrushFactory.CreateBrush(accentHex);
+        // The palette accent, not the per-card hex: those were legacy cyans that ignored the
+        // theme, so Ember, Violet and Sandstone still showed cyan icons in Settings.
+        var accentBrush = ResolveBrush("AccentBrush", accentHex);
         var token = IconFactory.CreateTile(iconKey, accentBrush, 40, 16);
 
         var headerGrid = new Grid
@@ -1491,9 +1235,13 @@ public sealed partial class ShellWindow
 
         // Row 4: font size + opacity
         var fontBox = CreateDeckInlineEntry(_draftOverlayFontSize, "14");
+        fontBox.Width = 120;
+        fontBox.HorizontalAlignment = HorizontalAlignment.Left;
         fontBox.TextChanged += (_, _) => { _draftOverlayFontSize = fontBox.Text; };
 
         var opacityBox = CreateDeckInlineEntry(_draftOverlayOpacity, "90");
+        opacityBox.Width = 120;
+        opacityBox.HorizontalAlignment = HorizontalAlignment.Left;
         opacityBox.TextChanged += (_, _) => { _draftOverlayOpacity = opacityBox.Text; };
 
         var row4Grid = new Grid { ColumnSpacing = PanelSpacing };
@@ -1537,6 +1285,8 @@ public sealed partial class ShellWindow
 
         // Row 5: hotkey
         var hotkeyBox = CreateDeckInlineEntry(_draftOverlayHotkey, "Ctrl+Shift+F11");
+        hotkeyBox.Width = 280;
+        hotkeyBox.HorizontalAlignment = HorizontalAlignment.Left;
         hotkeyBox.TextChanged += (_, _) => { _draftOverlayHotkey = hotkeyBox.Text; };
 
         var hotkeyRow = new Grid { ColumnSpacing = 12 };
@@ -1577,56 +1327,6 @@ public sealed partial class ShellWindow
         return CreateControlEditorCard("overlay", "OVERLAY", summaryValue, caption, "#7CE38B", contentStack);
     }
 
-    private static Border BuildOverlaySummaryCard(OverlayConfig ov)
-    {
-        var statusLine = ov.Enabled
-            ? $"On — {ov.Mode} @ {ov.Corner switch { OverlayCorner.TopLeft => "Top Left", OverlayCorner.TopRight => "Top Right", OverlayCorner.BottomLeft => "Bottom Left", _ => "Bottom Right" }}"
-            : "Off";
-
-        var accentBrush = BrushFactory.CreateBrush("#7CE38B");
-        var icon = IconFactory.CreateTile("overlay", accentBrush, 42, 16);
-
-        var colorSwatch = CreateColorSwatch(ov.TextColor);
-
-        var info = new StackPanel
-        {
-            Spacing = 2,
-            VerticalAlignment = VerticalAlignment.Center,
-            Children =
-            {
-                CreateMutedText("Overlay", 10),
-                CreatePrimaryText(statusLine, 16, true),
-                new StackPanel
-                {
-                    Orientation = Orientation.Horizontal,
-                    Spacing = 8,
-                    Children =
-                    {
-                        colorSwatch,
-                        CreateSecondaryText($"Toggle: {ov.HotkeyGesture}", 11),
-                    },
-                },
-            },
-        };
-
-        return new Border
-        {
-            Background = ResolveBrush("SurfaceBrush", "#1C1F22"),
-            BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E"),
-            BorderThickness = new Thickness(0.9),
-            CornerRadius = new CornerRadius(8),
-            Padding = new Thickness(16),
-            MinHeight = 72,
-            Child = new StackPanel
-            {
-                Orientation = Orientation.Horizontal,
-                Spacing = 12,
-                VerticalAlignment = VerticalAlignment.Center,
-                Children = { icon, info },
-            },
-        };
-    }
-
     private static Border CreateColorSwatch(string hex)
     {
         Color swatchColor;
@@ -1660,28 +1360,6 @@ public sealed partial class ShellWindow
         return string.IsNullOrWhiteSpace(storageDirectory)
             ? "Local app data"
             : "Custom folder";
-    }
-
-    private string GetStorageFieldCaption()
-    {
-        return GetStorageFieldCaption(_viewModel.StorageDirectory);
-    }
-
-    private static string GetStorageFieldCaption(string? storageDirectory)
-    {
-        if (!string.IsNullOrWhiteSpace(storageDirectory))
-        {
-            return storageDirectory.Trim();
-        }
-
-        try
-        {
-            return System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Vaktr", "Data");
-        }
-        catch
-        {
-            return "%LocalAppData%\\Vaktr\\Data";
-        }
     }
 
     private string GetRetentionFieldCaption()

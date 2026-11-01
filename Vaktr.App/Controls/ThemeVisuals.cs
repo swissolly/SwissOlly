@@ -9,10 +9,22 @@ namespace Vaktr.App.Controls;
 // retain their per-surface lift values.
 internal static class ThemeVisuals
 {
+    // Theme switches recolour the palette brushes in place (App.SetBrushResource) rather than
+    // replacing them, so an instance found once stays correct for the life of the app. Caching it
+    // saves a WinRT ResourceDictionary probe per call - about 150 per scrape before this. Only
+    // hits are cached, so a resource added later is still picked up. UI thread only.
+    private static readonly Dictionary<string, Brush> s_resourceBrushes = new(StringComparer.Ordinal);
+
     public static Brush ResolveBrush(string key, string fallbackHex)
     {
+        if (s_resourceBrushes.TryGetValue(key, out var cached))
+        {
+            return cached;
+        }
+
         if (Application.Current.Resources.TryGetValue(key, out var value) && value is Brush brush)
         {
+            s_resourceBrushes[key] = brush;
             return brush;
         }
 
@@ -21,8 +33,14 @@ internal static class ThemeVisuals
 
     public static Color ResolveColor(string key, string fallbackHex)
     {
+        if (s_resourceBrushes.TryGetValue(key, out var cached) && cached is SolidColorBrush cachedBrush)
+        {
+            return cachedBrush.Color;
+        }
+
         if (Application.Current.Resources.TryGetValue(key, out var value) && value is SolidColorBrush brush)
         {
+            s_resourceBrushes[key] = brush;
             return brush.Color;
         }
 

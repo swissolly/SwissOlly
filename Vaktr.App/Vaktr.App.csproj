@@ -19,7 +19,12 @@
     <UseWinUI>true</UseWinUI>
     <WinUISDKReferences>false</WinUISDKReferences>
     <WindowsPackageType>None</WindowsPackageType>
-    <DefaultItemExcludes>$(DefaultItemExcludes);obj\**;obj_winui3\**;bin\**</DefaultItemExcludes>
+    <DefaultItemExcludes>$(DefaultItemExcludes);obj\**;obj_winui3\**;bin\**;artifacts\**</DefaultItemExcludes>
+  </PropertyGroup>
+
+  <!-- Precompile the shipped build: JIT is a large share of a cold launch. Publish-only. -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <PublishReadyToRun>true</PublishReadyToRun>
   </PropertyGroup>
 
   <ItemGroup>

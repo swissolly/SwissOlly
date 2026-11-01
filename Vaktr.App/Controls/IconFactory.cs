@@ -92,7 +92,8 @@ internal static class IconFactory
     {
         return key switch
         {
-            "collection" => "\uF182", // ScreenTime
+            "collection" => "", // Stopwatch: how often samples are taken
+            "appearance" => "", // Color
             "retention" => "\uE81C", // History
             "storage" => "\uE8B7", // Folder
             "cpu" => "\uEEA1", // CPU
@@ -103,7 +104,7 @@ internal static class IconFactory
             "gpu" => "\uE7F8", // Video
             "temperature" => "\uE9CA", // Thermometer
             "system" => "\uF182", // ScreenTime
-            "overlay" => "", // LayeredDisplay
+            "overlay" => "", // Game
             _ => "\uF182",
         };
     }

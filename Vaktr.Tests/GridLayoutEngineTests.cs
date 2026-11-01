@@ -24,6 +24,148 @@ public class GridLayoutEngineTests
     }
 
     [Fact]
+    public void ResolveResponsive_Widens_Without_Overlapping_Or_Mutating_Saved_Layouts()
+    {
+        var input = new[]
+        {
+            P("a", 0, 0, 4, 6),
+            P("b", 4, 0, 4, 6),
+            P("c", 8, 0, 4, 6),
+        };
+
+        var board = GridLayoutEngine.ResolveResponsive(input, 6);
+
+        AssertNoOverlaps(board);
+        Assert.All(board, panel => Assert.True(panel.Layout.W >= 6));
+        Assert.All(input, panel => Assert.Equal(4, panel.Layout.W));
+    }
+
+    [Fact]
+    public void ResolveResponsive_Preserves_Saved_Positions_When_They_Do_Not_Collide()
+    {
+        var input = new[]
+        {
+            P("a", 0, 0, 4, 6),
+            P("b", 4, 9, 4, 6),
+        };
+
+        var board = GridLayoutEngine.ResolveResponsive(input, PanelLayout.MinWidth);
+
+        Assert.Equal((0, 0), (Find(board, "a").X, Find(board, "a").Y));
+        Assert.Equal((4, 9), (Find(board, "b").X, Find(board, "b").Y));
+    }
+
+    [Fact]
+    public void ResolveResponsive_Stacks_All_Panels_At_Single_Column_Breakpoint()
+    {
+        var input = new[]
+        {
+            P("a", 0, 0, 4, 6),
+            P("b", 4, 0, 4, 6),
+            P("c", 8, 0, 4, 6),
+        };
+
+        var board = GridLayoutEngine.ResolveResponsive(input, PanelLayout.Columns);
+
+        AssertNoOverlaps(board);
+        Assert.All(board, panel =>
+        {
+            Assert.Equal(0, panel.Layout.X);
+            Assert.Equal(PanelLayout.Columns, panel.Layout.W);
+        });
+        Assert.Equal(new[] { 4, 4, 4 }, input.Select(panel => panel.Layout.W));
+    }
+
+    [Fact]
+    public void Move_Preserves_An_Unoccupied_Downward_Target_Row()
+    {
+        var board = GridLayoutEngine.Move([
+            P("a", 0, 0, 4, 6),
+            P("b", 4, 0, 4, 6),
+        ], "a", 0, 12);
+
+        Assert.Equal(12, Find(board, "a").Y);
+        AssertNoOverlaps(board);
+    }
+
+    [Fact]
+    public void Apply_Preserves_Top_Resize_Target_And_Opposite_Bottom_Edge()
+    {
+        var board = GridLayoutEngine.Apply([
+            P("a", 0, 10, 4, 10),
+            P("b", 4, 0, 4, 6),
+        ], "a", new PanelLayout(0, 12, 4, 8));
+        var resized = Find(board, "a");
+
+        Assert.Equal(12, resized.Y);
+        Assert.Equal(8, resized.H);
+        Assert.Equal(20, resized.Bottom);
+        AssertNoOverlaps(board);
+    }
+
+    [Fact]
+    public void Apply_Resize_Pushes_Neighbors_Down_And_Compacts_Them_When_Shrunk()
+    {
+        var original = new[]
+        {
+            P("resizing", 0, 0, 6, 7),
+            P("below", 0, 7, 6, 7),
+            P("beside", 6, 0, 6, 7),
+        };
+
+        var expanded = GridLayoutEngine.Apply(original, "resizing", new PanelLayout(0, 0, 6, 10));
+        var contracted = GridLayoutEngine.Apply(expanded, "resizing", new PanelLayout(0, 0, 6, 7));
+
+        Assert.Equal(10, Find(expanded, "below").Y);
+        Assert.Equal(7, Find(contracted, "below").Y);
+        Assert.Equal(0, Find(expanded, "beside").Y);
+        AssertNoOverlaps(expanded);
+        AssertNoOverlaps(contracted);
+    }
+
+    [Fact]
+    public void ResizeByDelta_Left_Edge_Anchors_Right_And_Clamps_At_Board_Edges()
+    {
+        var origin = new PanelLayout(4, 3, 4, 8);
+
+        var shrink = GridLayoutEngine.ResizeByDelta(origin, true, false, false, false, 99, 0);
+        var grow = GridLayoutEngine.ResizeByDelta(origin, true, false, false, false, -99, 0);
+
+        Assert.Equal((6, 2), (shrink.X, shrink.W));
+        Assert.Equal((0, 8), (grow.X, grow.W));
+        Assert.Equal(8, origin.Right);
+    }
+
+    [Fact]
+    public void ResizeByDelta_Right_Edge_Respects_Responsive_Minimum_And_Board_Edge()
+    {
+        var origin = new PanelLayout(4, 2, 6, 8);
+
+        var shrink = GridLayoutEngine.ResizeByDelta(origin, false, true, false, false, -99, 0, minimumWidth: 6);
+        var grow = GridLayoutEngine.ResizeByDelta(origin, false, true, false, false, 99, 0, minimumWidth: 6);
+
+        Assert.Equal((4, 6), (shrink.X, shrink.W));
+        Assert.Equal((4, 8), (grow.X, grow.W));
+        Assert.Equal(PanelLayout.Columns, grow.Right);
+    }
+
+    [Fact]
+    public void ResizeByDelta_Vertical_Edges_Keep_Anchors_And_Height_Bounds()
+    {
+        var origin = new PanelLayout(2, 5, 4, 10);
+
+        var topShrink = GridLayoutEngine.ResizeByDelta(origin, false, false, true, false, 0, 99);
+        var topGrow = GridLayoutEngine.ResizeByDelta(origin, false, false, true, false, 0, -99);
+        var bottomShrink = GridLayoutEngine.ResizeByDelta(origin, false, false, false, true, 0, -99);
+        var bottomGrow = GridLayoutEngine.ResizeByDelta(origin, false, false, false, true, 0, 99);
+
+        Assert.Equal((8, 7), (topShrink.Y, topShrink.H));
+        Assert.Equal((0, 15), (topGrow.Y, topGrow.H));
+        Assert.Equal((5, 7), (bottomShrink.Y, bottomShrink.H));
+        Assert.Equal((5, PanelLayout.MaxHeight), (bottomGrow.Y, bottomGrow.H));
+    }
+
+    [Fact]
     public void Resolve_Separates_Overlapping_Panels()
     {
         var board = GridLayoutEngine.Resolve([

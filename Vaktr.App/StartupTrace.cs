@@ -34,6 +34,8 @@ internal static class StartupTrace
     {
         try
         {
+            // Mirror the trace into Visual Studio's Output window in Debug builds.
+            System.Diagnostics.Debug.WriteLine("[Vaktr] " + message);
             var directory = System.IO.Path.GetDirectoryName(LogPath);
             if (!string.IsNullOrWhiteSpace(directory))
             {

@@ -99,6 +99,10 @@ public sealed class TelemetryChart : UserControl
         _gridCanvas = new Canvas();
         _dataCanvas = new Canvas();
         _interactionCanvas = new Canvas();
+
+        // Fills beneath every line, so a second series' area never paints over the first's trace.
+        _dataCanvas.Children.Add(_fillLayer);
+        _dataCanvas.Children.Add(_lineLayer);
         _plotFrame = new Rectangle
         {
             RadiusX = 8,
@@ -261,7 +265,10 @@ public sealed class TelemetryChart : UserControl
             return;
         }
 
-        ScheduleRedraw();
+        // Redraw in this layout pass rather than on a later dispatcher turn. While a panel is
+        // being resized the deferred redraw trailed the card's edge by a frame, so the plot
+        // visibly lagged the frame around it. Retained rendering makes this cheap enough.
+        Redraw();
     }
 
     private bool _renderingSuspended;
@@ -363,6 +370,36 @@ public sealed class TelemetryChart : UserControl
         return hash == _lastRenderedPointHash;
     }
 
+    // ---- Retained rendering ------------------------------------------------------------------
+    //
+    // Redraw used to clear both canvases and rebuild everything: one LineSegment object per data
+    // point (twice when a fill was drawn) plus every grid line and label - roughly 4,400 XAML
+    // objects per scrape across the board, and the dominant cost of a live panel resize. Every
+    // element is now created once and updated in place. A series is one Path whose figure holds
+    // a single PolyLineSegment, so a redraw is arithmetic plus a few property sets.
+
+    private sealed class SeriesVisual
+    {
+        public required Path Fill { get; init; }
+        public required PathGeometry FillGeometry { get; init; }
+        public required Path Line { get; init; }
+        public required PathGeometry LineGeometry { get; init; }
+        public required Ellipse Glow { get; init; }
+        public required Ellipse Dot { get; init; }
+    }
+
+    private readonly Canvas _fillLayer = new();
+    private readonly Canvas _lineLayer = new();
+    private readonly List<SeriesVisual> _seriesVisuals = [];
+    private readonly List<Ellipse> _soloDots = [];
+    private readonly List<Rectangle> _gridBands = [];
+    private readonly List<Line> _gridRows = [];
+    private readonly List<Line> _gridColumns = [];
+    private readonly List<TextBlock> _timeLabels = [];
+    private TextBlock? _ceilingLabel;
+    private TextBlock? _midLabel;
+    private TextBlock? _floorLabel;
+
     private void Redraw()
     {
         var width = Math.Max(0, ActualWidth);
@@ -403,14 +440,15 @@ public sealed class TelemetryChart : UserControl
 
         if (!TryGetPointBounds(series, out var minTimestamp, out var maxTimestamp, out var maxObservedValue))
         {
-            _gridCanvas.Children.Clear();
-            _dataCanvas.Children.Clear();
             var emptyPlotWidth = Math.Max(16d, width - LeftPadding - RightPadding);
             var emptyPlotHeight = Math.Max(16d, height - TopPadding - BottomPadding);
             UpdatePlotSurface(emptyPlotWidth, emptyPlotHeight);
             _lastResolvedMaxValue = ResolveMaxValue(0d);
             DrawGrid(width, height, DateTimeOffset.UtcNow.AddMinutes(-1), DateTimeOffset.UtcNow, _lastResolvedMaxValue, includeLabels: false);
-            _emptyStateText.Text = string.IsNullOrWhiteSpace(EmptyStateText) ? "\u23F3 Waiting for samples" : $"\u23F3 {EmptyStateText}";
+            HideSeriesVisuals(0);
+            HideFrom(_soloDots, 0);
+            // Plain text: an emoji hourglass clashed with the Fluent icon set used everywhere else.
+            _emptyStateText.Text = string.IsNullOrWhiteSpace(EmptyStateText) ? "Waiting for samples" : EmptyStateText;
             _emptyStateText.Visibility = Visibility.Visible;
             _hasRenderedFrame = true;
             HideHover();
@@ -433,6 +471,7 @@ public sealed class TelemetryChart : UserControl
         _lastResolvedMaxValue = maxValue;
         var plotWidth = Math.Max(16d, width - LeftPadding - RightPadding);
         var plotHeight = Math.Max(16d, height - TopPadding - BottomPadding);
+        var plotBottom = TopPadding + plotHeight;
         var seriesCount = series.Count;
         var drawFilledArea = seriesCount <= 3;
         var drawPointMarkers = seriesCount <= 4;
@@ -441,10 +480,12 @@ public sealed class TelemetryChart : UserControl
         // chart read as designed rather than plotted.
         var strokeThickness = seriesCount <= 2 ? 2.4d : seriesCount <= 6 ? 1.9d : 1.4d;
 
-        _gridCanvas.Children.Clear();
-        _dataCanvas.Children.Clear();
         UpdatePlotSurface(plotWidth, plotHeight);
         DrawGrid(width, height, start, end, maxValue);
+
+        var visualIndex = 0;
+        var soloIndex = 0;
+        var runs = new List<IReadOnlyList<Windows.Foundation.Point>>();
         foreach (var item in series)
         {
             if (item.Points.Count == 0)
@@ -461,76 +502,235 @@ public sealed class TelemetryChart : UserControl
             var downsampled = Downsample(renderablePoints, pointBudget);
 
             // Split into contiguous segments at gaps (>3x the expected interval between points)
-            var segments = SplitAtGaps(downsampled, end - start);
-
-            foreach (var segment in segments)
+            runs.Clear();
+            foreach (var segment in SplitAtGaps(downsampled, end - start))
             {
                 var rawProjected = new Windows.Foundation.Point[segment.Count];
                 for (var pi = 0; pi < segment.Count; pi++)
                 {
                     rawProjected[pi] = Project(segment[pi], LeftPadding, TopPadding, plotWidth, plotHeight, start, end, maxValue);
                 }
-                var strokeProjected = NormalizeProjectedPoints(rawProjected);
 
-                if (strokeProjected.Count == 0)
+                var projected = NormalizeProjectedPoints(rawProjected);
+                if (projected.Count == 1)
                 {
-                    continue;
+                    PlaceDot(soloIndex++, projected[0], item.StrokeBrush);
                 }
-
-                if (strokeProjected.Count == 1)
+                else if (projected.Count > 1)
                 {
-                    DrawPoint(strokeProjected[0], item.StrokeBrush, 5);
-                    continue;
+                    runs.Add(projected);
                 }
-
-                if (drawFilledArea)
-                {
-                    var fillProjected = strokeProjected;
-                    if (fillProjected.Count >= 2)
-                    {
-                        _dataCanvas.Children.Add(new Path
-                        {
-                            Data = BuildAreaGeometry(fillProjected, TopPadding + plotHeight),
-                            Fill = item.FillBrush,
-                            // Single series can carry its full gradient; stacked series stay
-                            // translucent so overlapping fills don't turn to mud.
-                            Opacity = seriesCount == 1 ? 1.0 : 0.45,
-                        });
-                    }
-                }
-
-                _dataCanvas.Children.Add(new Path
-                {
-                    Data = BuildLineGeometry(strokeProjected),
-                    Stroke = item.StrokeBrush,
-                    StrokeLineJoin = PenLineJoin.Round,
-                    StrokeStartLineCap = PenLineCap.Round,
-                    StrokeEndLineCap = PenLineCap.Round,
-                    StrokeThickness = strokeThickness,
-                });
             }
 
-            // Draw latest-point marker only for primary (non-dimmed) series
-            // Skip if the stroke brush has very low alpha (dimmed/unfocused series)
+            var visual = SeriesVisualAt(visualIndex++);
+            if (runs.Count > 0)
+            {
+                if (drawFilledArea)
+                {
+                    SetFigures(visual.FillGeometry, runs, plotBottom, closed: true);
+                    visual.Fill.Fill = item.FillBrush;
+                    // Single series can carry its full gradient; stacked series stay
+                    // translucent so overlapping fills don't turn to mud.
+                    visual.Fill.Opacity = seriesCount == 1 ? 1.0 : 0.45;
+                    visual.Fill.Visibility = Visibility.Visible;
+                }
+                else
+                {
+                    visual.Fill.Visibility = Visibility.Collapsed;
+                }
+
+                SetFigures(visual.LineGeometry, runs, plotBottom, closed: false);
+                visual.Line.Stroke = item.StrokeBrush;
+                visual.Line.StrokeThickness = strokeThickness;
+                visual.Line.Visibility = Visibility.Visible;
+            }
+            else
+            {
+                visual.Fill.Visibility = Visibility.Collapsed;
+                visual.Line.Visibility = Visibility.Collapsed;
+            }
+
+            // Latest-point marker only for primary (non-dimmed) series; a low-alpha stroke
+            // means the series is unfocused.
             var isDimmed = item.StrokeBrush is SolidColorBrush scb && scb.Color.A < 80;
-            if (drawPointMarkers && renderablePoints.Count > 0 && !isDimmed)
+            if (drawPointMarkers && !isDimmed)
             {
                 var lastPoint = Project(renderablePoints[^1], LeftPadding, TopPadding, plotWidth, plotHeight, start, end, maxValue);
-                var glow = new Ellipse
-                {
-                    Width = 14,
-                    Height = 14,
-                    Fill = item.StrokeBrush,
-                    Opacity = 0.22,
-                };
-                Canvas.SetLeft(glow, lastPoint.X - 7);
-                Canvas.SetTop(glow, lastPoint.Y - 7);
-                _dataCanvas.Children.Add(glow);
-                DrawPoint(lastPoint, item.StrokeBrush, 5.5);
+                visual.Glow.Fill = item.StrokeBrush;
+                visual.Dot.Fill = item.StrokeBrush;
+                Canvas.SetLeft(visual.Glow, lastPoint.X - (visual.Glow.Width / 2d));
+                Canvas.SetTop(visual.Glow, lastPoint.Y - (visual.Glow.Height / 2d));
+                Canvas.SetLeft(visual.Dot, lastPoint.X - (visual.Dot.Width / 2d));
+                Canvas.SetTop(visual.Dot, lastPoint.Y - (visual.Dot.Height / 2d));
+                visual.Glow.Visibility = Visibility.Visible;
+                visual.Dot.Visibility = Visibility.Visible;
+            }
+            else
+            {
+                visual.Glow.Visibility = Visibility.Collapsed;
+                visual.Dot.Visibility = Visibility.Collapsed;
             }
         }
 
+        HideSeriesVisuals(visualIndex);
+        HideFrom(_soloDots, soloIndex);
         _hasRenderedFrame = true;
+    }
+
+    private SeriesVisual SeriesVisualAt(int index)
+    {
+        while (_seriesVisuals.Count <= index)
+        {
+            var fillGeometry = new PathGeometry();
+            var lineGeometry = new PathGeometry();
+            var visual = new SeriesVisual
+            {
+                Fill = new Path { Data = fillGeometry, IsHitTestVisible = false },
+                FillGeometry = fillGeometry,
+                Line = new Path
+                {
+                    Data = lineGeometry,
+                    StrokeLineJoin = PenLineJoin.Round,
+                    StrokeStartLineCap = PenLineCap.Round,
+                    StrokeEndLineCap = PenLineCap.Round,
+                    IsHitTestVisible = false,
+                },
+                LineGeometry = lineGeometry,
+                Glow = new Ellipse { Width = 14, Height = 14, Opacity = 0.22, IsHitTestVisible = false },
+                Dot = new Ellipse { Width = 5.5, Height = 5.5, IsHitTestVisible = false },
+            };
+            _fillLayer.Children.Add(visual.Fill);
+            _lineLayer.Children.Add(visual.Line);
+            _lineLayer.Children.Add(visual.Glow);
+            _lineLayer.Children.Add(visual.Dot);
+            _seriesVisuals.Add(visual);
+        }
+
+        return _seriesVisuals[index];
+    }
+
+    private void HideSeriesVisuals(int from)
+    {
+        for (var index = from; index < _seriesVisuals.Count; index++)
+        {
+            var visual = _seriesVisuals[index];
+            visual.Fill.Visibility = Visibility.Collapsed;
+            visual.Line.Visibility = Visibility.Collapsed;
+            visual.Glow.Visibility = Visibility.Collapsed;
+            visual.Dot.Visibility = Visibility.Collapsed;
+        }
+    }
+
+    /// <summary>
+    /// Writes each gap-free run as one figure with one PolyLineSegment, reusing figures. A fill
+    /// closes down to the plot floor at both ends.
+    /// </summary>
+    private static void SetFigures(
+        PathGeometry geometry,
+        List<IReadOnlyList<Windows.Foundation.Point>> runs,
+        double plotBottom,
+        bool closed)
+    {
+        var figures = geometry.Figures;
+        for (var index = 0; index < runs.Count; index++)
+        {
+            var run = runs[index];
+            PathFigure figure;
+            PolyLineSegment polyline;
+            if (index < figures.Count && figures[index].Segments.Count == 1 && figures[index].Segments[0] is PolyLineSegment existing)
+            {
+                figure = figures[index];
+                polyline = existing;
+            }
+            else
+            {
+                polyline = new PolyLineSegment();
+                figure = new PathFigure();
+                figure.Segments.Add(polyline);
+                if (index < figures.Count)
+                {
+                    figures[index] = figure;
+                }
+                else
+                {
+                    figures.Add(figure);
+                }
+            }
+
+            // A fresh collection, assigned: in-place edits to a PointCollection are not reliably
+            // picked up by the renderer, while a property assignment always is.
+            var points = new PointCollection();
+            if (closed)
+            {
+                figure.StartPoint = new Windows.Foundation.Point(run[0].X, plotBottom);
+                for (var k = 0; k < run.Count; k++)
+                {
+                    points.Add(run[k]);
+                }
+
+                points.Add(new Windows.Foundation.Point(run[^1].X, plotBottom));
+            }
+            else
+            {
+                figure.StartPoint = run[0];
+                for (var k = 1; k < run.Count; k++)
+                {
+                    points.Add(run[k]);
+                }
+            }
+
+            figure.IsClosed = closed;
+            figure.IsFilled = closed;
+            polyline.Points = points;
+        }
+
+        while (figures.Count > runs.Count)
+        {
+            figures.RemoveAt(figures.Count - 1);
+        }
+    }
+
+    private void PlaceDot(int index, Windows.Foundation.Point point, Brush brush)
+    {
+        const double size = 5;
+        var dot = Pooled(_soloDots, index, _lineLayer, () => new Ellipse { Width = size, Height = size, IsHitTestVisible = false });
+        dot.Fill = brush;
+        Canvas.SetLeft(dot, point.X - (size / 2d));
+        Canvas.SetTop(dot, point.Y - (size / 2d));
+    }
+
+    /// <summary>Returns pool element <paramref name="index"/>, creating it on first use, visible.</summary>
+    private static T Pooled<T>(List<T> pool, int index, Canvas host, Func<T> create)
+        where T : UIElement
+    {
+        while (pool.Count <= index)
+        {
+            var created = create();
+            pool.Add(created);
+            host.Children.Add(created);
+        }
+
+        var element = pool[index];
+        element.Visibility = Visibility.Visible;
+        return element;
+    }
+
+    private static void HideFrom<T>(List<T> pool, int count)
+        where T : UIElement
+    {
+        for (var index = count; index < pool.Count; index++)
+        {
+            pool[index].Visibility = Visibility.Collapsed;
+        }
+    }
+
+    private static void SetText(TextBlock block, string text)
+    {
+        // An identical string still invalidates text layout.
+        if (!string.Equals(block.Text, text, StringComparison.Ordinal))
+        {
+            block.Text = text;
+        }
     }
 
     private void UpdatePlotSurface(double plotWidth, double plotHeight)
@@ -577,49 +777,44 @@ public sealed class TelemetryChart : UserControl
 
         for (var index = 0; index < divisions; index++)
         {
-            var y = TopPadding + ((plotHeight / divisions) * index);
-            _gridCanvas.Children.Add(new Rectangle
-            {
-                Width = plotWidth,
-                Height = plotHeight / divisions,
-                Fill = ResolveBrush("SurfaceGridBrush", index % 2 == 0 ? "#274768" : "#1B3650"),
-                Opacity = index % 2 == 0 ? 0.06 : 0.03,
-            });
-
-            Canvas.SetLeft(_gridCanvas.Children[^1], LeftPadding);
-            Canvas.SetTop(_gridCanvas.Children[^1], y);
+            var band = Pooled(_gridBands, index, _gridCanvas, () => new Rectangle { IsHitTestVisible = false });
+            band.Width = plotWidth;
+            band.Height = plotHeight / divisions;
+            band.Fill = gridBrush;
+            band.Opacity = index % 2 == 0 ? 0.06 : 0.03;
+            Canvas.SetLeft(band, LeftPadding);
+            Canvas.SetTop(band, TopPadding + ((plotHeight / divisions) * index));
         }
+
+        HideFrom(_gridBands, divisions);
 
         for (var index = 0; index <= divisions; index++)
         {
             var y = TopPadding + ((plotHeight / divisions) * index);
-            _gridCanvas.Children.Add(new Line
-            {
-                Stroke = gridBrush,
-                StrokeThickness = 1,
-                Opacity = index is 0 || index == divisions ? 0.28 : 0.16,
-                X1 = LeftPadding,
-                X2 = LeftPadding + plotWidth,
-                Y1 = y,
-                Y2 = y,
-            });
+            var row = Pooled(_gridRows, index, _gridCanvas, () => new Line { StrokeThickness = 1, IsHitTestVisible = false });
+            row.Stroke = gridBrush;
+            row.Opacity = index is 0 || index == divisions ? 0.28 : 0.16;
+            row.X1 = LeftPadding;
+            row.X2 = LeftPadding + plotWidth;
+            row.Y1 = y;
+            row.Y2 = y;
         }
 
+        HideFrom(_gridRows, divisions + 1);
+
+        var columnIndex = 0;
+        var labelIndex = 0;
         for (var index = 0; index <= divisions; index++)
         {
             var x = LeftPadding + ((plotWidth / divisions) * index);
             if (index is not 0 && index != divisions)
             {
-                _gridCanvas.Children.Add(new Line
-                {
-                    Stroke = gridBrush,
-                    StrokeThickness = 1,
-                    Opacity = 0.08,
-                    X1 = x,
-                    X2 = x,
-                    Y1 = TopPadding,
-                    Y2 = bottomY,
-                });
+                var column = Pooled(_gridColumns, columnIndex++, _gridCanvas, () => new Line { StrokeThickness = 1, Opacity = 0.08, IsHitTestVisible = false });
+                column.Stroke = gridBrush;
+                column.X1 = x;
+                column.X2 = x;
+                column.Y1 = TopPadding;
+                column.Y2 = bottomY;
             }
 
             if (!includeLabels)
@@ -635,62 +830,69 @@ public sealed class TelemetryChart : UserControl
             }
 
             var tick = start + TimeSpan.FromTicks((end - start).Ticks / divisions * index);
-            var label = new TextBlock
-            {
-                FontFamily = s_numericFont,
-                FontSize = 9,
-                Foreground = ResolveBrush("TextMutedBrush", "#7D9AB6"),
-                Text = FormatTimeLabel(tick, end - start),
-            };
-            _gridCanvas.Children.Add(label);
-            Canvas.SetLeft(label, Math.Clamp(x - 18, LeftPadding, width - 54));
+            var label = Pooled(_timeLabels, labelIndex++, _gridCanvas, () => CreateAxisLabel(10));
+            label.Foreground = ResolveBrush("TextMutedBrush", "#7D9AB6");
+            SetText(label, FormatTimeLabel(tick, end - start));
+            Canvas.SetLeft(label, Math.Clamp(x - 20, LeftPadding, width - 58));
             Canvas.SetTop(label, bottomY + 4);
         }
 
+        HideFrom(_gridColumns, columnIndex);
+        HideFrom(_timeLabels, labelIndex);
+
+        _ceilingLabel ??= AddAxisLabel(10);
+        _midLabel ??= AddAxisLabel(10);
+        _floorLabel ??= AddAxisLabel(10);
         if (!includeLabels)
         {
+            _ceilingLabel.Visibility = Visibility.Collapsed;
+            _midLabel.Visibility = Visibility.Collapsed;
+            _floorLabel.Visibility = Visibility.Collapsed;
             return;
         }
 
-        var ceiling = new TextBlock
-        {
-            FontFamily = s_numericFont,
-            FontSize = 9,
-            Foreground = ResolveBrush("TextSecondaryBrush", "#A8C2DA"),
-            Text = FormatAxisValue(maxValue, Unit),
-        };
-        _gridCanvas.Children.Add(ceiling);
-        Canvas.SetLeft(ceiling, LeftPadding);
-        Canvas.SetTop(ceiling, 2);
+        _ceilingLabel.Foreground = ResolveBrush("TextSecondaryBrush", "#A8C2DA");
+        SetText(_ceilingLabel, FormatAxisValue(maxValue, Unit));
+        Canvas.SetLeft(_ceilingLabel, LeftPadding);
+        Canvas.SetTop(_ceilingLabel, 2);
+        _ceilingLabel.Visibility = Visibility.Visible;
 
         // Mid-point Y-axis label for context
-        if (maxValue > 0 && plotHeight >= 80)
+        var showMid = maxValue > 0 && plotHeight >= 80;
+        _midLabel.Visibility = showMid ? Visibility.Visible : Visibility.Collapsed;
+        if (showMid)
         {
-            var midValue = maxValue / 2d;
-            var midY = TopPadding + (plotHeight / 2d);
-            var midLabel = new TextBlock
-            {
-                FontFamily = s_numericFont,
-                FontSize = 8.5,
-                Foreground = ResolveBrush("TextMutedBrush", "#7D9AB6"),
-                Text = FormatAxisValue(midValue, Unit),
-                Opacity = 0.6,
-            };
-            _gridCanvas.Children.Add(midLabel);
-            Canvas.SetLeft(midLabel, LeftPadding);
-            Canvas.SetTop(midLabel, midY - 6);
+            _midLabel.Foreground = ResolveBrush("TextMutedBrush", "#7D9AB6");
+            SetText(_midLabel, FormatAxisValue(maxValue / 2d, Unit));
+            Canvas.SetLeft(_midLabel, LeftPadding);
+            Canvas.SetTop(_midLabel, TopPadding + (plotHeight / 2d) - 6);
         }
 
-        var floor = new TextBlock
+        _floorLabel.Foreground = ResolveBrush("TextSecondaryBrush", "#A8C2DA");
+        SetText(_floorLabel, FormatAxisValue(0d, Unit));
+        Canvas.SetLeft(_floorLabel, LeftPadding);
+        Canvas.SetTop(_floorLabel, bottomY - 15);
+        _floorLabel.Visibility = Visibility.Visible;
+    }
+
+    private static TextBlock CreateAxisLabel(double fontSize, double opacity = 1d)
+    {
+        var label = new TextBlock
         {
             FontFamily = s_numericFont,
-            FontSize = 9,
-            Foreground = ResolveBrush("TextSecondaryBrush", "#A8C2DA"),
-            Text = FormatAxisValue(0d, Unit),
+            FontSize = fontSize,
+            Opacity = opacity,
+            IsHitTestVisible = false,
         };
-        _gridCanvas.Children.Add(floor);
-        Canvas.SetLeft(floor, LeftPadding);
-        Canvas.SetTop(floor, bottomY - 14);
+        Microsoft.UI.Xaml.Documents.Typography.SetNumeralAlignment(label, FontNumeralAlignment.Tabular);
+        return label;
+    }
+
+    private TextBlock AddAxisLabel(double fontSize, double opacity = 1d)
+    {
+        var label = CreateAxisLabel(fontSize, opacity);
+        _gridCanvas.Children.Add(label);
+        return label;
     }
 
     private double ResolveMaxValue(double peak)
@@ -711,20 +913,6 @@ public sealed class TelemetryChart : UserControl
         }
 
         return peak * 1.14d;
-    }
-
-    private void DrawPoint(Windows.Foundation.Point point, Brush brush, double size)
-    {
-        var dot = new Ellipse
-        {
-            Width = size,
-            Height = size,
-            Fill = brush,
-        };
-
-        Canvas.SetLeft(dot, point.X - (size / 2d));
-        Canvas.SetTop(dot, point.Y - (size / 2d));
-        _dataCanvas.Children.Add(dot);
     }
 
     private static IReadOnlyList<MetricPoint> Downsample(IReadOnlyList<MetricPoint> points, int maxPoints)
@@ -1076,45 +1264,6 @@ public sealed class TelemetryChart : UserControl
         }
 
         return segments;
-    }
-
-    private static Geometry BuildLineGeometry(IReadOnlyList<Windows.Foundation.Point> points)
-    {
-        var segments = new PathSegmentCollection();
-        for (var index = 1; index < points.Count; index++)
-        {
-            segments.Add(new LineSegment { Point = points[index] });
-        }
-
-        return new PathGeometry
-        {
-            Figures = { new PathFigure { StartPoint = points[0], IsClosed = false, IsFilled = false, Segments = segments } },
-        };
-    }
-
-    private static Geometry BuildAreaGeometry(IReadOnlyList<Windows.Foundation.Point> points, double height)
-    {
-        var segments = new PathSegmentCollection();
-        segments.Add(new LineSegment { Point = points[0] });
-        for (var index = 1; index < points.Count; index++)
-        {
-            segments.Add(new LineSegment { Point = points[index] });
-        }
-        segments.Add(new LineSegment { Point = new Windows.Foundation.Point(points[^1].X, height) });
-
-        return new PathGeometry
-        {
-            Figures =
-            {
-                new PathFigure
-                {
-                    StartPoint = new Windows.Foundation.Point(points[0].X, height),
-                    IsClosed = true,
-                    IsFilled = true,
-                    Segments = segments,
-                },
-            },
-        };
     }
 
     private static Brush ResolveBrush(string key, string fallbackHex) => ThemeVisuals.ResolveBrush(key, fallbackHex);

@@ -24,8 +24,24 @@ public sealed class SqliteMetricStore : IMetricStore
     private SqliteParameter? _timestampMsParameter;
     private SqliteParameter? _valueParameter;
     private DateTimeOffset _nextMaintenanceUtc = DateTimeOffset.MinValue;
+    private int _disposeStarted;
 
     public async Task InitializeAsync(VaktrConfig config, CancellationToken cancellationToken)
+    {
+        ThrowIfDisposed();
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ThrowIfDisposed();
+            await InitializeCoreAsync(config, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    private async Task InitializeCoreAsync(VaktrConfig config, CancellationToken cancellationToken)
     {
         config = config.Normalize();
         Directory.CreateDirectory(config.StorageDirectory);
@@ -168,6 +184,7 @@ public sealed class SqliteMetricStore : IMetricStore
 
     public async Task AppendSnapshotAsync(MetricSnapshot snapshot, CancellationToken cancellationToken)
     {
+        ThrowIfDisposed();
         if (snapshot.Samples.Count == 0)
         {
             return;
@@ -177,6 +194,7 @@ public sealed class SqliteMetricStore : IMetricStore
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            ThrowIfDisposed();
             var connection = EnsureWriteConnectionInitialized();
             var command = EnsureInsertCommandInitialized();
             await using var transaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
@@ -215,6 +233,7 @@ public sealed class SqliteMetricStore : IMetricStore
         DateTimeOffset fromUtc,
         CancellationToken cancellationToken)
     {
+        ThrowIfDisposed();
         var connectionString = EnsureInitialized();
         await using var connection = new SqliteConnection(connectionString);
         await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
@@ -228,9 +247,9 @@ public sealed class SqliteMetricStore : IMetricStore
         // downsamples to ~180 points regardless, so second-resolution raw samples
         // for the last 6h would get collapsed to a single pixel anyway. Avoiding
         // the UNION saves hundreds of thousands of rows on a 30d load.
-        var wideRangeRollupsOnly = loadedWindow >= TimeSpan.FromHours(24);
+        var wideRange = loadedWindow >= TimeSpan.FromHours(24);
 
-        command.CommandText = wideRangeRollupsOnly
+        command.CommandText = wideRange
             ? """
               SELECT
                   panel_key,
@@ -241,8 +260,48 @@ public sealed class SqliteMetricStore : IMetricStore
                   unit,
                   timestamp_ms,
                   value
-              FROM metric_rollups_1m
-              WHERE timestamp_ms >= $fromTimestamp
+              FROM (
+                  SELECT
+                      panel_key,
+                      panel_title,
+                      series_key,
+                      series_name,
+                      category,
+                      unit,
+                      timestamp_ms,
+                      value
+                  FROM metric_rollups_1m
+                  WHERE timestamp_ms >= $fromTimestamp
+
+                  UNION ALL
+
+                  SELECT
+                      samples.panel_key,
+                      samples.panel_title,
+                      samples.series_key,
+                      samples.series_name,
+                      samples.category,
+                      samples.unit,
+                      (samples.timestamp_ms / $bucketMs) * $bucketMs AS timestamp_ms,
+                      AVG(samples.value) AS value
+                  FROM metric_samples AS samples
+                  WHERE samples.timestamp_ms >= $fromTimestamp
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM metric_rollups_1m AS rollups
+                        WHERE rollups.panel_key = samples.panel_key
+                          AND rollups.series_key = samples.series_key
+                          AND rollups.timestamp_ms = (samples.timestamp_ms / $bucketMs) * $bucketMs
+                    )
+                  GROUP BY
+                      samples.panel_key,
+                      samples.panel_title,
+                      samples.series_key,
+                      samples.series_name,
+                      samples.category,
+                      samples.unit,
+                      (samples.timestamp_ms / $bucketMs)
+              )
               ORDER BY panel_key, series_key, timestamp_ms;
               """
             : """
@@ -286,7 +345,11 @@ public sealed class SqliteMetricStore : IMetricStore
               ORDER BY panel_key, series_key, timestamp_ms;
               """;
         command.Parameters.AddWithValue("$fromTimestamp", fromMs);
-        if (!wideRangeRollupsOnly)
+        if (wideRange)
+        {
+            command.Parameters.AddWithValue("$bucketMs", MinuteBucketMilliseconds);
+        }
+        else
         {
             command.Parameters.AddWithValue("$rawBoundary", rawBoundaryMs);
         }
@@ -321,10 +384,12 @@ public sealed class SqliteMetricStore : IMetricStore
 
     public async Task PruneAsync(VaktrConfig config, CancellationToken cancellationToken)
     {
+        ThrowIfDisposed();
         _ = EnsureInitialized();
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            ThrowIfDisposed();
             _config = config.Normalize();
             var connection = EnsureWriteConnectionInitialized();
             await CompactAndPruneAsync(connection, _config, DateTimeOffset.UtcNow, cancellationToken).ConfigureAwait(false);
@@ -336,10 +401,32 @@ public sealed class SqliteMetricStore : IMetricStore
         }
     }
 
-    public ValueTask DisposeAsync()
+    public async ValueTask DisposeAsync()
     {
-        _gate.Dispose();
-        return DisposeCoreAsync();
+        if (Interlocked.Exchange(ref _disposeStarted, 1) != 0)
+        {
+            return;
+        }
+
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            await DisposeCoreAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            // Keep the semaphore alive so operations that were already queued can
+            // acquire it, observe disposal, and release it without racing Dispose.
+            _gate.Release();
+        }
+    }
+
+    private void ThrowIfDisposed()
+    {
+        if (Volatile.Read(ref _disposeStarted) != 0)
+        {
+            throw new ObjectDisposedException(nameof(SqliteMetricStore));
+        }
     }
 
     private string EnsureInitialized() =>
@@ -371,12 +458,16 @@ public sealed class SqliteMetricStore : IMetricStore
         var retentionWindow = config.GetRetentionWindow();
         var retentionCutoffMs = now.Subtract(retentionWindow).ToUnixTimeMilliseconds();
         var rawCutoffMs = now.Subtract(RawResolutionWindow).ToUnixTimeMilliseconds();
+        rawCutoffMs = rawCutoffMs / MinuteBucketMilliseconds * MinuteBucketMilliseconds;
+
+        await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
 
         // Only compact raw samples into rollups if retention extends beyond the raw window.
         // If retention is shorter than the raw window, we skip compaction and just delete everything older.
         if (retentionWindow > RawResolutionWindow)
         {
             var compactCommand = connection.CreateCommand();
+            compactCommand.Transaction = transaction;
             compactCommand.CommandText =
                 """
                 INSERT OR REPLACE INTO metric_rollups_1m (
@@ -418,15 +509,18 @@ public sealed class SqliteMetricStore : IMetricStore
 
         // Delete raw samples: if retention < raw window, honor the retention cutoff directly
         var deleteRawCommand = connection.CreateCommand();
+        deleteRawCommand.Transaction = transaction;
         deleteRawCommand.CommandText = "DELETE FROM metric_samples WHERE timestamp_ms < $cutoff;";
         deleteRawCommand.Parameters.AddWithValue("$cutoff", retentionWindow > RawResolutionWindow ? rawCutoffMs : retentionCutoffMs);
         await deleteRawCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
 
         // Delete rollup data older than retention
         var deleteRollupCommand = connection.CreateCommand();
+        deleteRollupCommand.Transaction = transaction;
         deleteRollupCommand.CommandText = "DELETE FROM metric_rollups_1m WHERE timestamp_ms < $cutoff;";
         deleteRollupCommand.Parameters.AddWithValue("$cutoff", retentionCutoffMs);
         await deleteRollupCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
 
         var maintenanceCommand = connection.CreateCommand();
         maintenanceCommand.CommandText =

@@ -13,6 +13,7 @@ public sealed class MainViewModel : ObservableObject
     private readonly Dictionary<string, PanelLayout> _panelLayouts = new(StringComparer.OrdinalIgnoreCase);
     private bool _dashboardPanelsDirty = true;
     private bool _panelTogglesDirty = true;
+    private bool _panelLayoutsNeedResolution;
 
     private string _storageDirectory = string.Empty;
     private string _scrapeIntervalInput = string.Empty;
@@ -456,6 +457,8 @@ public sealed class MainViewModel : ObservableObject
         {
             _panelLayouts[key] = layout.Clone().Normalize();
         }
+
+        _panelLayoutsNeedResolution = true;
     }
 
     /// <summary>
@@ -505,14 +508,20 @@ public sealed class MainViewModel : ObservableObject
             _panelLayouts.Remove(stale);
         }
 
-        ResolvePanelLayouts();
+        if (_panelLayoutsNeedResolution)
+        {
+            ResolvePanelLayouts();
+        }
     }
 
-    /// <summary>Runs the collision engine over current geometry and writes the result back.</summary>
+    /// <summary>
+    /// Fixes loaded overlaps without compacting intentional saved gaps, then writes the result back.
+    /// </summary>
     public void ResolvePanelLayouts()
     {
         if (_panelLayouts.Count == 0)
         {
+            _panelLayoutsNeedResolution = false;
             return;
         }
 
@@ -522,10 +531,11 @@ public sealed class MainViewModel : ObservableObject
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .Select(k => new PanelPlacement(k, _panelLayouts[k]));
 
-        foreach (var placement in GridLayoutEngine.Resolve(ordered))
+        foreach (var placement in GridLayoutEngine.ResolveResponsive(ordered, PanelLayout.MinWidth))
         {
             _panelLayouts[placement.Key] = placement.Layout;
         }
+        _panelLayoutsNeedResolution = false;
     }
 
     public PanelLayout? GetPanelLayout(string panelKey)
@@ -544,6 +554,7 @@ public sealed class MainViewModel : ObservableObject
         {
             _panelLayouts[key] = layout.Clone();
         }
+        _panelLayoutsNeedResolution = false;
     }
 
     /// <summary>Applies an engine result (from a move or resize) to the stored geometry.</summary>
@@ -553,6 +564,7 @@ public sealed class MainViewModel : ObservableObject
         {
             _panelLayouts[placement.Key] = placement.Layout;
         }
+        _panelLayoutsNeedResolution = false;
     }
 
     public bool SetPanelSizePreset(string panelKey, PanelSizePreset preset)

@@ -15,6 +15,33 @@ namespace Vaktr.App.Controls;
 // from wherever the value currently is, not restart a fixed From→To animation.
 //
 // Everything here is UI-thread only; CompositionTarget.Rendering fires on the UI thread.
+
+/// <summary>
+/// The app's motion vocabulary. Every animation picks one of these instead of a hand-tuned
+/// number, so the same kind of change always moves at the same speed - the consistency is what
+/// makes an interface feel deliberate rather than assembled. Durations are milliseconds.
+/// </summary>
+internal static class MotionTokens
+{
+    /// <summary>Direct feedback under the pointer: hover highlights, grip emphasis, presses.</summary>
+    public const double Instant = 90;
+
+    /// <summary>Small reveals and dismissals: fades, chips appearing, a card lifting.</summary>
+    public const double Quick = 150;
+
+    /// <summary>Things settling into place: drops, view changes, a card being set down.</summary>
+    public const double Standard = 220;
+
+    /// <summary>Larger spatial changes that need to be followed by eye.</summary>
+    public const double Emphasized = 320;
+
+    /// <summary>Spring response for motion the user drives directly (seconds).</summary>
+    public const double GestureResponse = 0.26;
+
+    /// <summary>Spring response for things that make room for the user's motion (seconds).</summary>
+    public const double ReflowResponse = 0.32;
+}
+
 internal static class Motion
 {
     /// <summary>Standard duration for a value settling into place. Must stay well under the
@@ -30,10 +57,12 @@ internal static class Motion
     private const float EntranceRise = 6f;
 
     private static bool? s_animationsEnabled;
+    private static Windows.UI.ViewManagement.UISettings? s_uiSettings;
 
     /// <summary>
-    /// Honours the OS "show animations in Windows" setting. When off, every animator in this
-    /// file degrades to an immediate snap — the pre-animation behaviour.
+    /// Honours the OS "Animation effects" setting. When off, every animator degrades to an
+    /// immediate snap. Cached, but refreshed when the setting changes - it used to be read once
+    /// per process, so turning animations off in Windows had no effect until a restart.
     /// </summary>
     public static bool AnimationsEnabled
     {
@@ -43,7 +72,21 @@ internal static class Motion
             bool value;
             try
             {
-                value = new Windows.UI.ViewManagement.UISettings().AnimationsEnabled;
+                if (s_uiSettings is null)
+                {
+                    // Kept in a static: the change event only fires while the instance is alive.
+                    s_uiSettings = new Windows.UI.ViewManagement.UISettings();
+                    try
+                    {
+                        s_uiSettings.AnimationsEnabledChanged += (_, _) => s_animationsEnabled = null;
+                    }
+                    catch
+                    {
+                        // Event unavailable on older Windows builds; the cached value stands.
+                    }
+                }
+
+                value = s_uiSettings.AnimationsEnabled;
             }
             catch
             {
@@ -190,6 +233,87 @@ internal static class MotionTicker
                 }
             }
         }
+    }
+}
+
+/// <summary>
+/// A critically damped spring: the motion model for anything the user drives directly.
+///
+/// An eased tween restarts its curve on every retarget, so a value chased by a pointer lurches
+/// each time the target moves - fast, slow, fast. A spring carries its velocity through a
+/// retarget, which is what makes interactive motion feel continuous rather than stepped
+/// (the approach Apple's UIKit uses for interruptible animations). Critical damping settles
+/// as fast as possible without overshoot, so a panel never bounces past its slot.
+///
+/// Integrated with the closed-form solution rather than Euler steps, so a long frame (a GC
+/// pause, a slow redraw) lands exactly where the curve says instead of overshooting.
+/// </summary>
+internal sealed class SpringValue
+{
+    private readonly double _omega;
+
+    public SpringValue(double initial = 0d, double responseSeconds = 0.28)
+    {
+        Value = initial;
+        Target = initial;
+        // Response is the time to settle visually; omega is the matching natural frequency.
+        _omega = 2d * Math.PI / Math.Max(0.05, responseSeconds);
+    }
+
+    public double Value { get; private set; }
+
+    public double Target { get; private set; }
+
+    public double Velocity { get; private set; }
+
+    public bool IsSettled => Value == Target && Velocity == 0d;
+
+    public void SetTarget(double target)
+    {
+        Target = target;
+        if (!Motion.AnimationsEnabled)
+        {
+            Snap(target);
+        }
+    }
+
+    /// <summary>Moves value and target together, keeping velocity - a frame-of-reference shift.</summary>
+    public void Shift(double delta)
+    {
+        Value += delta;
+        Target += delta;
+    }
+
+    public void Snap(double value)
+    {
+        Value = value;
+        Target = value;
+        Velocity = 0d;
+    }
+
+    /// <summary>Advances by <paramref name="dt"/> seconds. Returns true while still moving.</summary>
+    public bool Step(double dt)
+    {
+        if (IsSettled)
+        {
+            return false;
+        }
+
+        dt = Math.Clamp(dt, 0d, 0.064);
+        var c1 = Value - Target;
+        var c2 = Velocity + (_omega * c1);
+        var decay = Math.Exp(-_omega * dt);
+        Value = Target + ((c1 + (c2 * dt)) * decay);
+        Velocity = (c2 - (_omega * (c1 + (c2 * dt)))) * decay;
+
+        // Sub-pixel and nearly still: finish exactly on target so the final frame is crisp.
+        if (Math.Abs(Value - Target) < 0.08 && Math.Abs(Velocity) < 2d)
+        {
+            Snap(Target);
+            return false;
+        }
+
+        return true;
     }
 }
 

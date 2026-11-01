@@ -13,9 +13,20 @@ public sealed class JsonConfigStore : IConfigStore
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
     };
 
+    private readonly string? _configPath;
+
+    /// <summary>
+    /// Creates a config store. Supplying a path is useful for isolated environments
+    /// such as tests; normal app usage keeps the per-user Vaktr settings location.
+    /// </summary>
+    public JsonConfigStore(string? configPath = null)
+    {
+        _configPath = string.IsNullOrWhiteSpace(configPath) ? null : Path.GetFullPath(configPath);
+    }
+
     public async Task<VaktrConfig> LoadAsync(CancellationToken cancellationToken)
     {
-        var path = ResolveConfigPath();
+        var path = _configPath ?? ResolveConfigPath();
         if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
         {
             return VaktrConfig.CreateDefault().Normalize();
@@ -34,10 +45,14 @@ public sealed class JsonConfigStore : IConfigStore
         await SaveGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            Directory.CreateDirectory(VaktrConfig.SettingsDirectory);
+            var destination = _configPath ?? VaktrConfig.GetConfigPath();
+            var destinationDirectory = Path.GetDirectoryName(destination);
+            if (!string.IsNullOrWhiteSpace(destinationDirectory))
+            {
+                Directory.CreateDirectory(destinationDirectory);
+            }
             Directory.CreateDirectory(config.StorageDirectory);
 
-            var destination = VaktrConfig.GetConfigPath();
             var temporary = $"{destination}.{Guid.NewGuid():N}.tmp";
             try
             {
