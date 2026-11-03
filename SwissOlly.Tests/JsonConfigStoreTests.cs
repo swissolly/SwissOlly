@@ -19,6 +19,56 @@ public sealed class JsonConfigStoreTests : IDisposable
         Assert.Single(Directory.GetFiles(_tempDir, "swissolly-settings.json.corrupt-*"));
     }
 
+    [Theory]
+    [InlineData("{ \"scrapeIntervalSeconds\": \"fast\" }")]
+    [InlineData("{ \"scrapeIntervalSeconds\": 99999999999999 }")]
+    [InlineData("{ \"panelLayouts\": [1, 2, 3] }")]
+    [InlineData("[]")]
+    public async Task Load_Wrong_Types_Fall_Back_To_Defaults(string contents)
+    {
+        Directory.CreateDirectory(_tempDir);
+        var configPath = Path.Combine(_tempDir, "swissolly-settings.json");
+        await File.WriteAllTextAsync(configPath, contents);
+
+        var loaded = await new SwissOlly.Store.Persistence.JsonConfigStore(configPath).LoadAsync(CancellationToken.None);
+
+        Assert.Equal(SwissOllyConfig.DefaultScrapeIntervalSeconds, loaded.ScrapeIntervalSeconds);
+        Assert.Equal(SwissOllyConfig.DefaultStorageDirectory, loaded.StorageDirectory);
+        Assert.Single(Directory.GetFiles(_tempDir, "swissolly-settings.json.corrupt-*"));
+    }
+
+    [Fact]
+    public async Task Load_Hostile_Values_Are_Normalized_Instead_Of_Trusted()
+    {
+        Directory.CreateDirectory(_tempDir);
+        var configPath = Path.Combine(_tempDir, "swissolly-settings.json");
+        await File.WriteAllTextAsync(configPath, """
+            {
+              "scrapeIntervalSeconds": -4,
+              "graphWindowMinutes": 2147483647,
+              "maxRetentionHours": 2147483647,
+              "retentionInputText": "99999999d",
+              "theme": 999,
+              "storageDirectory": "\\\\evil\\share\\swissolly",
+              "panelLayouts": { "cpu-total": null, "memory": { "x": -50, "y": 999999, "w": 0, "h": -1 } }
+            }
+            """);
+
+        var loaded = await new SwissOlly.Store.Persistence.JsonConfigStore(configPath).LoadAsync(CancellationToken.None);
+
+        Assert.Equal(SwissOllyConfig.DefaultScrapeIntervalSeconds, loaded.ScrapeIntervalSeconds);
+        Assert.Equal(SwissOllyConfig.DefaultGraphWindowMinutes, loaded.GraphWindowMinutes);
+        Assert.Equal(TimeSpan.FromHours(SwissOllyConfig.DefaultMaxRetentionHours), loaded.GetRetentionWindow());
+        Assert.Equal(ThemeMode.Dark, loaded.Theme);
+        Assert.Equal(SwissOllyConfig.DefaultStorageDirectory, loaded.StorageDirectory);
+        Assert.False(loaded.PanelLayouts.ContainsKey("cpu-total"));
+        var memory = loaded.PanelLayouts["memory"];
+        Assert.InRange(memory.X, 0, PanelLayout.Columns - 1);
+        Assert.InRange(memory.W, 1, PanelLayout.Columns);
+        Assert.InRange(memory.H, PanelLayout.MinHeight, PanelLayout.MaxHeight);
+        Assert.InRange(memory.Y, 0, PanelLayout.MaxY);
+    }
+
     [Fact]
     public async Task Save_Then_Load_Preserves_Settings_Across_Store_Restart()
     {

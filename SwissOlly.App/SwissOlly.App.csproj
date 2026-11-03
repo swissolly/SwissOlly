@@ -23,8 +23,12 @@
   </PropertyGroup>
 
   <!-- Precompile the shipped build: JIT is a large share of a cold launch. Publish-only. -->
+  <!-- Ship the Windows App SDK runtime inside the app. Framework-dependent, a PC without
+       Windows App Runtime 1.8 stopped at a "requires the Windows App Runtime" download prompt on
+       first launch. Measured: about +100 MB unpacked, and the same warm launch time. -->
   <PropertyGroup Condition="'$(Configuration)' == 'Release'">
     <PublishReadyToRun>true</PublishReadyToRun>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
   </PropertyGroup>
 
   <ItemGroup>

@@ -76,13 +76,11 @@ internal static class Motion
                 {
                     // Kept in a static: the change event only fires while the instance is alive.
                     s_uiSettings = new Windows.UI.ViewManagement.UISettings();
-                    try
+                    // The change event arrived in Windows 10 2004; before that the value read at
+                    // first use stands until restart.
+                    if (OperatingSystem.IsWindowsVersionAtLeast(10, 0, 19041))
                     {
                         s_uiSettings.AnimationsEnabledChanged += (_, _) => s_animationsEnabled = null;
-                    }
-                    catch
-                    {
-                        // Event unavailable on older Windows builds; the cached value stands.
                     }
                 }
 
@@ -103,7 +101,17 @@ internal static class Motion
         return 1d - (inv * inv * inv);
     }
 
+    /// <summary>Entrance for switching between sibling views: slides in from the side the view
+    /// sits on in the navigation (+1 from the right, -1 from the left) instead of rising.</summary>
+    public static void PlayDirectionalEntrance(UIElement element, int direction)
+        => PlayEntrance(element, default, new Vector3(Math.Sign(direction) * EntranceSlide, 0f, 0f));
+
+    private const float EntranceSlide = 28f;
+
     public static void PlayEntrance(UIElement element, TimeSpan delay = default)
+        => PlayEntrance(element, delay, new Vector3(0f, EntranceRise, 0f));
+
+    private static void PlayEntrance(UIElement element, TimeSpan delay, Vector3 from)
     {
         if (!AnimationsEnabled || element.XamlRoot is null)
         {
@@ -129,13 +137,13 @@ internal static class Motion
             opacity.DelayTime = delay;
 
             var offset = compositor.CreateVector3KeyFrameAnimation();
-            offset.InsertKeyFrame(0f, new Vector3(0f, EntranceRise, 0f));
+            offset.InsertKeyFrame(0f, from);
             offset.InsertKeyFrame(1f, Vector3.Zero, easing);
             offset.Duration = TimeSpan.FromMilliseconds(210);
             offset.DelayTime = delay;
 
             visual.Opacity = 0f;
-            visual.Offset = new Vector3(0f, EntranceRise, 0f);
+            visual.Offset = from;
             visual.StartAnimation("Opacity", opacity);
             visual.StartAnimation("Offset", offset);
         }

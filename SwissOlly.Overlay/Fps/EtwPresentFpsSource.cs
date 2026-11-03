@@ -269,48 +269,48 @@ internal sealed class EtwPresentFpsSource : IFpsSource
         var raiseStall = false;
         try
         {
-        lock (_gate)
-        {
-            long freq = System.Diagnostics.Stopwatch.Frequency;
-
-            if (System.Diagnostics.Stopwatch.GetTimestamp() - _lastPresentTick > StallSeconds * freq)
+            lock (_gate)
             {
-                _presentTicks.Clear();
-                if (!_stallReported)
+                long freq = System.Diagnostics.Stopwatch.Frequency;
+
+                if (System.Diagnostics.Stopwatch.GetTimestamp() - _lastPresentTick > StallSeconds * freq)
                 {
-                    // Game is alive but not presenting - minimised, loading, or fully occluded.
-                    // Raised outside the lock below: subscribers run arbitrary code (the
-                    // controller re-renders under its own lock), and any path back into _gate
-                    // would deadlock the emit timer against the consumer callback.
-                    _stallReported = true;
-                    raiseStall = true;
+                    _presentTicks.Clear();
+                    if (!_stallReported)
+                    {
+                        // Game is alive but not presenting - minimised, loading, or fully occluded.
+                        // Raised outside the lock below: subscribers run arbitrary code (the
+                        // controller re-renders under its own lock), and any path back into _gate
+                        // would deadlock the emit timer against the consumer callback.
+                        _stallReported = true;
+                        raiseStall = true;
+                    }
+                    return;
                 }
-                return;
+
+                _stallReported = false;
+
+                if (_presentTicks.Count < 2) return;
+
+                long cutoff = _newestPresentTick - (long)(WindowSeconds * freq);
+                while (_presentTicks.Count > 2 && _presentTicks.Peek() < cutoff)
+                    _presentTicks.Dequeue();
+
+                if (_presentTicks.Count < 2) return;
+
+                // ETW delivers real-time events in buffer-sized batches roughly once a second, which
+                // is slower than this timer. Without this guard the same window is recomputed twice
+                // and the HUD emits each reading twice in a row.
+                long newest = _newestPresentTick;
+                if (newest == _lastEmittedTick) return;
+                _lastEmittedTick = newest;
+
+                double span = (newest - _presentTicks.Peek()) / (double)freq;
+                if (span <= 0) return;
+
+                // count-1 intervals span the window between first and last present.
+                fps = (_presentTicks.Count - 1) / span;
             }
-
-            _stallReported = false;
-
-            if (_presentTicks.Count < 2) return;
-
-            long cutoff = _newestPresentTick - (long)(WindowSeconds * freq);
-            while (_presentTicks.Count > 2 && _presentTicks.Peek() < cutoff)
-                _presentTicks.Dequeue();
-
-            if (_presentTicks.Count < 2) return;
-
-            // ETW delivers real-time events in buffer-sized batches roughly once a second, which
-            // is slower than this timer. Without this guard the same window is recomputed twice
-            // and the HUD emits each reading twice in a row.
-            long newest = _newestPresentTick;
-            if (newest == _lastEmittedTick) return;
-            _lastEmittedTick = newest;
-
-            double span = (newest - _presentTicks.Peek()) / (double)freq;
-            if (span <= 0) return;
-
-            // count-1 intervals span the window between first and last present.
-            fps = (_presentTicks.Count - 1) / span;
-        }
 
         }
         finally

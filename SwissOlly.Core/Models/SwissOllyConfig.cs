@@ -10,6 +10,9 @@ public sealed class SwissOllyConfig
     private const int DefaultMaxRetentionHoursValue = 24;
     private const int MaxGraphWindowMinutesValue = 60 * 24 * 30;
 
+    /// <summary>Longest retention accepted: ten years, the same ceiling as MaxRetentionHours.</summary>
+    public const long MaxRetentionMinutes = 3650L * 24 * 60;
+
     public int ScrapeIntervalSeconds { get; set; } = DefaultScrapeIntervalSecondsValue;
 
     public int GraphWindowMinutes { get; set; } = DefaultGraphWindowMinutesValue;
@@ -27,6 +30,9 @@ public sealed class SwissOllyConfig
     public bool LaunchOnStartup { get; set; }
 
     public bool MinimizeToTray { get; set; } = true;
+
+    /// <summary>Set once the "still running in the tray" notice has been shown, so it shows once.</summary>
+    public bool HasShownTrayNotice { get; set; }
 
     public Dictionary<string, bool> PanelVisibility { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
@@ -125,13 +131,36 @@ public sealed class SwissOllyConfig
         try
         {
             // Collapses "..\.." segments so the stored path is the one actually used.
-            normalized = Path.GetFullPath(trimmed);
+            var fullPath = Path.GetFullPath(trimmed);
+            if (fullPath.IndexOf(':', 2) >= 0 ||
+                fullPath.IndexOfAny(Path.GetInvalidPathChars()) >= 0 ||
+                fullPath.Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries).Skip(1).Any(IsReservedDeviceName))
+            {
+                // "C:\data:stream" names an alternate data stream, and CON, NUL, COM1 and friends
+                // are devices in any folder: neither is a directory SQLite can live in.
+                return false;
+            }
+
+            normalized = fullPath;
             return true;
         }
         catch
         {
             return false;
         }
+    }
+
+    private static bool IsReservedDeviceName(string segment)
+    {
+        var name = segment.Split('.')[0].TrimEnd(' ');
+        return name.Length is 3 or 4 &&
+            (name.Equals("CON", StringComparison.OrdinalIgnoreCase) ||
+             name.Equals("PRN", StringComparison.OrdinalIgnoreCase) ||
+             name.Equals("AUX", StringComparison.OrdinalIgnoreCase) ||
+             name.Equals("NUL", StringComparison.OrdinalIgnoreCase) ||
+             (name.Length == 4 &&
+              (name.StartsWith("COM", StringComparison.OrdinalIgnoreCase) || name.StartsWith("LPT", StringComparison.OrdinalIgnoreCase)) &&
+              name[3] is >= '0' and <= '9'));
     }
 
     public SwissOllyConfig Normalize()
@@ -289,27 +318,27 @@ public sealed class SwissOllyConfig
 
         var unit = char.ToLowerInvariant(trimmed[^1]);
         var amountText = trimmed[..^1].Trim();
-        if (!int.TryParse(amountText, out var amount) || amount <= 0)
+        if (!int.TryParse(amountText, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var amount) || amount <= 0)
         {
             return false;
         }
 
-        switch (unit)
+        // Bounded before building the TimeSpan: "99999999d" overflowed TimeSpan and threw out of
+        // config loading and the settings page instead of being rejected.
+        var minutes = unit switch
         {
-            case 'm':
-                retentionWindow = TimeSpan.FromMinutes(amount);
-                normalizedText = $"{amount}m";
-                return true;
-            case 'h':
-                retentionWindow = TimeSpan.FromHours(amount);
-                normalizedText = $"{amount}h";
-                return true;
-            case 'd':
-                retentionWindow = TimeSpan.FromDays(amount);
-                normalizedText = $"{amount}d";
-                return true;
-            default:
-                return false;
+            'm' => (long)amount,
+            'h' => amount * 60L,
+            'd' => amount * 1440L,
+            _ => -1L,
+        };
+        if (minutes <= 0 || minutes > MaxRetentionMinutes)
+        {
+            return false;
         }
+
+        retentionWindow = TimeSpan.FromMinutes(minutes);
+        normalizedText = $"{amount}{unit}";
+        return true;
     }
 }

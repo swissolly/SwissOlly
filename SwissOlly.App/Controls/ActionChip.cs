@@ -31,10 +31,11 @@ public sealed class ActionChip : UserControl
     {
         UseLayoutRounding = true;
         UseSystemFocusVisuals = false;
+        MinHeight = UiMetrics.MinHitTarget;
 
         _surface = new Border
         {
-            CornerRadius = new CornerRadius(8),
+            CornerRadius = new CornerRadius(UiMetrics.ControlRadius),
             // Constant. The ring is drawn by changing the brush only: switching thickness between
             // 0, 1.0 and 1.2 by state re-ran layout on every hover and focus change and nudged the
             // label by a pixel each time.
@@ -79,12 +80,9 @@ public sealed class ActionChip : UserControl
         };
         Content = _surface;
 
-        // Show hand cursor on hover to indicate clickable
-        Loaded += (_, _) =>
-        {
-            try { ProtectedCursor = Microsoft.UI.Input.InputSystemCursor.Create(Microsoft.UI.Input.InputSystemCursorShape.Hand); }
-            catch { /* cursor not supported in all hosts */ }
-        };
+        // Hand cursor on hover. Assigned once here from the shared cursor, never from Loaded:
+        // see PointerCursors for the crash that caused.
+        ProtectedCursor = PointerCursors.Get(Microsoft.UI.Input.InputSystemCursorShape.Hand);
 
         _surface.PointerEntered += OnPointerEntered;
         _surface.PointerExited += OnPointerExited;
@@ -94,6 +92,15 @@ public sealed class ActionChip : UserControl
 
         IsTabStop = true;
         KeyDown += OnKeyDown;
+        IsEnabledChanged += (_, _) =>
+        {
+            if (!IsEnabled)
+            {
+                _isHovered = _isPressed = false;
+            }
+
+            UpdateVisualState();
+        };
         // The focus ring is for keyboard navigation only. Showing it for pointer and programmatic
         // focus - and treating focus as hover - made a chip that received focus when a flyout
         // opened look like a second selected option.
@@ -135,8 +142,44 @@ public sealed class ActionChip : UserControl
             }
 
             _isActive = value;
+            // The selected preset, theme or view is announced as such; without this a screen
+            // reader could not tell which of "6h 12h 24h" was in effect.
+            AutomationProperties.SetItemStatus(this, value ? "Selected" : string.Empty);
             UpdateVisualState();
         }
+    }
+
+    /// <summary>Raises <see cref="Click"/> for an assistive-technology invoke.</summary>
+    internal void RaiseClickFromAutomation()
+    {
+        if (IsEnabled)
+        {
+            Click?.Invoke(this, EventArgs.Empty);
+        }
+    }
+
+    // A button to assistive technology, with Invoke. It reported a generic "custom" element
+    // before, which Narrator read without a role and which UI Automation could not press.
+    protected override Microsoft.UI.Xaml.Automation.Peers.AutomationPeer OnCreateAutomationPeer() =>
+        new ActionChipAutomationPeer(this);
+
+    private sealed class ActionChipAutomationPeer : Microsoft.UI.Xaml.Automation.Peers.FrameworkElementAutomationPeer,
+        Microsoft.UI.Xaml.Automation.Provider.IInvokeProvider
+    {
+        public ActionChipAutomationPeer(ActionChip owner)
+            : base(owner)
+        {
+        }
+
+        protected override Microsoft.UI.Xaml.Automation.Peers.AutomationControlType GetAutomationControlTypeCore() =>
+            Microsoft.UI.Xaml.Automation.Peers.AutomationControlType.Button;
+
+        protected override string GetClassNameCore() => nameof(ActionChip);
+
+        protected override object GetPatternCore(Microsoft.UI.Xaml.Automation.Peers.PatternInterface patternInterface) =>
+            patternInterface == Microsoft.UI.Xaml.Automation.Peers.PatternInterface.Invoke ? this : base.GetPatternCore(patternInterface);
+
+        public void Invoke() => ((ActionChip)Owner).RaiseClickFromAutomation();
     }
 
     public bool IsFilled
@@ -156,12 +199,15 @@ public sealed class ActionChip : UserControl
 
     private void OnTapped(object sender, TappedRoutedEventArgs e)
     {
-        Click?.Invoke(this, EventArgs.Empty);
+        if (IsEnabled)
+        {
+            Click?.Invoke(this, EventArgs.Empty);
+        }
     }
 
     private void OnKeyDown(object sender, KeyRoutedEventArgs e)
     {
-        if (e.Key is Windows.System.VirtualKey.Enter or Windows.System.VirtualKey.Space)
+        if (IsEnabled && e.Key is Windows.System.VirtualKey.Enter or Windows.System.VirtualKey.Space)
         {
             Click?.Invoke(this, EventArgs.Empty);
             e.Handled = true;
@@ -179,6 +225,11 @@ public sealed class ActionChip : UserControl
 
     private void OnPointerEntered(object sender, PointerRoutedEventArgs e)
     {
+        if (!IsEnabled)
+        {
+            return;
+        }
+
         _isHovered = true;
         UpdateVisualState();
     }
@@ -192,6 +243,11 @@ public sealed class ActionChip : UserControl
 
     private void OnPointerPressed(object sender, PointerRoutedEventArgs e)
     {
+        if (!IsEnabled)
+        {
+            return;
+        }
+
         _isPressed = true;
         UpdateVisualState();
     }
@@ -222,6 +278,21 @@ public sealed class ActionChip : UserControl
             _cachedAccentBg = ResolveBrush("AccentSoftBrush", isLight ? "#C8E8F8" : "#294A6B");
         }
 
+        // A filled chip is a primary button (Apply, Browse folder, Done): solid accent with
+        // backdrop-coloured text, and a stronger shade on hover. It used to share the selected
+        // chip's soft fill and ring, so "Browse folder" beside "Use default" read as a choice
+        // already made, and nothing on screen looked like a button.
+        if (_isFilled)
+        {
+            _surface.Background = ResolveBrush(_isHovered || _isPressed ? "AccentStrongBrush" : "AccentBrush", "#79B8FF");
+            _surface.BorderBrush = _isFocused ? ResolveBrush("TextPrimaryBrush", "#F2F8FF") : s_noBorder;
+            _label.Foreground = ResolveBrush("AppBackdropBrush", "#111315");
+            ApplyPressScale(_isPressed);
+            _glow.Opacity = 0;
+            _surface.Opacity = IsEnabled ? 1 : 0.45;
+            return;
+        }
+
         _surface.Background = useAccent
             ? _cachedAccentBg
             : _isHovered ? _cachedHoverBg : _cachedIdleBg;
@@ -247,6 +318,8 @@ public sealed class ActionChip : UserControl
         ApplyPressScale(_isPressed);
         _glow.Background = ResolveBrush("AccentHaloBrush", "#2B8FE6C4");
         _glow.Opacity = _isFocused ? 0.08 : useAccent ? 0.04 : 0;
+        // Opacity is composition-only, so toggling it never re-runs layout.
+        _surface.Opacity = IsEnabled ? 1 : 0.45;
     }
 
     /// <summary>

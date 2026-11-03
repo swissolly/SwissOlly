@@ -54,6 +54,114 @@ internal static class ThemeVisuals
         return luminance >= 170d;
     }
 
+    /// <summary>
+    /// A chart colour as the current palette should draw it. The series colours are tuned for
+    /// dark plots; on a light one they measured 1.1-2.5:1 against the plot (the CPU line all but
+    /// vanished), so there they are darkened, hue and saturation kept, until they reach 3:1, the
+    /// WCAG floor for graphics. Dark palettes get the colour unchanged.
+    /// </summary>
+    public static Color AdaptSeriesColor(Color color) =>
+        IsLightPaletteActive() ? AdaptSeriesColorForLightPlot(color, ResolveColor("SurfaceInsetBrush", "#F1F2F4")) : color;
+
+    /// <summary>The same adaptation against a given light plot colour, for previews of a palette
+    /// that isn't the current one.</summary>
+    public static Color AdaptSeriesColorForLightPlot(Color color, Color plot)
+    {
+        var key = ((long)PackRgb(color) << 24) | (uint)PackRgb(plot);
+        if (s_adaptedSeriesColors.TryGetValue(key, out var adapted))
+        {
+            return adapted;
+        }
+
+        adapted = DarkenToContrast(color, plot, 3.2);
+        s_adaptedSeriesColors[key] = adapted;
+        return adapted;
+    }
+
+    private static readonly Dictionary<long, Color> s_adaptedSeriesColors = [];
+
+    private static int PackRgb(Color color) => (color.R << 16) | (color.G << 8) | color.B;
+
+    private static Color DarkenToContrast(Color color, Color background, double target)
+    {
+        var (hue, saturation, lightness) = ToHsl(color);
+        var candidate = color;
+        while (ContrastRatio(candidate, background) < target && lightness > 0.12)
+        {
+            lightness -= 0.02;
+            candidate = FromHsl(hue, saturation, lightness, color.A);
+        }
+
+        return candidate;
+    }
+
+    private static double RelativeLuminance(Color color)
+    {
+        static double Channel(byte value)
+        {
+            var c = value / 255d;
+            return c <= 0.03928 ? c / 12.92 : Math.Pow((c + 0.055) / 1.055, 2.4);
+        }
+
+        return (0.2126 * Channel(color.R)) + (0.7152 * Channel(color.G)) + (0.0722 * Channel(color.B));
+    }
+
+    private static double ContrastRatio(Color a, Color b)
+    {
+        var la = RelativeLuminance(a);
+        var lb = RelativeLuminance(b);
+        return (Math.Max(la, lb) + 0.05) / (Math.Min(la, lb) + 0.05);
+    }
+
+    /// <summary>Hue, saturation and lightness, each 0 to 1.</summary>
+    internal static (double Hue, double Saturation, double Lightness) ToHsl(Color color)
+    {
+        var r = color.R / 255d;
+        var g = color.G / 255d;
+        var b = color.B / 255d;
+        var max = Math.Max(r, Math.Max(g, b));
+        var min = Math.Min(r, Math.Min(g, b));
+        var lightness = (max + min) / 2;
+        if (max == min)
+        {
+            return (0, 0, lightness);
+        }
+
+        var delta = max - min;
+        var saturation = lightness > 0.5 ? delta / (2 - max - min) : delta / (max + min);
+        var hue = max == r ? ((g - b) / delta) + (g < b ? 6 : 0)
+            : max == g ? ((b - r) / delta) + 2
+            : ((r - g) / delta) + 4;
+        return (hue / 6, saturation, lightness);
+    }
+
+    private static Color FromHsl(double hue, double saturation, double lightness, byte alpha)
+    {
+        if (saturation == 0)
+        {
+            var gray = (byte)Math.Round(lightness * 255);
+            return Color.FromArgb(alpha, gray, gray, gray);
+        }
+
+        static double HueToRgb(double p, double q, double t)
+        {
+            if (t < 0) t += 1;
+            if (t > 1) t -= 1;
+            if (t < 1d / 6) return p + ((q - p) * 6 * t);
+            if (t < 1d / 2) return q;
+            if (t < 2d / 3) return p + ((q - p) * ((2d / 3) - t) * 6);
+            return p;
+        }
+
+        var q = lightness < 0.5 ? lightness * (1 + saturation) : lightness + saturation - (lightness * saturation);
+        var p = (2 * lightness) - q;
+        return Color.FromArgb(
+            alpha,
+            (byte)Math.Round(HueToRgb(p, q, hue + (1d / 3)) * 255),
+            (byte)Math.Round(HueToRgb(p, q, hue) * 255),
+            (byte)Math.Round(HueToRgb(p, q, hue - (1d / 3)) * 255));
+    }
+
     // Supports both #RRGGBB and #AARRGGBB — BrushFactory.ParseColor only supports the former.
     public static Color ParseColor(string hex)
     {

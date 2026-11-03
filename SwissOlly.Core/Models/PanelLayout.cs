@@ -21,10 +21,17 @@ public sealed class PanelLayout
     public const int MinHeight = 4;
     public const int MaxHeight = 24;
 
+    /// <summary>
+    /// Lowest top row accepted. Far below any real board (every panel stacked at full height),
+    /// it keeps a hand-edited Y of 999999 from making the board add a million grid rows, since
+    /// saved gaps are deliberately preserved rather than compacted.
+    /// </summary>
+    public const int MaxY = 1024;
+
     /// <summary>Leftmost column, 0-based.</summary>
     public int X { get; set; }
 
-    /// <summary>Top row, 0-based. Unbounded — the board grows downward.</summary>
+    /// <summary>Top row, 0-based. The board grows downward, up to <see cref="MaxY"/>.</summary>
     public int Y { get; set; }
 
     /// <summary>Width in columns.</summary>
@@ -61,7 +68,7 @@ public sealed class PanelLayout
         W = Math.Clamp(W, MinWidth, Columns);
         H = Math.Clamp(H, MinHeight, MaxHeight);
         X = Math.Clamp(X, 0, Columns - W);
-        Y = Math.Max(0, Y);
+        Y = Math.Clamp(Y, 0, MaxY);
         return this;
     }
 

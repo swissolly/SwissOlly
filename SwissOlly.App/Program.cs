@@ -5,9 +5,22 @@ namespace SwissOlly.App;
 
 public static class Program
 {
+    /// <summary>Started by the Windows Run key: come up in the tray instead of opening a window.</summary>
+    public const string StartInTrayArgument = "--tray";
+
+    public static bool StartedInTray { get; private set; }
+
     [STAThread]
     private static void Main(string[] args)
     {
+        if (!SwissOlly.App.Services.SingleInstance.TryClaim())
+        {
+            SwissOlly.App.Services.SingleInstance.SignalRunningInstance();
+            return;
+        }
+
+        StartedInTray = args.Any(arg => string.Equals(arg, StartInTrayArgument, StringComparison.OrdinalIgnoreCase));
+
         // Before anything writes to the settings folder: once the new folder exists, the
         // pre-rebrand one can no longer simply be renamed into place.
         var rebrandOutcome = SwissOlly.Store.Persistence.RebrandMigration.Run();

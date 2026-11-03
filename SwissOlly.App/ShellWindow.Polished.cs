@@ -28,9 +28,6 @@ public sealed partial class ShellWindow : Window
     private const double PageGutter = 24;
     private const double SectionSpacing = 20;
     private const double PanelSpacing = 14;
-    private static readonly int[] ScrapeIntervalPresets = [1, 2, 5, 10, 15, 30, 60];
-    private static readonly string[] OverlayColorPresets = ["#66E7FF", "#7CE38B", "#F5B54A", "#FF6B6B", "#FFFFFF"];
-    private static readonly int[] RetentionHourPresets = [1, 6, 12, 24, 48, 72, 168, 336, 720, 2160, 8760];
     private static BitmapImage? s_brandBitmap;
     private static string? s_brandBitmapPath;
 
@@ -94,7 +91,6 @@ public sealed partial class ShellWindow : Window
     private Task? _pendingStartupPrune;
     private OverlayController? _overlayController;
     private nint _windowIconHandle;
-    private bool _controlDeckEditableActive;
     private bool _dashboardRefreshQueued;
     private bool _responsiveLayoutUpdateQueued;
     private bool _hasReceivedFirstSnapshot;
@@ -111,7 +107,6 @@ public sealed partial class ShellWindow : Window
     private bool _settingsViewActive;
     private bool _settingsViewBuilt;
     private int _snapshotApplyQueued; // 0/1 via Interlocked: set by the collector thread, cleared by the UI thread
-    private bool _controlDeckRenderQueued;
     private bool _panelRenderingSuspended;
     private string _lastRenderedStatusText = string.Empty;
     private string _draftScrapeIntervalInput = string.Empty;
@@ -129,7 +124,6 @@ public sealed partial class ShellWindow : Window
     private DateTimeOffset? _globalAbsoluteStartUtc;
     private DateTimeOffset? _globalAbsoluteEndUtc;
     private MetricSnapshot? _pendingSnapshot; // written by the collector thread, taken atomically by the UI thread
-    private int _lastLoadedHistoryMinutes;
     public ShellWindow(
         MainViewModel viewModel,
         IMetricStore metricStore,
@@ -145,9 +139,10 @@ public sealed partial class ShellWindow : Window
 
         _overviewView = new StackPanel { Spacing = SectionSpacing };
         _settingsView = new StackPanel { Spacing = SectionSpacing, Visibility = Visibility.Collapsed };
-        _overviewNavigationButton = CreateActionChip("Overview", OnOverviewNavigationClick, true);
+        _overviewNavigationButton = CreateActionChip("Overview", OnOverviewNavigationClick);
         _settingsNavigationButton = CreateActionChip("Settings", OnSettingsNavigationClick);
         _overviewNavigationButton.MinHeight = _settingsNavigationButton.MinHeight = 32;
+        _overviewNavigationButton.IsActive = true;
         _overviewNavigationButton.MinWidth = _settingsNavigationButton.MinWidth = 88;
 
         Title = "SwissOlly";
@@ -262,6 +257,7 @@ public sealed partial class ShellWindow : Window
         SetTitleBar(_titleBarDragHost);
         ApplyInitialTheme(_viewModel.SelectedTheme);
         InstallResizeHook();
+        InstallWindowBehavior();
 
         _viewModel.PropertyChanged += OnViewModelPropertyChanged;
         _viewModel.DashboardPanels.CollectionChanged += OnDashboardPanelsChanged;
@@ -319,6 +315,7 @@ public sealed partial class ShellWindow : Window
 
         // All brush updates run synchronously so the user never sees a half-themed state.
         // Chart redraws are already deferred inside each card's RefreshThemeResources.
+        _viewModel.RefreshSeriesColors();
         RefreshWindowChrome();
         RefreshShellSurfaceThemeResources();
         RefreshSummaryCardThemeResources();
@@ -337,6 +334,9 @@ public sealed partial class ShellWindow : Window
         {
             chip.RefreshThemeResources();
         }
+
+        _settingsApplyChip?.RefreshThemeResources();
+        _settingsRevertChip?.RefreshThemeResources();
 
         // Panel cards — update brushes only, chart redraws are deferred inside each card
         foreach (var card in _panelCards.Values)
@@ -491,6 +491,44 @@ public sealed partial class ShellWindow : Window
         _summaryCardsBound = true;
     }
 
+    /// <summary>
+    /// Moves the built summary cards into the column count for the current width. Rebuilding
+    /// would subscribe each card's meter a second time, and BuildSummaryCards refuses once bound,
+    /// so the strip used to keep its launch-time column count: four squeezed columns after
+    /// shrinking the window, or one stretched column after maximizing a narrow one.
+    /// </summary>
+    private void ReflowSummaryCards()
+    {
+        var summaryColumns = DetermineSummaryColumns();
+        if (!_summaryCardsBound || summaryColumns == _lastSummaryColumnCount)
+        {
+            return;
+        }
+
+        _lastSummaryColumnCount = summaryColumns;
+        _summaryHost.ColumnDefinitions.Clear();
+        _summaryHost.RowDefinitions.Clear();
+        for (var column = 0; column < summaryColumns; column++)
+        {
+            _summaryHost.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        }
+
+        for (var index = 0; index < _summaryCardVisuals.Count; index++)
+        {
+            var surface = _summaryCardVisuals[index].Surface;
+            var column = index % summaryColumns;
+            var row = index / summaryColumns;
+            while (_summaryHost.RowDefinitions.Count <= row)
+            {
+                _summaryHost.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            }
+
+            surface.BorderThickness = new Thickness(column > 0 ? 1 : 0, row > 0 ? 1 : 0, 0, 0);
+            Grid.SetColumn(surface, column);
+            Grid.SetRow(surface, row);
+        }
+    }
+
     private void RefreshSummaryCardThemeResources()
     {
         if (!_summaryCardsBound)
@@ -546,6 +584,7 @@ public sealed partial class ShellWindow : Window
                 staleCard.LayoutGestureStarted -= OnCardLayoutGestureStarted;
                 staleCard.LayoutGestureMoved -= OnCardLayoutGestureMoved;
                 staleCard.LayoutGestureEnded -= OnCardLayoutGestureEnded;
+                staleCard.LayoutNudgeRequested -= OnCardLayoutNudgeRequested;
             }
 
             _panelCards.Remove(staleKey);
@@ -562,6 +601,7 @@ public sealed partial class ShellWindow : Window
                 card.LayoutGestureStarted += OnCardLayoutGestureStarted;
                 card.LayoutGestureMoved += OnCardLayoutGestureMoved;
                 card.LayoutGestureEnded += OnCardLayoutGestureEnded;
+                card.LayoutNudgeRequested += OnCardLayoutNudgeRequested;
                 card.SetLayoutEditMode(_isLayoutEditMode);
                 _panelCards.Add(panel.PanelKey, card);
             }
@@ -671,17 +711,25 @@ public sealed partial class ShellWindow : Window
             {
                 RefreshDashboardPanels();
             }
-            if (_summaryCardsBound && DetermineSummaryColumns() != _lastSummaryColumnCount)
-            {
-                BuildSummaryCards();
-            }
+            ReflowSummaryCards();
+            UpdateHeaderStatusWidth();
+            ApplyMinimumWindowSize();
 
             _ = _uiQueue.TryEnqueue(DispatcherQueuePriority.Low, PlayLaunchEntrance);
 
             var config = _viewModel.BuildConfig();
             StartupTrace.Write("OnRootLoaded resumed after first paint // polished-v19");
 
-            _autoLaunchService.SetEnabled(config.LaunchOnStartup);
+            // The Run key decides, not the saved setting: the installer may have created it and
+            // Task Manager may have disabled it. Writing the setting back used to delete the
+            // installer's entry on every launch.
+            _autoLaunchService.RefreshIfStale();
+            _viewModel.LaunchOnStartup = _autoLaunchService.IsEnabled();
+            if (Program.StartedInTray && _viewModel.MinimizeToTray)
+            {
+                _ = _uiQueue.TryEnqueue(() => HideToTray(showNotice: false));
+            }
+
             App.CurrentApp.MarkStartupSettled();
             _ = StartTelemetryAsync(config);
             StartOverlay(config);
@@ -690,6 +738,9 @@ public sealed partial class ShellWindow : Window
                 TryApplyWindowIcon();
             });
             StartupTrace.Write("OnRootLoaded scheduled background startup // polished-v19");
+#if DEBUG
+            StartUiProbe(); // TEMPORARY QA PROBE — remove with ShellWindow.Probe.cs
+#endif
         }
         catch (Exception ex)
         {
@@ -766,14 +817,33 @@ public sealed partial class ShellWindow : Window
             // Open the store first, on a worker. Initialization is idempotent, so the collector's
             // own StartAsync reusing it later costs nothing.
             var store = _metricStore;
-            await Task.Run(() => store.InitializeAsync(config, CancellationToken.None));
-            StartupTrace.Write("Metric store ready");
+            var storeReady = true;
+            try
+            {
+                await Task.Run(() => store.InitializeAsync(config, CancellationToken.None));
+                StartupTrace.Write("Metric store ready");
+            }
+            catch (Exception storeEx)
+            {
+                // Storage folder unreachable (an unplugged drive, no permission). The live board
+                // still runs; the collector reports the history problem and keeps retrying.
+                storeReady = false;
+                StartupTrace.WriteException("Metric store", storeEx);
+            }
 
-            // Fill the board from history straight away, in parallel with the collector's PDH
-            // setup. It used to wait behind that setup, so panels appeared ~0.5s later than needed.
-            _pendingHistoryLoad = Task.Run(() => TryLoadHistoryAsync(config));
+            if (storeReady)
+            {
+                // Fill the board from history straight away, in parallel with the collector's PDH
+                // setup. It used to wait behind that setup, so panels appeared ~0.5s later than needed.
+                _viewModel.SetHistoryLoading(true);
+                _pendingHistoryLoad = Task.Run(() => TryLoadHistoryAsync(config));
+            }
 
             await EnsureCollectorRunningAsync(config);
+            if (!storeReady)
+            {
+                return;
+            }
 
             // Retention catches up in the background; pruning is transactional.
             _pendingStartupPrune = Task.Run(async () =>
@@ -817,6 +887,7 @@ public sealed partial class ShellWindow : Window
 
         _overlayController?.Dispose();
         _overlayController = null;
+        RemoveTrayIcon();
 
         _viewModel.PropertyChanged -= OnViewModelPropertyChanged;
         _viewModel.DashboardPanels.CollectionChanged -= OnDashboardPanelsChanged;
@@ -870,6 +941,7 @@ public sealed partial class ShellWindow : Window
             _collectorService = null;
             collectorService.SnapshotCollected -= OnSnapshotCollected;
             collectorService.CollectionFailed -= OnCollectionFailed;
+            collectorService.HistoryWriteStateChanged -= OnHistoryWriteStateChanged;
             // Wait for disposal to complete so SQLite connections are properly closed
             // and WAL is checkpointed before the process exits
             try
@@ -930,19 +1002,47 @@ public sealed partial class ShellWindow : Window
             var previousConfig = _viewModel.BuildConfig();
             if (!TryNormalizeScrapeInput(_draftScrapeIntervalInput, out var normalizedScrapeInput))
             {
-                _viewModel.SetStatus("Scrape interval must be a whole number of seconds between 1 and 60.", StatusSeverity.Issue);
-                UpdateStatusText();
-                RenderEditableControlDeck();
+                RejectSettings("Scrape interval must be a whole number of seconds between 1 and 60.");
                 return;
             }
 
             if (!MainViewModel.TryParseRetentionInput(_draftRetentionInput, out _, out var normalizedRetentionInput))
             {
-                _viewModel.SetStatus("Retention must use m, h, or d. Try 30m, 24h, or 7d.", StatusSeverity.Issue);
-                UpdateStatusText();
-                RenderEditableControlDeck();
+                RejectSettings("Retention must be a number with m, h or d, up to 3650d. Try 30m, 24h or 7d.");
                 return;
             }
+
+            // An unusable folder used to be swapped for the default without a word.
+            if (!string.IsNullOrWhiteSpace(_draftStorageDirectory) &&
+                !SwissOllyConfig.TryNormalizeStorageDirectory(_draftStorageDirectory, out _))
+            {
+                RejectSettings(@"Storage needs a full path to a folder on a local drive, like D:\SwissOlly.");
+                return;
+            }
+
+            // The overlay's own Normalize swaps anything out of range for a default, which would
+            // apply something other than what was typed without a word.
+            if (GetOverlayDraftProblem() is { } overlayProblem)
+            {
+                RejectSettings(overlayProblem);
+                return;
+            }
+
+            _settingsProblem = null;
+
+            // Lowering retention deletes history as soon as it applies. Say what will go and
+            // wait for a yes; the confirmation calls back in here.
+            var currentRetention = previousConfig.GetRetentionWindow();
+            var draftRetention = SwissOllyConfig.TryParseRetentionWindow(normalizedRetentionInput, out var parsedRetention, out _)
+                ? parsedRetention
+                : TimeSpan.FromHours(SwissOllyConfig.DefaultMaxRetentionHours);
+            if (draftRetention < currentRetention && !_retentionDeletionConfirmed)
+            {
+                ShowRetentionConfirmation(currentRetention, draftRetention);
+                return;
+            }
+
+            _retentionDeletionConfirmed = false;
 
             _viewModel.ScrapeIntervalInput = normalizedScrapeInput;
             _viewModel.RetentionHoursInput = normalizedRetentionInput;
@@ -977,34 +1077,149 @@ public sealed partial class ShellWindow : Window
             UpdateStatusText();
             _viewModel.ApplyConfig(config);
             SyncControlDeckDraftsFromViewModel();
-            _autoLaunchService.SetEnabled(config.LaunchOnStartup);
+            // Start with Windows is not touched here: it applies on its own click. Re-writing it
+            // from the flag read at launch re-enabled a startup entry the user had since turned
+            // off in Task Manager.
             await _configStore.SaveAsync(config, CancellationToken.None);
             if (themeChanged)
             {
                 App.CurrentApp.ApplyTheme(config.Theme);
             }
-            RenderEditableControlDeck();
-            _ = ApplyRuntimeSettingsAsync(config, collectorRestartRequired, retentionChanged, retentionLowered);
+            _settingsSavedAt = DateTimeOffset.Now;
+            RefreshSettingsDeck();
+            _ = ApplyRuntimeSettingsAsync(config, collectorRestartRequired, storageChanged, retentionChanged, retentionLowered);
         }
         catch (Exception ex)
         {
+            _retentionDeletionConfirmed = false;
             _viewModel.SetStatus($"Settings issue: {ex.Message}", StatusSeverity.Issue);
             UpdateStatusText();
         }
     }
 
-    private void OnThemeChoiceClick(object? sender, EventArgs e)
+    /// <summary>Keeps the draft and says why it was not applied, beside Apply and in the header.</summary>
+    private void RejectSettings(string problem)
     {
-        if (sender is ActionChip { Tag: ThemeMode mode } && Enum.IsDefined(typeof(ThemeMode), mode))
+        _settingsProblem = problem;
+        _viewModel.SetStatus(problem, StatusSeverity.Issue);
+        UpdateStatusText();
+        RefreshSettingsDeck();
+    }
+
+    /// <summary>
+    /// A whole number from a field, allowing the unit its chips are labelled with ("90%",
+    /// "14px"), which used to be rejected as typed.
+    /// </summary>
+    private static bool TryParseDraftNumber(string? text, string unit, out int value)
+    {
+        var trimmed = (text ?? string.Empty).Trim();
+        if (trimmed.EndsWith(unit, StringComparison.OrdinalIgnoreCase))
         {
-            // A theme has nothing to validate, so it applies and saves on click. As a draft it
-            // looked applied, then silently reverted on the next launch unless you also found
-            // Apply at the bottom of the page.
-            _draftThemeMode = mode;
-            _viewModel.SelectedTheme = mode;
-            App.CurrentApp.ApplyTheme(mode);
-            DebouncePersistLayout();
+            trimmed = trimmed[..^unit.Length].TrimEnd();
         }
+
+        return int.TryParse(trimmed, NumberStyles.None, CultureInfo.InvariantCulture, out value);
+    }
+
+    /// <summary>Why the overlay drafts can't be applied as typed, or null when they can.</summary>
+    private string? GetOverlayDraftProblem()
+    {
+        if (!TryParseDraftNumber(_draftOverlayFontSize, "px", out var fontSize) || fontSize is < 10 or > 32)
+        {
+            return "Overlay text size must be a whole number from 10 to 32.";
+        }
+
+        if (!TryParseDraftNumber(_draftOverlayOpacity, "%", out var opacity) || opacity is < 30 or > 100)
+        {
+            return "Overlay opacity must be a whole number from 30 to 100.";
+        }
+
+        if (SwissOlly.Core.Models.OverlayConfig.NormalizeHexColor(_draftOverlayColor) is null)
+        {
+            return "Overlay color must be a hex value like #66E7FF.";
+        }
+
+        if (_draftOverlayMode == SwissOlly.Core.Models.OverlayMode.Custom && _draftOverlayCustomMetrics.Count == 0)
+        {
+            return "Pick at least one metric for the custom overlay.";
+        }
+
+        return SwissOlly.Core.Models.OverlayConfig.DescribeHotkeyProblem(_draftOverlayHotkey);
+    }
+
+    private bool _retentionDeletionConfirmed;
+    private Flyout? _retentionConfirmFlyout;
+
+    private void ShowRetentionConfirmation(TimeSpan current, TimeSpan next)
+    {
+        if (_settingsApplyChip is null)
+        {
+            return;
+        }
+
+        var cancel = CreateActionChip("Cancel", (_, _) => _retentionConfirmFlyout?.Hide());
+        var confirm = CreateActionChip("Delete and apply", (_, _) =>
+        {
+            _retentionConfirmFlyout?.Hide();
+            _retentionDeletionConfirmed = true;
+            OnSaveSettingsClick(this, EventArgs.Empty);
+        }, filled: true);
+
+        var body = CreateSecondaryText(
+            $"Retention goes from {FormatDuration(current)} to {FormatDuration(next)}. History older than {FormatDuration(next)} is deleted as soon as you apply, and can't be recovered.",
+            12.5);
+        body.TextWrapping = TextWrapping.WrapWholeWords;
+
+        _retentionConfirmFlyout = new Flyout
+        {
+            Placement = FlyoutPlacementMode.TopEdgeAlignedRight,
+            FlyoutPresenterStyle = CreateFlyoutPresenterStyle(),
+            Content = new StackPanel
+            {
+                Width = 340,
+                Spacing = 12,
+                Children =
+                {
+                    CreatePrimaryText("Delete older history?", 14, true),
+                    body,
+                    CreateChipRow(cancel, confirm),
+                },
+            },
+        };
+        _retentionConfirmFlyout.ShowAt(_settingsApplyChip);
+        // Keyboard users land on the safe choice.
+        _ = _uiQueue.TryEnqueue(DispatcherQueuePriority.Low, () => cancel.Focus(FocusState.Programmatic));
+    }
+
+    /// <summary>A flyout surface in the app's palette rather than the system's.</summary>
+    private static Style CreateFlyoutPresenterStyle()
+    {
+        var style = new Style(typeof(FlyoutPresenter));
+        style.Setters.Add(new Setter(Control.BackgroundProperty, ResolveBrush("SurfaceElevatedBrush", "#222529")));
+        style.Setters.Add(new Setter(Control.BorderBrushProperty, ResolveBrush("SurfaceStrokeBrush", "#2C3035")));
+        style.Setters.Add(new Setter(Control.BorderThicknessProperty, new Thickness(UiMetrics.Hairline)));
+        style.Setters.Add(new Setter(Control.CornerRadiusProperty, new CornerRadius(UiMetrics.OverlayRadius)));
+        style.Setters.Add(new Setter(Control.PaddingProperty, new Thickness(16)));
+        return style;
+    }
+
+    /// <summary>"30 minutes", "24 hours", "7 days". Days from two up, so 24h reads as the chip does.</summary>
+    private static string FormatDuration(TimeSpan span)
+    {
+        if (span.TotalDays >= 2 && span.TotalDays == Math.Floor(span.TotalDays))
+        {
+            var days = (int)span.TotalDays;
+            return days == 1 ? "1 day" : $"{days:N0} days";
+        }
+
+        if (span.TotalHours >= 1 && span.TotalHours == Math.Floor(span.TotalHours))
+        {
+            var hours = (int)span.TotalHours;
+            return hours == 1 ? "1 hour" : $"{hours} hours";
+        }
+
+        var minutes = (int)Math.Round(span.TotalMinutes);
+        return minutes == 1 ? "1 minute" : $"{minutes} minutes";
     }
 
     private void OnToggleGlobalRangeEditor(object? sender, EventArgs e)
@@ -1156,6 +1371,7 @@ public sealed partial class ShellWindow : Window
             _globalAbsoluteStartUtc = null;
             _globalAbsoluteEndUtc = null;
             _viewModel.ResetGlobalZoom();
+            _viewModel.ReleaseStatusHold();
         });
 
         HideGlobalRangeEditor();
@@ -1192,6 +1408,46 @@ public sealed partial class ShellWindow : Window
             Volatile.Write(ref _snapshotApplyQueued, 0);
         }
     }
+
+    private void SubscribeCollector(CollectorService collectorService)
+    {
+        collectorService.SnapshotCollected -= OnSnapshotCollected;
+        collectorService.CollectionFailed -= OnCollectionFailed;
+        collectorService.HistoryWriteStateChanged -= OnHistoryWriteStateChanged;
+        collectorService.SnapshotCollected += OnSnapshotCollected;
+        collectorService.CollectionFailed += OnCollectionFailed;
+        collectorService.HistoryWriteStateChanged += OnHistoryWriteStateChanged;
+    }
+
+    private void OnHistoryWriteStateChanged(object? sender, Exception? error)
+    {
+        if (error is not null)
+        {
+            StartupTrace.WriteException("History write", error);
+        }
+        else
+        {
+            StartupTrace.Write("History writes recovered");
+        }
+
+        var issue = error is null ? null : $"History isn't being saved: {DescribeStorageError(error)}. The live view keeps updating.";
+        _ = _uiQueue.TryEnqueue(DispatcherQueuePriority.Low, () =>
+        {
+            _viewModel.SetHistoryWriteIssue(issue);
+            UpdateStatusText();
+        });
+    }
+
+    /// <summary>A storage failure in words a user can act on, rather than a SQLite error code.</summary>
+    internal static string DescribeStorageError(Exception error) => error switch
+    {
+        Microsoft.Data.Sqlite.SqliteException { SqliteErrorCode: 13 } => "the disk is full",
+        Microsoft.Data.Sqlite.SqliteException { SqliteErrorCode: 5 or 6 } => "the database is locked by another program",
+        Microsoft.Data.Sqlite.SqliteException { SqliteErrorCode: 8 } or UnauthorizedAccessException => "SwissOlly can't write to the storage folder",
+        Microsoft.Data.Sqlite.SqliteException { SqliteErrorCode: 10 or 14 } or DirectoryNotFoundException or DriveNotFoundException => "the storage folder can't be reached",
+        IOException => "the storage folder can't be reached",
+        _ => error.Message.TrimEnd('.'),
+    };
 
     private void OnCollectionFailed(object? sender, Exception ex)
     {
@@ -1232,6 +1488,7 @@ public sealed partial class ShellWindow : Window
         {
             _hasReceivedFirstSnapshot = true;
             StartupTrace.Write($"First snapshot collected // samples={snapshot.Samples.Count}");
+            PrebuildSettingsWhenIdle();
         }
 
         // Suspend rendering during the snapshot application pass so that
@@ -1393,7 +1650,7 @@ public sealed partial class ShellWindow : Window
 
     private void SetPanelRenderingSuspended(bool suspended)
     {
-        var shouldSuspend = suspended || _settingsViewActive;
+        var shouldSuspend = suspended || _settingsViewActive || _isHiddenToTray;
         if (_panelRenderingSuspended == shouldSuspend)
         {
             return;
@@ -1410,6 +1667,33 @@ public sealed partial class ShellWindow : Window
 
     private void OnSettingsNavigationClick(object? sender, EventArgs e) => SetActiveShellView(settings: true);
 
+    private DispatcherQueueTimer? _settingsPrebuildTimer;
+
+    /// <summary>
+    /// Builds the (hidden) Settings page a few seconds after the board is live, while nothing is
+    /// happening, so the first click on Settings doesn't pay ~70-150ms to build it.
+    /// </summary>
+    private void PrebuildSettingsWhenIdle()
+    {
+        if (_settingsViewBuilt || _settingsPrebuildTimer is not null)
+        {
+            return;
+        }
+
+        _settingsPrebuildTimer = _uiQueue.CreateTimer();
+        _settingsPrebuildTimer.IsRepeating = false;
+        _settingsPrebuildTimer.Interval = TimeSpan.FromSeconds(3);
+        _settingsPrebuildTimer.Tick += (_, _) =>
+            _uiQueue.TryEnqueue(DispatcherQueuePriority.Low, () =>
+            {
+                if (!_settingsViewBuilt && !_isLayoutEditMode)
+                {
+                    EnsureSettingsViewBuilt();
+                }
+            });
+        _settingsPrebuildTimer.Start();
+    }
+
     private void EnsureSettingsViewBuilt()
     {
         if (_settingsViewBuilt)
@@ -1417,8 +1701,10 @@ public sealed partial class ShellWindow : Window
             return;
         }
 
-        _settingsView.Children.Add(CreatePrimaryText("Settings", 22, true));
+        _settingsView.Children.Add(CreatePrimaryText("Settings", 28, true));
         _settingsView.Children.Add(BuildControlsSurface());
+        // Room to scroll the last card clear of the floating Apply bar.
+        _settingsView.Children.Add(new Border { Height = 56 });
         SyncControlDeckDraftsFromViewModel();
         _settingsViewBuilt = true;
         RenderEditableControlDeck();
@@ -1457,9 +1743,7 @@ public sealed partial class ShellWindow : Window
         _overviewView.Visibility = settings ? Visibility.Collapsed : Visibility.Visible;
         _settingsView.Visibility = settings ? Visibility.Visible : Visibility.Collapsed;
         _overviewNavigationButton.IsActive = !settings;
-        _overviewNavigationButton.IsFilled = !settings;
         _settingsNavigationButton.IsActive = settings;
-        _settingsNavigationButton.IsFilled = settings;
         // ChangeView(horizontalOffset, verticalOffset, zoomFactor, disableAnimation). The
         // offset goes in the SECOND slot: a 0 in the third set zoomFactor to 0 (clamped to 0.1),
         // which once rendered a whole view at a tenth of its size.
@@ -1474,9 +1758,12 @@ public sealed partial class ShellWindow : Window
         }
         else
         {
-            Motion.PlayEntrance(settings ? _settingsView : _overviewView);
+            // Overview sits left of Settings in the navigation, so each view arrives from its side.
+            Motion.PlayDirectionalEntrance(settings ? _settingsView : _overviewView, settings ? 1 : -1);
         }
         SetPanelRenderingSuspended(false);
+        // The Apply bar belongs to Settings: it leaves with it, and returns if edits are waiting.
+        UpdateSettingsActionState();
     }
 
     private double _overviewScrollOffset;
@@ -1604,11 +1891,9 @@ public sealed partial class ShellWindow : Window
                     {
                         ReorderDashboardPanelsInPlace();
                     }
-                    else if (_summaryCardsBound && DetermineSummaryColumns() != _lastSummaryColumnCount)
-                    {
-                        BuildSummaryCards();
-                    }
 
+                    ReflowSummaryCards();
+                    UpdateHeaderStatusWidth();
                     RefreshSettingsLayoutIfNeeded();
 
                     foreach (var card in _panelCards.Values)
@@ -1642,7 +1927,9 @@ public sealed partial class ShellWindow : Window
             ResponsiveMinimumWidth() != _lastResponsiveMinimumWidth;
         var needsSummary = _summaryCardsBound && DetermineSummaryColumns() != _lastSummaryColumnCount;
         var needsSettings = _settingsViewActive && DetermineSettingsColumns() != _lastSettingsColumnCount;
-        if (needsDashboard || needsSummary || needsSettings)
+        var needsHeader = _statusColumn is not null &&
+            (_statusColumn.Width.Value < StatusColumnWidth || e.NewSize.Width < e.PreviousSize.Width);
+        if (needsDashboard || needsSummary || needsSettings || needsHeader)
         {
             QueueResponsiveLayoutUpdate();
         }
@@ -1675,11 +1962,8 @@ public sealed partial class ShellWindow : Window
                 ReorderDashboardPanelsInPlace();
             }
 
-            if (_summaryCardsBound && DetermineSummaryColumns() != _lastSummaryColumnCount)
-            {
-                BuildSummaryCards();
-            }
-
+            ReflowSummaryCards();
+            UpdateHeaderStatusWidth();
             RefreshSettingsLayoutIfNeeded();
         }))
         {
@@ -1736,27 +2020,11 @@ public sealed partial class ShellWindow : Window
     {
     }
 
-    private void OnRetentionInputChanged(object? sender, EventArgs e)
+    private void OnSettingsEntrySubmitted(object? sender, EventArgs e)
     {
-        if (sender is InlineTextEntry entry)
+        if (HasUnappliedSettings())
         {
-            _draftRetentionInput = entry.Text;
-        }
-    }
-
-    private void OnScrapeInputChanged(object? sender, EventArgs e)
-    {
-        if (sender is InlineTextEntry entry)
-        {
-            _draftScrapeIntervalInput = entry.Text;
-        }
-    }
-
-    private void OnStorageInputChanged(object? sender, EventArgs e)
-    {
-        if (sender is InlineTextEntry entry)
-        {
-            _draftStorageDirectory = entry.Text;
+            OnSaveSettingsClick(sender, e);
         }
     }
 
@@ -1766,32 +2034,191 @@ public sealed partial class ShellWindow : Window
         var persistedTheme = _viewModel.SelectedTheme;
         var restoreThemePreview = _draftThemeMode != persistedTheme;
         SyncControlDeckDraftsFromViewModel();
+        _settingsProblem = null;
         if (restoreThemePreview)
         {
             App.CurrentApp.ApplyTheme(persistedTheme);
         }
 
-        RenderEditableControlDeck();
+        RefreshSettingsDeck();
         _viewModel.SetStatus("Settings reverted", StatusSeverity.Healthy);
         UpdateStatusText();
     }
 
-    private void QueueEditableControlDeckRender()
+    private ActionChip? _settingsApplyChip;
+    private ActionChip? _settingsRevertChip;
+    private TextBlock? _settingsSavedLabel;
+    private Border? _settingsApplyBar;
+    private string? _settingsProblem;
+    private DateTimeOffset _settingsSavedAt = DateTimeOffset.MinValue;
+    private DispatcherQueueTimer? _settingsSavedTimer;
+    private static readonly TimeSpan SettingsSavedVisibleFor = TimeSpan.FromSeconds(2.5);
+
+    /// <summary>True when any draft differs from what is saved. Compares the raw draft text, so an
+    /// invalid entry still counts as a change and Apply stays available to report it.</summary>
+    private bool HasUnappliedSettings()
     {
-        if (!_controlDeckEditableActive || _controlDeckRenderQueued)
+        static bool SameText(string? a, string? b) =>
+            string.Equals((a ?? string.Empty).Trim(), (b ?? string.Empty).Trim(), StringComparison.OrdinalIgnoreCase);
+
+        // The theme isn't compared: it applies on click and is never a draft. The custom metric
+        // list counts only while Custom is (or was) chosen; an edit to it under "All metrics"
+        // flagged unsaved changes the user couldn't see.
+        var ov = _viewModel.OverlayConfig;
+        var customMatters = _draftOverlayMode == SwissOlly.Core.Models.OverlayMode.Custom ||
+            ov.Mode == SwissOlly.Core.Models.OverlayMode.Custom;
+        return !SameText(_draftScrapeIntervalInput, _viewModel.ScrapeIntervalInput) ||
+            !SameText(_draftRetentionInput, _viewModel.RetentionHoursInput) ||
+            !SameText(_draftStorageDirectory, _viewModel.StorageDirectory) ||
+            _draftOverlayEnabled != ov.Enabled ||
+            _draftOverlayMode != ov.Mode ||
+            _draftOverlayCorner != ov.Corner ||
+            !SameText(_draftOverlayColor, ov.TextColor) ||
+            !SameText(_draftOverlayFontSize, ov.FontSizePx.ToString(CultureInfo.InvariantCulture)) ||
+            !SameText(_draftOverlayOpacity, ((int)Math.Round(ov.Opacity * 100)).ToString(CultureInfo.InvariantCulture)) ||
+            !SameText(_draftOverlayHotkey, ov.HotkeyGesture) ||
+            (customMatters && !new HashSet<string>(_draftOverlayCustomMetrics, StringComparer.OrdinalIgnoreCase).SetEquals(ov.CustomMetrics));
+    }
+
+    /// <summary>
+    /// The floating bar over the bottom of Settings: it appears while something is unapplied,
+    /// explains a rejected Apply, and says "Saved" for a moment after a good one. Apply used to
+    /// sit below the overlay card, a long scroll from the retention or interval just changed.
+    /// </summary>
+    private void UpdateSettingsActionState()
+    {
+        if (_settingsApplyBar is null || _settingsApplyChip is null || _settingsRevertChip is null || _settingsSavedLabel is null)
         {
             return;
         }
 
-        _controlDeckRenderQueued = true;
-        _ = _uiQueue.TryEnqueue(DispatcherQueuePriority.Low, () =>
+        var dirty = HasUnappliedSettings();
+        ToolTipService.SetToolTip(_settingsApplyChip, dirty ? "Save and apply your changes (Ctrl+S)" : "No changes to apply");
+
+        bool show;
+        if (_settingsProblem is not null && dirty)
         {
-            _controlDeckRenderQueued = false;
-            if (_controlDeckEditableActive)
+            // A rejected Apply explains itself beside the button, not only in the header.
+            SetTextIfChanged(_settingsSavedLabel, _settingsProblem);
+            _settingsSavedLabel.Foreground = ResolveBrush("CriticalBrush", "#FF897D");
+            show = true;
+        }
+        else
+        {
+            _settingsProblem = null;
+            var showSaved = !dirty && DateTimeOffset.Now - _settingsSavedAt < SettingsSavedVisibleFor;
+            SetTextIfChanged(_settingsSavedLabel, dirty ? "You have changes that aren't applied yet." : "Saved");
+            _settingsSavedLabel.Foreground = ResolveBrush("TextSecondaryBrush", "#C4C8CE");
+            show = dirty || showSaved;
+            if (showSaved)
             {
-                RenderEditableControlDeck();
+                _settingsSavedTimer ??= CreateSettingsSavedTimer();
+                _settingsSavedTimer.Interval = SettingsSavedVisibleFor - (DateTimeOffset.Now - _settingsSavedAt);
+                _settingsSavedTimer.Start();
             }
-        });
+        }
+
+        show &= _settingsViewActive;
+        _settingsApplyChip.IsEnabled = show && dirty;
+        _settingsRevertChip.IsEnabled = show && dirty;
+        _settingsApplyBar.IsHitTestVisible = show;
+        // A hidden bar is collapsed once it has faded, so it is gone for the keyboard and screen
+        // readers too. Faded but present, Tab from the Overview could land on an invisible
+        // Revert or Apply.
+        if (show)
+        {
+            _applyBarCollapseTimer?.Stop();
+            _settingsApplyBar.Visibility = Visibility.Visible;
+            _settingsApplyBar.Opacity = 1;
+        }
+        else if (_settingsApplyBar.Visibility == Visibility.Visible && _settingsApplyBar.Opacity > 0)
+        {
+            _settingsApplyBar.Opacity = 0;
+            _applyBarCollapseTimer ??= CreateApplyBarCollapseTimer();
+            _applyBarCollapseTimer.Start();
+        }
+    }
+
+    private DispatcherQueueTimer? _applyBarCollapseTimer;
+
+    private DispatcherQueueTimer CreateApplyBarCollapseTimer()
+    {
+        var timer = _uiQueue.CreateTimer();
+        timer.IsRepeating = false;
+        timer.Interval = TimeSpan.FromMilliseconds(200);
+        timer.Tick += (_, _) =>
+        {
+            if (_settingsApplyBar is { Opacity: 0 })
+            {
+                _settingsApplyBar.Visibility = Visibility.Collapsed;
+            }
+        };
+        return timer;
+    }
+
+    private static void SetTextIfChanged(TextBlock block, string text)
+    {
+        if (!string.Equals(block.Text, text, StringComparison.Ordinal))
+        {
+            block.Text = text;
+        }
+    }
+
+    /// <summary>Built once and kept: it floats over the scrolling page, so it stays in reach.</summary>
+    private Border BuildSettingsApplyBar()
+    {
+        _settingsRevertChip = CreateActionChip("Revert", OnCancelSettingsClick);
+        _settingsApplyChip = CreateActionChip("Apply", OnSaveSettingsClick, filled: true);
+        _settingsSavedLabel = new TextBlock
+        {
+            FontSize = 12.5,
+            Foreground = ResolveBrush("TextSecondaryBrush", "#C4C8CE"),
+            VerticalAlignment = VerticalAlignment.Center,
+            TextWrapping = TextWrapping.WrapWholeWords,
+            MaxLines = 2,
+            TextTrimming = TextTrimming.CharacterEllipsis,
+        };
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetLiveSetting(
+            _settingsSavedLabel, Microsoft.UI.Xaml.Automation.Peers.AutomationLiveSetting.Polite);
+
+        var layout = new Grid { ColumnSpacing = 16 };
+        layout.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        layout.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        layout.Children.Add(_settingsSavedLabel);
+        var chips = CreateChipRow(_settingsRevertChip, _settingsApplyChip);
+        layout.Children.Add(chips);
+        Grid.SetColumn(chips, 1);
+
+        _settingsApplyBar = new Border
+        {
+            Background = ResolveBrush("SurfaceElevatedBrush", "#222529"),
+            BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#2C3035"),
+            BorderThickness = new Thickness(UiMetrics.Hairline),
+            CornerRadius = new CornerRadius(UiMetrics.OverlayRadius),
+            Padding = new Thickness(18, 8, 8, 8),
+            MaxWidth = 640,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Bottom,
+            Margin = new Thickness(PageGutter, 0, PageGutter, 18),
+            Opacity = 0,
+            IsHitTestVisible = false,
+            Visibility = Visibility.Collapsed,
+            Child = layout,
+        };
+        if (Motion.AnimationsEnabled)
+        {
+            _settingsApplyBar.OpacityTransition = new ScalarTransition { Duration = TimeSpan.FromMilliseconds(160) };
+        }
+
+        return _settingsApplyBar;
+    }
+
+    private DispatcherQueueTimer CreateSettingsSavedTimer()
+    {
+        var timer = _uiQueue.CreateTimer();
+        timer.IsRepeating = false;
+        timer.Tick += (_, _) => UpdateSettingsActionState();
+        return timer;
     }
 
     private void SyncControlDeckDraftsFromViewModel()
@@ -1814,17 +2241,15 @@ public sealed partial class ShellWindow : Window
 
     private SwissOlly.Core.Models.OverlayConfig BuildOverlayConfigFromDrafts()
     {
-        int.TryParse(_draftOverlayFontSize?.Trim(), System.Globalization.NumberStyles.None,
-            System.Globalization.CultureInfo.InvariantCulture, out var fontSize);
-        int.TryParse(_draftOverlayOpacity?.Trim(), System.Globalization.NumberStyles.None,
-            System.Globalization.CultureInfo.InvariantCulture, out var opacityPct);
+        TryParseDraftNumber(_draftOverlayFontSize, "px", out var fontSize);
+        TryParseDraftNumber(_draftOverlayOpacity, "%", out var opacityPct);
 
         return new SwissOlly.Core.Models.OverlayConfig
         {
             Enabled = _draftOverlayEnabled,
             Mode = _draftOverlayMode,
             Corner = _draftOverlayCorner,
-            TextColor = _draftOverlayColor,
+            TextColor = SwissOlly.Core.Models.OverlayConfig.NormalizeHexColor(_draftOverlayColor) ?? _draftOverlayColor,
             FontSizePx = fontSize,
             Opacity = opacityPct / 100.0,
             HotkeyGesture = _draftOverlayHotkey,
@@ -1843,73 +2268,36 @@ public sealed partial class ShellWindow : Window
             ? hours
             : SwissOllyConfig.DefaultMaxRetentionHours;
 
-    private void StepScrapeInterval(int direction)
-    {
-        var next = MoveThroughPresets(GetDraftScrapeIntervalSeconds(), ScrapeIntervalPresets, direction);
-        _draftScrapeIntervalInput = next == SwissOllyConfig.DefaultScrapeIntervalSeconds
-            ? string.Empty
-            : next.ToString(CultureInfo.InvariantCulture);
-        QueueEditableControlDeckRender();
-    }
-
     private void SetScrapeInterval(int seconds)
     {
         _draftScrapeIntervalInput = seconds == SwissOllyConfig.DefaultScrapeIntervalSeconds
             ? string.Empty
             : seconds.ToString(CultureInfo.InvariantCulture);
-        QueueEditableControlDeckRender();
-    }
-
-    private void NudgeScrapeInterval(int delta)
-    {
-        var next = Math.Clamp(_viewModel.EffectiveScrapeIntervalSeconds + delta, 1, 60);
-        SetScrapeInterval(next);
+        RefreshSettingsDeck();
     }
 
     private void ResetScrapeInterval()
     {
         _draftScrapeIntervalInput = string.Empty;
-        QueueEditableControlDeckRender();
+        RefreshSettingsDeck();
     }
 
     private void SetRetentionInput(string value)
     {
         _draftRetentionInput = value;
-        QueueEditableControlDeckRender();
-    }
-
-    private void StepRetentionHours(int direction)
-    {
-        var next = MoveThroughPresets(GetDraftRetentionHours(), RetentionHourPresets, direction);
-        _draftRetentionInput = FormatRetentionDraftInput(next);
-        QueueEditableControlDeckRender();
-    }
-
-    private void SetRetentionHours(int hours)
-    {
-        _draftRetentionInput = FormatRetentionDraftInput(hours);
-        QueueEditableControlDeckRender();
-    }
-
-    private void NudgeRetentionHours(int delta)
-    {
-        var next = Math.Clamp(GetDraftRetentionHours() + delta, 1, 24 * 3650);
-        SetRetentionHours(next);
+        RefreshSettingsDeck();
     }
 
     private void ResetRetentionHours()
     {
         _draftRetentionInput = string.Empty;
-        QueueEditableControlDeckRender();
+        RefreshSettingsDeck();
     }
-
-    private static string FormatRetentionDraftInput(int hours) =>
-        hours <= 0 ? string.Empty : MainViewModel.FormatRetentionInput(hours);
 
     private void ResetStorageDirectory()
     {
         _draftStorageDirectory = string.Empty;
-        QueueEditableControlDeckRender();
+        RefreshSettingsDeck();
     }
 
     private void SetStorageDirectory(string? value)
@@ -1920,7 +2308,7 @@ public sealed partial class ShellWindow : Window
         }
 
         _draftStorageDirectory = value.Trim();
-        QueueEditableControlDeckRender();
+        RefreshSettingsDeck();
     }
 
     private static bool TryNormalizeScrapeInput(string? text, out string normalizedText)
@@ -1950,6 +2338,7 @@ public sealed partial class ShellWindow : Window
     private async Task ApplyRuntimeSettingsAsync(
         SwissOllyConfig config,
         bool collectorRestartRequired,
+        bool storageChanged,
         bool retentionChanged,
         bool retentionLowered)
     {
@@ -1962,8 +2351,7 @@ public sealed partial class ShellWindow : Window
                     if (_collectorService is null)
                     {
                         _collectorService = new CollectorService(new WindowsMetricCollector(), _metricStore);
-                        _collectorService.SnapshotCollected += OnSnapshotCollected;
-                        _collectorService.CollectionFailed += OnCollectionFailed;
+                        SubscribeCollector(_collectorService);
                     }
 
                     await _collectorService.StartAsync(config, CancellationToken.None);
@@ -1982,10 +2370,22 @@ public sealed partial class ShellWindow : Window
                 }
             });
 
-            _viewModel.SetStatus(_viewModel.DashboardPanels.Count > 0
-                ? "Streaming local telemetry"
-                : "Waiting for first sample", _viewModel.DashboardPanels.Count > 0 ? StatusSeverity.Healthy : StatusSeverity.Pending);
-            UpdateStatusText();
+            if (storageChanged)
+            {
+                // Nothing is copied: the new folder has its own database, and the old one stays
+                // where it was. Show what the new folder holds.
+                _viewModel.SetStatus("History now saves to the new folder. Earlier history stays in the old one.", StatusSeverity.Healthy, TimeSpan.FromSeconds(10));
+                UpdateStatusText();
+                _viewModel.SetHistoryLoading(true);
+                _pendingHistoryLoad = Task.Run(() => TryLoadHistoryAsync(config));
+            }
+            else
+            {
+                _viewModel.SetStatus(_viewModel.DashboardPanels.Count > 0
+                    ? "Streaming local telemetry"
+                    : "Waiting for first sample", _viewModel.DashboardPanels.Count > 0 ? StatusSeverity.Healthy : StatusSeverity.Pending);
+                UpdateStatusText();
+            }
 
             if (_overlayController != null && config.Overlay != null)
             {
@@ -2034,37 +2434,6 @@ public sealed partial class ShellWindow : Window
         }
     }
 
-    private static int MoveThroughPresets(int currentValue, IReadOnlyList<int> presets, int direction)
-    {
-        if (presets.Count == 0)
-        {
-            return currentValue;
-        }
-
-        if (direction > 0)
-        {
-            foreach (var preset in presets)
-            {
-                if (preset > currentValue)
-                {
-                    return preset;
-                }
-            }
-
-            return presets[^1];
-        }
-
-        for (var index = presets.Count - 1; index >= 0; index--)
-        {
-            if (presets[index] < currentValue)
-            {
-                return presets[index];
-            }
-        }
-
-        return presets[0];
-    }
-
     private void TryApplyWindowIcon()
     {
         if (_windowIconApplied)
@@ -2076,7 +2445,7 @@ public sealed partial class ShellWindow : Window
         {
             // Try ico first, then fall back to png
             var icoPath = System.IO.Path.Combine(AppContext.BaseDirectory, "Assets", "SwissOlly.ico");
-            var pngPath = System.IO.Path.Combine(AppContext.BaseDirectory, "Assets", "swissolly.png");
+            var pngPath = System.IO.Path.Combine(AppContext.BaseDirectory, "Assets", "swissolly-256.png");
             var iconPath = File.Exists(icoPath) ? icoPath : File.Exists(pngPath) ? pngPath : null;
 
             if (iconPath is not null)
@@ -2112,7 +2481,7 @@ public sealed partial class ShellWindow : Window
     {
         try
         {
-            var imagePath = System.IO.Path.Combine(AppContext.BaseDirectory, "Assets", "swissolly.png");
+            var imagePath = System.IO.Path.Combine(AppContext.BaseDirectory, "Assets", "swissolly-256.png");
             if (!File.Exists(imagePath))
             {
                 return;
@@ -2183,19 +2552,47 @@ public sealed partial class ShellWindow : Window
         return width >= 1120 ? 4 : width >= 820 ? 2 : 1;
     }
 
+    /// <summary>History kept in memory at full resolution; longer ranges are read on demand.</summary>
+    private static readonly TimeSpan BaseHistoryWindow = TimeSpan.FromHours(24);
+
+    /// <summary>The most recent stretch loaded sample by sample; older base history is per minute.
+    /// The same window a running session keeps raw, so a restart shows what was on screen.</summary>
+    private static readonly TimeSpan RawHistoryWindow = MetricPanelViewModel.RawSampleWindow;
+
+    private DateTimeOffset _baseHistoryStartUtc = DateTimeOffset.MaxValue;
+    private int _wideHistoryMinutes;
+    private int _wideHistoryRequest;
+
+    /// <summary>
+    /// Loads the last 24 hours (or less, with shorter retention): raw samples for the last hour,
+    /// minute averages before that. Loading the whole retention window, as before, put every
+    /// point of a 90-day or year-long history in memory at launch.
+    /// </summary>
     private async Task TryLoadHistoryAsync(SwissOllyConfig config)
     {
         try
         {
             StartupTrace.Write("TryLoadHistoryAsync start");
-            // Load the full retention window so users can zoom out to see all retained data
+            var now = DateTimeOffset.UtcNow;
             var retentionWindow = config.GetRetentionWindow();
-            var historyWindow = retentionWindow;
-            // ConfigureAwait(false): the SQLite read must not need the UI thread to resume, or
-            // a close that waits on this task deadlocks against its own continuation.
-            var history = await _metricStore
-                .LoadHistoryAsync(DateTimeOffset.UtcNow.Subtract(historyWindow), CancellationToken.None)
-                .ConfigureAwait(false);
+            var baseWindow = retentionWindow < BaseHistoryWindow ? retentionWindow : BaseHistoryWindow;
+            var baseStart = now - baseWindow;
+            // Cut at a whole minute, where the running session folds its own samples (see
+            // MetricPanelViewModel.RawSampleWindow): each average then covers a full minute, and
+            // the reload is point for point what the last session showed.
+            var rawStart = baseWindow > RawHistoryWindow ? MetricPanelViewModel.MinuteFloor(now - RawHistoryWindow) : baseStart;
+            var store = _metricStore;
+            // Run, not just await: SQLite is synchronous, so its "async" reads block whatever
+            // thread calls them. ConfigureAwait(false): a close that waits on this task must not
+            // deadlock against its own continuation on the UI thread.
+            var history = await Task.Run(async () =>
+            {
+                var older = rawStart > baseStart
+                    ? await store.LoadHistoryAsync(baseStart, rawStart, TimeSpan.FromMinutes(1), CancellationToken.None).ConfigureAwait(false)
+                    : [];
+                var recent = await store.LoadHistoryAsync(rawStart, now.AddMinutes(1), TimeSpan.Zero, CancellationToken.None).ConfigureAwait(false);
+                return MetricHistory.Concat(older, recent);
+            }).ConfigureAwait(false);
 
             // Back to the UI thread explicitly for the view-model update.
             var applied = new TaskCompletionSource();
@@ -2204,12 +2601,18 @@ public sealed partial class ShellWindow : Window
                 try
                 {
                     _viewModel.LoadHistory(history);
-                    _lastLoadedHistoryMinutes = (int)historyWindow.TotalMinutes;
+                    _baseHistoryStartUtc = baseStart;
+                    _wideHistoryMinutes = 0;
                 }
                 finally
                 {
+                    _viewModel.SetHistoryLoading(false);
                     applied.TrySetResult();
                 }
+
+                // A range wider than the base window (restored from the last session) still
+                // needs its older part.
+                RequestWideHistory(_viewModel.SelectedWindowMinutes);
             }))
             {
                 await applied.Task.ConfigureAwait(false);
@@ -2221,6 +2624,7 @@ public sealed partial class ShellWindow : Window
             StartupTrace.WriteException("History load", ex);
             _ = _uiQueue.TryEnqueue(() =>
             {
+                _viewModel.SetHistoryLoading(false);
                 if (!_hasReceivedFirstSnapshot)
                 {
                     _viewModel.SetStatus("History unavailable, starting live telemetry", StatusSeverity.Issue);
@@ -2245,10 +2649,7 @@ public sealed partial class ShellWindow : Window
         }
 
         StartupTrace.Write("CollectorService created");
-        collectorService.SnapshotCollected -= OnSnapshotCollected;
-        collectorService.CollectionFailed -= OnCollectionFailed;
-        collectorService.SnapshotCollected += OnSnapshotCollected;
-        collectorService.CollectionFailed += OnCollectionFailed;
+        SubscribeCollector(collectorService);
 
         StartupTrace.Write("Calling CollectorService.StartAsync");
 
@@ -2300,34 +2701,67 @@ public sealed partial class ShellWindow : Window
         StartupTrace.Write($"ApplyGlobalWindowRange start // minutes={minutes}");
         _globalAbsoluteStartUtc = null;
         _globalAbsoluteEndUtc = null;
+        _viewModel.ReleaseStatusHold(); // "Showing 10:55 PM - 11:25 PM" no longer applies
         _viewModel.ApplyGlobalWindowRange(minutes);
         HideGlobalRangeEditor();
         RefreshGlobalRangeControls();
         StartupTrace.Write($"ApplyGlobalWindowRange complete // minutes={minutes}");
 
-        // If the user selects a wider range than we last loaded from the database,
-        // re-query to ensure the data covers the full requested window.
-        if (minutes > _lastLoadedHistoryMinutes)
-        {
-            _ = ReloadHistoryForRangeAsync(minutes);
-        }
+        RequestWideHistory(minutes);
     }
 
-    private async Task ReloadHistoryForRangeAsync(int minutes)
+    /// <summary>
+    /// For a range longer than the base window, reads the older part in the background, averaged
+    /// to about two thousand points per series, and puts it in front of the in-memory history.
+    /// The read used to run on the UI thread (SQLite is synchronous) and froze the window for
+    /// about 0.6s on 7d and 30d, then replaced the recent raw samples with minute averages.
+    /// </summary>
+    private void RequestWideHistory(int minutes)
+    {
+        var retentionMinutes = (int)Math.Min(int.MaxValue, _viewModel.BuildConfig().GetRetentionWindow().TotalMinutes);
+        var wanted = Math.Min(minutes, retentionMinutes);
+        var baseMinutes = _baseHistoryStartUtc == DateTimeOffset.MaxValue
+            ? int.MaxValue
+            : (int)Math.Ceiling((DateTimeOffset.UtcNow - _baseHistoryStartUtc).TotalMinutes);
+        if (wanted <= baseMinutes || wanted == _wideHistoryMinutes)
+        {
+            return;
+        }
+
+        _ = LoadWideHistoryAsync(wanted, ++_wideHistoryRequest);
+    }
+
+    private async Task LoadWideHistoryAsync(int minutes, int request)
     {
         try
         {
-            StartupTrace.Write($"ReloadHistoryForRangeAsync start // minutes={minutes}");
-            var fromUtc = DateTimeOffset.UtcNow.AddMinutes(-minutes);
-            var history = await _metricStore.LoadHistoryAsync(fromUtc, CancellationToken.None);
-            StartupTrace.Write($"ReloadHistoryForRangeAsync read complete // panels={history.Count}");
-            _viewModel.LoadHistory(history);
-            _lastLoadedHistoryMinutes = minutes;
-            StartupTrace.Write($"ReloadHistoryForRangeAsync applied // minutes={minutes}");
+            StartupTrace.Write($"Wide history load start // minutes={minutes}");
+            _viewModel.SetHistoryLoading(true);
+            var to = _baseHistoryStartUtc;
+            var from = DateTimeOffset.UtcNow.AddMinutes(-minutes);
+            var bucket = MetricHistory.BucketFor(to - from);
+            var store = _metricStore;
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            var history = await Task.Run(() => store.LoadHistoryAsync(from, to, bucket, CancellationToken.None));
+            if (request != _wideHistoryRequest)
+            {
+                return; // A newer range was picked while this one loaded.
+            }
+
+            _viewModel.MergeOlderHistory(history, to);
+            _wideHistoryMinutes = minutes;
+            StartupTrace.Write($"Wide history load applied // minutes={minutes} bucket={bucket.TotalMinutes}m read={stopwatch.ElapsedMilliseconds}ms");
         }
         catch (Exception ex)
         {
-            StartupTrace.WriteException("ReloadHistoryForRangeAsync", ex);
+            StartupTrace.WriteException("Wide history load", ex);
+        }
+        finally
+        {
+            if (request == _wideHistoryRequest)
+            {
+                _viewModel.SetHistoryLoading(false);
+            }
         }
     }
 
@@ -2349,7 +2783,8 @@ public sealed partial class ShellWindow : Window
         ApplyGlobalRangeState(_globalNinetyDayButton, noAbsolute && minutes == 129600);
         ApplyGlobalRangeState(_globalOneYearButton, noAbsolute && minutes == 525600);
 
-        _globalRangeButton.Text = BuildGlobalRangeButtonText();
+        // With its ▾: a bare "5m" didn't read as something that opens.
+        _globalRangeButton.Text = GetGlobalRangeButtonText();
         _globalRangeButton.IsActive = _globalRangeEditorVisible;
         _globalRangeButton.IsFilled = true;
         var hasZoomedPanels = _viewModel.DashboardPanels.Any(panel => panel.IsZoomed);
@@ -2462,6 +2897,12 @@ public sealed partial class ShellWindow : Window
 
         _rangeFromEntry = CreateDeckInlineEntry(string.Empty, "2026-04-02 09:00");
         _rangeToEntry = CreateDeckInlineEntry(string.Empty, "2026-04-02 09:30");
+        _rangeFromEntry.AccessibleLabel = "Custom range from";
+        _rangeToEntry.AccessibleLabel = "Custom range to";
+        EventHandler applyRangeOnEnter = (_, _) =>
+            ApplyAbsoluteGlobalRange(_rangeFromEntry?.Text ?? string.Empty, _rangeToEntry?.Text ?? string.Empty);
+        _rangeFromEntry.Submitted += applyRangeOnEnter;
+        _rangeToEntry.Submitted += applyRangeOnEnter;
         var nowChip = CreateActionChip("Now", (_, _) =>
         {
             if (_rangeToEntry is not null)
@@ -2521,7 +2962,7 @@ public sealed partial class ShellWindow : Window
         presenterStyle.Setters.Add(new Setter(Control.BackgroundProperty, ResolveBrush("SurfaceElevatedBrush", "#222529")));
         presenterStyle.Setters.Add(new Setter(Control.BorderBrushProperty, ResolveBrush("SurfaceStrokeBrush", "#2C3035")));
         presenterStyle.Setters.Add(new Setter(Control.BorderThicknessProperty, new Thickness(1)));
-        presenterStyle.Setters.Add(new Setter(Control.CornerRadiusProperty, new CornerRadius(10)));
+        presenterStyle.Setters.Add(new Setter(Control.CornerRadiusProperty, new CornerRadius(UiMetrics.OverlayRadius)));
         presenterStyle.Setters.Add(new Setter(Control.PaddingProperty, new Thickness(16)));
         presenterStyle.Setters.Add(new Setter(FrameworkElement.MaxWidthProperty, 460d));
 
@@ -2564,14 +3005,32 @@ public sealed partial class ShellWindow : Window
 
     private void ApplyAbsoluteGlobalRange(string fromText, string toText)
     {
-        if (!TryParseGlobalDateTime(fromText, out var start) || !TryParseGlobalDateTime(toText, out var end) || end <= start)
+        string? problem = null;
+        if (!TryParseGlobalDateTime(fromText, out var start))
         {
-            _viewModel.SetStatus("Time range must use local date/time like 2026-04-02 21:30, and End must be after From.", StatusSeverity.Issue);
-            UpdateStatusText();
+            problem = $"From isn't a date and time SwissOlly can read. Use the form {FormatRangeEntry(DateTimeOffset.Now)}.";
+        }
+        else if (!TryParseGlobalDateTime(toText, out var end))
+        {
+            problem = $"To isn't a date and time SwissOlly can read. Use the form {FormatRangeEntry(DateTimeOffset.Now)}.";
+        }
+        else if (end <= start)
+        {
+            problem = "To must be later than From.";
+        }
+        else if (start >= DateTimeOffset.Now)
+        {
+            problem = "From is in the future, so there's nothing to show yet.";
+        }
+        else
+        {
+            // An end in the future would leave the right of every chart empty.
+            ApplyAbsoluteGlobalRange(start, end > DateTimeOffset.Now ? DateTimeOffset.Now : end);
             return;
         }
 
-        ApplyAbsoluteGlobalRange(start, end);
+        _viewModel.SetStatus(problem, StatusSeverity.Issue);
+        UpdateStatusText();
     }
 
     private void ApplyAbsoluteGlobalRange(DateTimeOffset start, DateTimeOffset end)
@@ -2583,26 +3042,19 @@ public sealed partial class ShellWindow : Window
             _viewModel.ApplyGlobalAbsoluteRange(start, end);
         });
 
+        // A pinned range can reach back past the in-memory window.
+        RequestWideHistory((int)Math.Min(int.MaxValue, Math.Ceiling((DateTimeOffset.UtcNow - start).TotalMinutes)));
+
         HideGlobalRangeEditor();
-        _viewModel.SetStatus($"Pinned {start.LocalDateTime:g} to {end.LocalDateTime:g}", StatusSeverity.Healthy);
+        _viewModel.SetStatus($"Showing {TimeLabels.Range(start.LocalDateTime, end.LocalDateTime)}", StatusSeverity.Healthy, TimeSpan.FromSeconds(6));
         UpdateStatusText();
-    }
-
-    private string BuildGlobalRangeButtonText()
-    {
-        if (_globalAbsoluteStartUtc.HasValue && _globalAbsoluteEndUtc.HasValue)
-        {
-            return $"{_globalAbsoluteStartUtc.Value.LocalDateTime:MM-dd HH:mm} -> {_globalAbsoluteEndUtc.Value.LocalDateTime:MM-dd HH:mm}";
-        }
-
-        return FormatGlobalRangeLabel(_viewModel.SelectedWindowMinutes);
     }
 
     private string GetGlobalRangeButtonText()
     {
         if (_globalAbsoluteStartUtc.HasValue && _globalAbsoluteEndUtc.HasValue)
         {
-            return $"{_globalAbsoluteStartUtc.Value.LocalDateTime:MM-dd HH:mm} -> {_globalAbsoluteEndUtc.Value.LocalDateTime:MM-dd HH:mm} ▾";
+            return $"{TimeLabels.Range(_globalAbsoluteStartUtc.Value.LocalDateTime, _globalAbsoluteEndUtc.Value.LocalDateTime)} ▾";
         }
 
         return $"{FormatGlobalRangeLabel(_viewModel.SelectedWindowMinutes)} ▾";
@@ -2655,9 +3107,9 @@ public sealed partial class ShellWindow : Window
 
     private static void ApplyGlobalRangeState(ActionChip chip, bool isActive)
     {
+        // Selection is IsActive alone (dimming the other chips also dimmed their text); "filled"
+        // now means a primary button.
         chip.IsActive = isActive;
-        chip.IsFilled = isActive;
-        chip.Opacity = isActive ? 1d : 0.82d;
     }
 }
 
@@ -2757,6 +3209,10 @@ internal static class NativeWindowMethods
 
     public static nint LoadWindowIcon(string iconPath) =>
         LoadImageW(0, iconPath, ImageIcon, 0, 0, LoadFromFile | DefaultSize);
+
+    /// <summary>Loads the icon image closest to <paramref name="size"/> pixels square.</summary>
+    public static nint LoadWindowIcon(string iconPath, int size) =>
+        LoadImageW(0, iconPath, ImageIcon, size, size, LoadFromFile);
 
     public static void ApplyWindowIcon(nint windowHandle, nint iconHandle)
     {

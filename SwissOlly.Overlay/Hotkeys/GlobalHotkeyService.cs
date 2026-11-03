@@ -20,7 +20,9 @@ internal sealed class GlobalHotkeyService : IDisposable
         if (!OverlayConfig.TryParseHotkeyGesture(gesture, out uint mods, out uint vk))
             return false;
 
-        _registered = RegisterHotKey(ownerHwnd, HotkeyId, mods, vk);
+        // MOD_NOREPEAT: holding the keys toggles once, not on every auto-repeat.
+        const uint ModNoRepeat = 0x4000;
+        _registered = RegisterHotKey(ownerHwnd, HotkeyId, mods | ModNoRepeat, vk);
         return _registered;
     }
 

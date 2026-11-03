@@ -47,6 +47,13 @@ internal sealed class LayeredOverlayWindow : IDisposable
         PostToWindow(WM_UPDATE_BITMAP, 0);
     }
 
+    /// <summary>
+    /// The corner to anchor to, from the next frame. Every frame recomputes its position from it,
+    /// so a new corner applies live. It used to change only when a game was detected, so the
+    /// hotkey showed the overlay in whatever corner the last game had used.
+    /// </summary>
+    internal void SetCorner(OverlayCorner corner) => _corner = corner;
+
     internal void Reposition(OverlayCorner corner, IntPtr gameMonitor, IntPtr gameHwnd)
     {
         _corner = corner;
@@ -274,9 +281,9 @@ internal sealed class LayeredOverlayWindow : IDisposable
 
         return _corner switch
         {
-            OverlayCorner.TopLeft     => new Win32Interop.POINT { X = r.Left  + Margin, Y = r.Top    + Margin },
-            OverlayCorner.TopRight    => new Win32Interop.POINT { X = r.Right - w - Margin, Y = r.Top    + Margin },
-            OverlayCorner.BottomLeft  => new Win32Interop.POINT { X = r.Left  + Margin, Y = r.Bottom - h - Margin },
+            OverlayCorner.TopLeft => new Win32Interop.POINT { X = r.Left + Margin, Y = r.Top + Margin },
+            OverlayCorner.TopRight => new Win32Interop.POINT { X = r.Right - w - Margin, Y = r.Top + Margin },
+            OverlayCorner.BottomLeft => new Win32Interop.POINT { X = r.Left + Margin, Y = r.Bottom - h - Margin },
             OverlayCorner.BottomRight => new Win32Interop.POINT { X = r.Right - w - Margin, Y = r.Bottom - h - Margin },
             _ => new Win32Interop.POINT { X = r.Right - w - Margin, Y = r.Top + Margin },
         };

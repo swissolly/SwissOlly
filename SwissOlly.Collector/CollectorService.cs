@@ -33,6 +33,14 @@ public sealed class CollectorService : IAsyncDisposable
     public event EventHandler<MetricSnapshot>? SnapshotCollected;
     public event EventHandler<Exception>? CollectionFailed;
 
+    /// <summary>
+    /// Raised when saving history starts failing (with the error) and again when it recovers
+    /// (with null). Live snapshots keep flowing either way.
+    /// </summary>
+    public event EventHandler<Exception?>? HistoryWriteStateChanged;
+
+    private bool _historyWriteFailing;
+
     public async Task StartAsync(SwissOllyConfig config, CancellationToken cancellationToken)
     {
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -40,7 +48,17 @@ public sealed class CollectorService : IAsyncDisposable
         {
             await StopInternalAsync().ConfigureAwait(false);
 
-            await _store.InitializeAsync(config, cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await _store.InitializeAsync(config, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // Storage folder unreachable (drive unplugged, no permission). Sample anyway so the
+                // live board works; the store retries opening on every write.
+                _historyWriteFailing = true;
+                RaiseHistoryWriteStateChanged(ex);
+            }
 
             _loopCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             _timer = new PeriodicTimer(TimeSpan.FromSeconds(config.ScrapeIntervalSeconds));
@@ -159,7 +177,9 @@ public sealed class CollectorService : IAsyncDisposable
         try
         {
             var snapshot = await collect.WaitAsync(timeout, cancellationToken).ConfigureAwait(false);
-            await _store.AppendSnapshotAsync(snapshot, timeoutCancellation.Token).ConfigureAwait(false);
+            await TryPersistAsync(snapshot, cancellationToken, timeoutCancellation.Token).ConfigureAwait(false);
+            // Raised even when the write failed: a full disk or an unplugged storage drive should
+            // stop history, not freeze the live board.
             RaiseSnapshotCollected(snapshot);
         }
         catch (Exception ex) when (ex is TimeoutException
@@ -173,6 +193,46 @@ public sealed class CollectorService : IAsyncDisposable
         catch (Exception ex)
         {
             RaiseCollectionFailed(ex);
+        }
+    }
+
+    private async Task TryPersistAsync(MetricSnapshot snapshot, CancellationToken loopToken, CancellationToken writeToken)
+    {
+        try
+        {
+            await _store.AppendSnapshotAsync(snapshot, writeToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (loopToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            if (!_historyWriteFailing)
+            {
+                _historyWriteFailing = true;
+                RaiseHistoryWriteStateChanged(ex);
+            }
+
+            return;
+        }
+
+        if (_historyWriteFailing)
+        {
+            _historyWriteFailing = false;
+            RaiseHistoryWriteStateChanged(null);
+        }
+    }
+
+    private void RaiseHistoryWriteStateChanged(Exception? error)
+    {
+        try
+        {
+            HistoryWriteStateChanged?.Invoke(this, error);
+        }
+        catch
+        {
+            // A subscriber failing must not stop sampling.
         }
     }
 

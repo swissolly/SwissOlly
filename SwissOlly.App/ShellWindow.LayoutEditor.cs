@@ -236,6 +236,13 @@ public sealed partial class ShellWindow
         // Ctrl+[ / Ctrl+] narrow and widen the board's time range one preset at a time.
         AddControlShortcut((VirtualKey)219, () => StepGlobalWindowRange(-1));
         AddControlShortcut((VirtualKey)221, () => StepGlobalWindowRange(+1));
+        AddControlShortcut(VirtualKey.S, () =>
+        {
+            if (_settingsViewActive && HasUnappliedSettings())
+            {
+                OnSaveSettingsClick(null, EventArgs.Empty);
+            }
+        });
     }
 
     private static readonly int[] s_rangeStepsMinutes = [1, 5, 15, 30, 60, 720, 1440, 2880, 7200, 10080, 43200, 129600, 525600];
@@ -937,6 +944,54 @@ public sealed partial class ShellWindow
         {
             _scrollHost.ChangeView(null, next, null, disableAnimation: true);
         }
+    }
+
+    // ---- Keyboard -----------------------------------------------------------------------------
+
+    /// <summary>
+    /// Arrow keys on a focused panel in edit mode. Resolved through the same engine path as a
+    /// drop, so a nudge displaces and compacts neighbours exactly like a drag would.
+    /// </summary>
+    private void OnCardLayoutNudgeRequested(object? sender, LayoutNudgeEventArgs e)
+    {
+        CompleteFloatSettle();
+        if (sender is not TelemetryPanelCard card
+            || !_isLayoutEditMode
+            || _layoutGesture is not null
+            || card.Panel?.PanelKey is not { Length: > 0 } key
+            || !_displayPanelLayouts.TryGetValue(key, out var display)
+            || _viewModel.GetPanelLayout(key) is not { } saved)
+        {
+            return;
+        }
+
+        var target = e.Resize
+            ? GridLayoutEngine.ResizeByDelta(
+                display, left: false, right: e.Columns != 0, top: false, bottom: e.Rows != 0,
+                e.Columns, e.Rows, Math.Max(PanelLayout.MinWidth, ResponsiveMinimumWidth()))
+            : new PanelLayout(
+                Math.Clamp(display.X + e.Columns, 0, PanelLayout.Columns - display.W),
+                Math.Max(0, display.Y + e.Rows),
+                display.W,
+                display.H);
+        if (LayoutsEqual(target, display))
+        {
+            return;
+        }
+
+        var resolved = GridLayoutEngine.Apply(
+            _viewModel.PanelLayouts.Select(pair => new PanelPlacement(pair.Key, pair.Value.Clone())),
+            key,
+            MapDisplayTargetToSaved(display, saved, target));
+        ApplyLayoutChangeAnimated(() =>
+        {
+            _viewModel.ApplyPlacements(resolved);
+            ReorderDashboardPanelsInPlace();
+        });
+
+        // Reordering can move the card in the visual tree; keep focus on it for the next press.
+        _ = card.Focus(FocusState.Keyboard);
+        card.StartBringIntoView(new BringIntoViewOptions { AnimationDesired = Motion.AnimationsEnabled });
     }
 
     // ---- Helpers ------------------------------------------------------------------------------

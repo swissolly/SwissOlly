@@ -202,6 +202,10 @@ public sealed class SwissOllyConfigTests
     [InlineData(ThemeMode.Violet)]
     [InlineData(ThemeMode.Nord)]
     [InlineData(ThemeMode.Sandstone)]
+    [InlineData(ThemeMode.Obsidian)]
+    [InlineData(ThemeMode.Synthwave)]
+    [InlineData(ThemeMode.Frost)]
+    [InlineData(ThemeMode.Blossom)]
     public void Normalize_Preserves_Every_Defined_Theme(ThemeMode theme)
     {
         var config = new SwissOllyConfig { Theme = theme };
@@ -305,11 +309,55 @@ public sealed class SwissOllyConfigTests
     [InlineData(@"\\.\C:\swissolly")]
     [InlineData(@"relative\data")]
     [InlineData(@"C:relative")]
+    [InlineData(@"C:\data:stream")]
+    [InlineData(@"C:\NUL\data")]
+    [InlineData(@"C:\stuff\com1")]
+    [InlineData(@"C:\stuff\LPT9.log")]
+    [InlineData("C:\\bad|pipe")]
     public void Normalize_Rejects_Unsafe_Storage_Directories(string storageDirectory)
     {
         var config = new SwissOllyConfig { StorageDirectory = storageDirectory }.Normalize();
 
         Assert.Equal(SwissOllyConfig.DefaultStorageDirectory, config.StorageDirectory);
+    }
+
+    [Theory]
+    [InlineData(@"C:\Users\me\Console\data")]
+    [InlineData(@"D:\compact\nullable")]
+    [InlineData(@"E:\COM10")]
+    public void Normalize_Keeps_Folders_That_Only_Look_Like_Device_Names(string storageDirectory)
+    {
+        var config = new SwissOllyConfig { StorageDirectory = storageDirectory }.Normalize();
+
+        Assert.Equal(storageDirectory, config.StorageDirectory);
+    }
+
+    [Theory]
+    [InlineData("99999999d")]
+    [InlineData("2147483647m")]
+    [InlineData("3651d")]
+    [InlineData("87601h")]
+    [InlineData("+5d")]
+    public void TryParseRetentionWindow_Rejects_Out_Of_Range_Values_Without_Throwing(string input)
+    {
+        Assert.False(SwissOllyConfig.TryParseRetentionWindow(input, out _, out _));
+    }
+
+    [Fact]
+    public void TryParseRetentionWindow_Accepts_The_Ten_Year_Ceiling()
+    {
+        Assert.True(SwissOllyConfig.TryParseRetentionWindow("3650d", out var window, out var normalized));
+        Assert.Equal(TimeSpan.FromDays(3650), window);
+        Assert.Equal("3650d", normalized);
+    }
+
+    [Fact]
+    public void Normalize_Survives_A_Hostile_Retention_Value()
+    {
+        var config = new SwissOllyConfig { RetentionInputText = "99999999d", MaxRetentionHours = 48 }.Normalize();
+
+        Assert.Equal(TimeSpan.FromHours(48), config.GetRetentionWindow());
+        Assert.Equal("2d", config.RetentionInputText);
     }
 
     [Fact]

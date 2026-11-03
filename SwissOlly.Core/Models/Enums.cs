@@ -43,6 +43,18 @@ public enum ThemeMode
 
     /// <summary>Warm off-white paper tone with a slate accent.</summary>
     Sandstone = 7,
+
+    /// <summary>True black for OLED screens, with monochrome chrome.</summary>
+    Obsidian = 8,
+
+    /// <summary>Deep indigo with a neon magenta accent.</summary>
+    Synthwave = 9,
+
+    /// <summary>Cool blue-white with an indigo accent.</summary>
+    Frost = 10,
+
+    /// <summary>Blush light surfaces with a raspberry accent.</summary>
+    Blossom = 11,
 }
 
 public enum PanelSizePreset

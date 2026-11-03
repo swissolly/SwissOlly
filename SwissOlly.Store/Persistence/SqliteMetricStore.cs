@@ -57,7 +57,6 @@ public sealed class SqliteMetricStore : IMetricStore
     private async Task InitializeCoreAsync(SwissOllyConfig config, CancellationToken cancellationToken)
     {
         config = config.Normalize();
-        Directory.CreateDirectory(config.StorageDirectory);
         var nextConnectionString = new SqliteConnectionStringBuilder
         {
             DataSource = ResolveDatabasePath(config),
@@ -75,18 +74,16 @@ public sealed class SqliteMetricStore : IMetricStore
 
         _connectionString = nextConnectionString;
         _config = config;
+        await OpenWriteConnectionAsync(cancellationToken).ConfigureAwait(false);
+    }
 
-        if (_insertCommand is not null)
-        {
-            await _insertCommand.DisposeAsync().ConfigureAwait(false);
-            _insertCommand = null;
-        }
+    private async Task OpenWriteConnectionAsync(CancellationToken cancellationToken)
+    {
+        await DropWriteConnectionAsync().ConfigureAwait(false);
 
-        if (_writeConnection is not null)
-        {
-            await _writeConnection.DisposeAsync().ConfigureAwait(false);
-        }
-
+        // Recreated on every open: a storage folder on a drive that was unplugged and plugged
+        // back in needs it again before SQLite can create the database file.
+        Directory.CreateDirectory(_config!.StorageDirectory);
         _writeConnection = new SqliteConnection(_connectionString);
         await _writeConnection.OpenAsync(cancellationToken).ConfigureAwait(false);
 
@@ -203,42 +200,82 @@ public sealed class SqliteMetricStore : IMetricStore
             return;
         }
 
-        var connectionString = EnsureInitialized();
+        _ = EnsureInitialized();
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             ThrowIfDisposed();
+            if (_writeConnection is null || _insertCommand is null)
+            {
+                // A failed write dropped the connection; try again now that the disk may have room
+                // or the drive may be back.
+                await OpenWriteConnectionAsync(cancellationToken).ConfigureAwait(false);
+            }
+
             var connection = EnsureWriteConnectionInitialized();
             var command = EnsureInsertCommandInitialized();
-            await using var transaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
-            command.Transaction = (SqliteTransaction)transaction;
             try
             {
-                foreach (var sample in snapshot.Samples)
+                await using var transaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+                command.Transaction = (SqliteTransaction)transaction;
+                try
                 {
-                    _panelKeyParameter!.Value = sample.PanelKey;
-                    _panelTitleParameter!.Value = sample.PanelTitle;
-                    _seriesKeyParameter!.Value = sample.SeriesKey;
-                    _seriesNameParameter!.Value = sample.SeriesName;
-                    _categoryParameter!.Value = (int)sample.Category;
-                    _unitParameter!.Value = (int)sample.Unit;
-                    _timestampMsParameter!.Value = sample.Timestamp.ToUnixTimeMilliseconds();
-                    _valueParameter!.Value = sample.Value;
+                    foreach (var sample in snapshot.Samples)
+                    {
+                        _panelKeyParameter!.Value = sample.PanelKey;
+                        _panelTitleParameter!.Value = sample.PanelTitle;
+                        _seriesKeyParameter!.Value = sample.SeriesKey;
+                        _seriesNameParameter!.Value = sample.SeriesName;
+                        _categoryParameter!.Value = (int)sample.Category;
+                        _unitParameter!.Value = (int)sample.Unit;
+                        _timestampMsParameter!.Value = sample.Timestamp.ToUnixTimeMilliseconds();
+                        _valueParameter!.Value = sample.Value;
 
-                    await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                    }
+
+                    await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
                 }
-
-                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                finally
+                {
+                    command.Transaction = null;
+                }
+                await MaybeMaintainAsync(connection, snapshot.Timestamp, cancellationToken).ConfigureAwait(false);
             }
-            finally
+            catch (Exception ex) when (ex is SqliteException or IOException or UnauthorizedAccessException)
             {
-                command.Transaction = null;
+                // Disk full, drive removed, file locked: the connection may be unusable now, so
+                // drop it and reopen on the next write instead of failing forever.
+                await DropWriteConnectionAsync().ConfigureAwait(false);
+                throw;
             }
-            await MaybeMaintainAsync(connection, snapshot.Timestamp, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
             _gate.Release();
+        }
+    }
+
+    private async Task DropWriteConnectionAsync()
+    {
+        if (_insertCommand is not null)
+        {
+            await _insertCommand.DisposeAsync().ConfigureAwait(false);
+            _insertCommand = null;
+        }
+
+        if (_writeConnection is not null)
+        {
+            try
+            {
+                await _writeConnection.DisposeAsync().ConfigureAwait(false);
+            }
+            catch
+            {
+                // Closing a connection whose file vanished can fail too; it is gone either way.
+            }
+
+            _writeConnection = null;
         }
     }
 
@@ -367,6 +404,61 @@ public sealed class SqliteMetricStore : IMetricStore
             command.Parameters.AddWithValue("$rawBoundary", rawBoundaryMs);
         }
 
+        return await ReadHistoryAsync(command, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<IReadOnlyList<MetricSeriesHistory>> LoadHistoryAsync(
+        DateTimeOffset fromUtc,
+        DateTimeOffset toUtc,
+        TimeSpan bucket,
+        CancellationToken cancellationToken)
+    {
+        ThrowIfDisposed();
+        var connectionString = EnsureInitialized();
+        await using var connection = new SqliteConnection(connectionString);
+        await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+
+        // Minute rollups and raw samples never cover the same time (compaction moves samples
+        // into rollups and deletes them in one transaction), so the two tables simply stack.
+        // Averaging in SQL keeps a year to a couple of thousand points per series instead of
+        // half a million rows marshalled into memory.
+        const string Stored =
+            """
+            SELECT panel_key, panel_title, series_key, series_name, category, unit, timestamp_ms, value
+            FROM metric_rollups_1m
+            WHERE timestamp_ms >= $fromTimestamp AND timestamp_ms < $toTimestamp
+            UNION ALL
+            SELECT panel_key, panel_title, series_key, series_name, category, unit, timestamp_ms, value
+            FROM metric_samples
+            WHERE timestamp_ms >= $fromTimestamp AND timestamp_ms < $toTimestamp
+            """;
+
+        var command = connection.CreateCommand();
+        var bucketMs = (long)Math.Max(0d, bucket.TotalMilliseconds);
+        command.CommandText = bucketMs > 0
+            ? $"""
+              SELECT panel_key, MAX(panel_title), series_key, MAX(series_name), MAX(category), MAX(unit),
+                     (timestamp_ms / $bucketMs) * $bucketMs AS bucket_ms, AVG(value)
+              FROM ({Stored})
+              GROUP BY panel_key, series_key, bucket_ms
+              ORDER BY panel_key, series_key, bucket_ms;
+              """
+            : $"""
+              SELECT * FROM ({Stored})
+              ORDER BY panel_key, series_key, timestamp_ms;
+              """;
+        command.Parameters.AddWithValue("$fromTimestamp", fromUtc.ToUnixTimeMilliseconds());
+        command.Parameters.AddWithValue("$toTimestamp", toUtc.ToUnixTimeMilliseconds());
+        if (bucketMs > 0)
+        {
+            command.Parameters.AddWithValue("$bucketMs", bucketMs);
+        }
+
+        return await ReadHistoryAsync(command, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task<IReadOnlyList<MetricSeriesHistory>> ReadHistoryAsync(SqliteCommand command, CancellationToken cancellationToken)
+    {
         var panelMap = new Dictionary<string, PanelAccumulator>(StringComparer.OrdinalIgnoreCase);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
@@ -404,6 +496,11 @@ public sealed class SqliteMetricStore : IMetricStore
         {
             ThrowIfDisposed();
             _config = config.Normalize();
+            if (_writeConnection is null || _insertCommand is null)
+            {
+                await OpenWriteConnectionAsync(cancellationToken).ConfigureAwait(false);
+            }
+
             var connection = EnsureWriteConnectionInitialized();
             await CompactAndPruneAsync(connection, _config, DateTimeOffset.UtcNow, cancellationToken).ConfigureAwait(false);
             _nextMaintenanceUtc = DateTimeOffset.UtcNow.Add(MaintenanceInterval);

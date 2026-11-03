@@ -56,6 +56,109 @@ public sealed class SqliteMetricStoreTests : IAsyncDisposable
     }
 
     [Fact]
+    public async Task Bucketed_History_Averages_In_Sql_And_Honours_The_Range()
+    {
+        await _store.InitializeAsync(CreateConfig(), CancellationToken.None);
+        var start = new DateTimeOffset(DateTime.UtcNow.Date, TimeSpan.Zero).AddHours(1);
+        // Ten-second samples for ten minutes: values 0..59.
+        for (var i = 0; i < 60; i++)
+        {
+            var at = start.AddSeconds(i * 10);
+            await _store.AppendSnapshotAsync(new MetricSnapshot(at,
+            [
+                new MetricSample("cpu-total", "CPU Total", "usage", "Usage", MetricCategory.Cpu, MetricUnit.Percent, i, at),
+            ]), CancellationToken.None);
+        }
+
+        var fiveMinute = await _store.LoadHistoryAsync(start, start.AddMinutes(10), TimeSpan.FromMinutes(5), CancellationToken.None);
+        var points = Assert.Single(Assert.Single(fiveMinute).Series).Points;
+        Assert.Equal(2, points.Count);
+        Assert.Equal(14.5, points[0].Value, 3);   // average of 0..29
+        Assert.Equal(44.5, points[1].Value, 3);   // average of 30..59
+
+        var raw = await _store.LoadHistoryAsync(start.AddMinutes(1), start.AddMinutes(2), TimeSpan.Zero, CancellationToken.None);
+        var rawPoints = Assert.Single(Assert.Single(raw).Series).Points;
+        Assert.Equal(6, rawPoints.Count);          // [1:00, 2:00) at ten-second spacing
+        Assert.Equal(6d, rawPoints[0].Value);
+    }
+
+    /// <summary>
+    /// The restart guarantee: what the app reloads at launch (minute averages before the last hour,
+    /// raw samples after it) is point for point what a running session holds once it has folded
+    /// its own older samples into minutes. So a chart looks the same before and after a restart.
+    /// </summary>
+    [Fact]
+    public async Task Reloaded_History_Matches_What_A_Running_Session_Shows()
+    {
+        await _store.InitializeAsync(CreateConfig(), CancellationToken.None);
+        var start = MinuteFloor(DateTimeOffset.UtcNow.AddHours(-4)).AddSeconds(7);
+        var end = start.AddHours(2.5);
+        var session = new List<MetricPoint>();
+        var random = new Random(12);
+        for (var at = start; at < end; at = at.AddSeconds(5))
+        {
+            // Spiky, like CPU load, with a five-minute outage in the middle.
+            if (at > start.AddMinutes(70) && at < start.AddMinutes(75))
+            {
+                continue;
+            }
+
+            var value = random.NextDouble() < 0.05 ? 90 + (random.NextDouble() * 10) : random.NextDouble() * 20;
+            session.Add(new MetricPoint(at, value));
+            await _store.AppendSnapshotAsync(new MetricSnapshot(at,
+            [
+                new MetricSample("cpu-total", "CPU Total", "usage", "Usage", MetricCategory.Cpu, MetricUnit.Percent, value, at),
+            ]), CancellationToken.None);
+        }
+
+        // The session folds everything older than an hour, cut at a whole minute.
+        var rawFrom = MinuteFloor(end.AddHours(-1));
+        MetricHistory.Compact(session, DateTimeOffset.MinValue, rawFrom, TimeSpan.FromMinutes(1));
+
+        // A restart at the same moment reads the same two tiers.
+        var older = await _store.LoadHistoryAsync(MinuteFloor(start), rawFrom, TimeSpan.FromMinutes(1), CancellationToken.None);
+        var recent = await _store.LoadHistoryAsync(rawFrom, end.AddMinutes(1), TimeSpan.Zero, CancellationToken.None);
+        var reloaded = Assert.Single(Assert.Single(MetricHistory.Concat(older, recent)).Series).Points;
+
+        Assert.Equal(session.Count, reloaded.Count);
+        for (var i = 0; i < session.Count; i++)
+        {
+            Assert.Equal(session[i].Timestamp, reloaded[i].Timestamp);
+            Assert.Equal(session[i].Value, reloaded[i].Value, 9);
+        }
+
+        // The outage stays an outage: no minute is invented inside it.
+        Assert.DoesNotContain(reloaded, p => p.Timestamp > start.AddMinutes(71) && p.Timestamp < start.AddMinutes(74));
+    }
+
+    private static DateTimeOffset MinuteFloor(DateTimeOffset value) =>
+        DateTimeOffset.FromUnixTimeMilliseconds(value.ToUnixTimeMilliseconds() / 60_000 * 60_000);
+
+    [Fact]
+    public async Task Store_Recovers_When_Its_Folder_Becomes_Reachable_Again()
+    {
+        // A file sitting where the storage folder should be stands in for an unplugged drive.
+        var blocked = Path.Combine(_tempDir, "blocked");
+        await File.WriteAllTextAsync(blocked, "not a folder");
+        var config = new SwissOllyConfig { StorageDirectory = blocked, MaxRetentionHours = 24 }.Normalize();
+        var timestamp = DateTimeOffset.UtcNow;
+        var snapshot = new MetricSnapshot(timestamp,
+        [
+            new MetricSample("cpu-total", "CPU Total", "usage", "Usage", MetricCategory.Cpu, MetricUnit.Percent, 12, timestamp),
+        ]);
+
+        await Assert.ThrowsAnyAsync<IOException>(() => _store.InitializeAsync(config, CancellationToken.None));
+        await Assert.ThrowsAnyAsync<IOException>(() => _store.AppendSnapshotAsync(snapshot, CancellationToken.None));
+
+        File.Delete(blocked);
+        await _store.AppendSnapshotAsync(snapshot, CancellationToken.None);
+
+        var history = await _store.LoadHistoryAsync(timestamp.AddMinutes(-1), CancellationToken.None);
+        Assert.Single(history);
+        Assert.True(File.Exists(config.GetDatabasePath()));
+    }
+
+    [Fact]
     public async Task AppendSnapshot_Empty_Samples_Does_Not_Throw()
     {
         var config = CreateConfig();

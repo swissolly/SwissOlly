@@ -54,9 +54,13 @@ public sealed class TelemetryPanelCard : UserControl
     private readonly ActionChip _processToggleButton;
     private readonly Border _legendDivider;
     private readonly Grid _contentGrid;
-    private readonly RowDefinition _processRow;
-    private readonly Dictionary<string, (ClickableBorder Row, Border InnerBorder, TextBlock NameText, TextBlock ValueText, Ellipse Dot)> _legendRows = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, (ClickableBorder Row, TextBlock NameText, TextBlock ValueText, TextBlock CaptionText, LinearGradientBrush FillBrush, Border RowBorder, Ellipse? ChartDot)> _processRowParts = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Flyout _processFlyout;
+    private readonly TextBlock _processFooterText;
+    private readonly Dictionary<string, (ClickableBorder Row, Border InnerBorder, TextBlock NameText, TextBlock ValueText, Ellipse Dot, Line Pattern)> _legendRows = new(StringComparer.OrdinalIgnoreCase);
+    private readonly List<ProcessRowSlot> _processRowSlots = [];
+    private readonly List<string> _displayedProcessKeys = [];
+    private readonly TextBlock _processEmptyText;
+    private bool _processListHovered;
     private bool _processScrollLoadQueued;
     private bool _processSectionExpanded;
     private MetricPanelViewModel? _observedPanel;
@@ -69,7 +73,9 @@ public sealed class TelemetryPanelCard : UserControl
     private DateTimeOffset _lastRenderedWindowEndUtc;
     private double _lastRenderedCeilingValue = double.NaN;
     private MetricUnit _lastRenderedUnit;
-    private ProcessSortMode _lastRenderedSortMode;
+    // Nullable: Highest is the enum's zero value, so a plain field already "matched" the default
+    // and the Highest chip never showed as selected until the sort was changed.
+    private ProcessSortMode? _lastRenderedSortMode;
     // Nullable so the first render always applies the visual mode. As plain bools they started
     // "false", matched every panel without a process table, and the Processes button kept its
     // default Visible on CPU Cores, Clock, GPU and the rest.
@@ -120,8 +126,12 @@ public sealed class TelemetryPanelCard : UserControl
     /// <summary>The gesture finished: released (commit) or cancelled (capture lost).</summary>
     public event EventHandler<LayoutGestureEndedEventArgs>? LayoutGestureEnded;
 
+    /// <summary>Arrow key in edit mode: move one cell, or with Shift, resize one cell.</summary>
+    public event EventHandler<LayoutNudgeEventArgs>? LayoutNudgeRequested;
+
     private Grid _resizeHandleLayer = null!;
     private bool _isLayoutEditMode;
+    private bool _hasKeyboardFocus;
 
     /// <summary>Which edges a handle drags. Flags so a corner is just two edges combined.</summary>
     [Flags]
@@ -148,6 +158,13 @@ public sealed class TelemetryPanelCard : UserControl
         // here is what once let a card overflow the space the grid had reserved for it.
         HorizontalAlignment = HorizontalAlignment.Stretch;
         VerticalAlignment = VerticalAlignment.Stretch;
+        IsTabStop = false;
+        UseSystemFocusVisuals = false;
+        KeyDown += OnLayoutKeyDown;
+        GotFocus += (_, _) => OnLayoutFocusChanged(true);
+        LostFocus += (_, _) => OnLayoutFocusChanged(false);
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetHelpText(
+            this, "While editing the layout: arrow keys move this panel, Shift+arrow keys resize it");
 
         _badgeIconHost = new Grid
         {
@@ -181,7 +198,7 @@ public sealed class TelemetryPanelCard : UserControl
             Width = 36,
             Height = 36,
             CornerRadius = new CornerRadius(8),
-            BorderThickness = new Thickness(0.9),
+            BorderThickness = new Thickness(UiMetrics.Hairline),
             Background = ResolveBrush("SurfaceInsetBrush", "#091321"),
             Child = _badgeIconHost,
         };
@@ -236,9 +253,13 @@ public sealed class TelemetryPanelCard : UserControl
         _visualGrid.Children.Add(_chartFrame);
         Grid.SetColumn(_chartFrame, 1);
 
+        // One Tab stop for the whole legend; arrows move between its rows. Sixteen per-core rows
+        // as separate stops would make tabbing past a CPU panel tedious.
         _legendHost = new StackPanel
         {
             Spacing = 4,
+            TabFocusNavigation = KeyboardNavigationMode.Once,
+            XYFocusKeyboardNavigation = XYFocusKeyboardNavigationMode.Enabled,
         };
         _legendDivider = new Border
         {
@@ -270,8 +291,7 @@ public sealed class TelemetryPanelCard : UserControl
         _sortHighestButton = CreateProcessSortButton("Highest", ProcessSortMode.Highest);
         _sortLowestButton = CreateProcessSortButton("Lowest", ProcessSortMode.Lowest);
         _sortNameButton = CreateProcessSortButton("Name", ProcessSortMode.Name);
-        // Wide enough for "Hide processes", so toggling never shifts the header beside it.
-        _processToggleButton = new ActionChip { Text = "Processes", MinHeight = 30, MinWidth = 124 };
+        _processToggleButton = new ActionChip { Text = "Processes" };
         ToolTipService.SetToolTip(_processToggleButton, "Show the top processes for this metric");
         _processToggleButton.Click += OnProcessSectionToggleClick;
         // Hidden until a panel that has a process table says otherwise.
@@ -280,8 +300,13 @@ public sealed class TelemetryPanelCard : UserControl
         _processSectionTitleText = CreateTextBlock("Segoe UI Variable Text", 12, FontWeights.SemiBold);
         _processRowsHost = new StackPanel
         {
-            Spacing = 0,
+            Spacing = 2,
+            TabFocusNavigation = KeyboardNavigationMode.Once,
+            XYFocusKeyboardNavigation = XYFocusKeyboardNavigationMode.Enabled,
         };
+        _processEmptyText = CreateEmptyText("Collecting process data…");
+        _processEmptyText.Visibility = Visibility.Collapsed;
+        _processRowsHost.Children.Add(_processEmptyText);
         // Click handlers are attached per-row in the slow path of RefreshProcessRows
         _processScroller = new ScrollViewer
         {
@@ -299,6 +324,8 @@ public sealed class TelemetryPanelCard : UserControl
         };
         processHeader.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         processHeader.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        _processSectionTitleText.VerticalAlignment = VerticalAlignment.Center;
+        _processSectionTitleText.FontSize = 14;
         processHeader.Children.Add(_processSectionTitleText);
 
         var sortHost = new StackPanel
@@ -315,15 +342,12 @@ public sealed class TelemetryPanelCard : UserControl
         processHeader.Children.Add(sortHost);
         Grid.SetColumn(sortHost, 1);
 
+        // Same columns and horizontal padding as the rows, so each label sits over its values.
         var processColumns = new Grid
         {
-            ColumnSpacing = 6,
-            Padding = new Thickness(6, 0, 6, 4),
+            Padding = new Thickness(s_processRowPadding.Left, 0, s_processRowPadding.Right, 2),
         };
-        processColumns.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star), MinWidth = 90 });
-        processColumns.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(0.7, GridUnitType.Star) });
-        processColumns.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(32) });
-        processColumns.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        AddProcessColumns(processColumns);
 
         _processLabelText = CreateTextBlock(fontSize: 10.5);
         _processLabelText.Foreground = ResolveBrush("TextMutedBrush", "#7D9AB6");
@@ -358,6 +382,17 @@ public sealed class TelemetryPanelCard : UserControl
             }
         };
 
+        // Rows hold still under the pointer (see RefreshProcessRows); leaving re-sorts at once.
+        _processScroller.PointerEntered += (_, _) => _processListHovered = true;
+        _processScroller.PointerExited += (_, _) =>
+        {
+            _processListHovered = false;
+            if (_processSectionExpanded && Panel is { } hoveredPanel)
+            {
+                RefreshProcessRows(hoveredPanel);
+            }
+        };
+
         // Load more processes when user scrolls near the bottom
         _processScroller.ViewChanged += (_, _) =>
         {
@@ -389,24 +424,51 @@ public sealed class TelemetryPanelCard : UserControl
 
         // A grid rather than a stack, so the list fills the section's row and scrolls inside it
         // instead of pushing the card taller than its grid span.
+        // States how much of the list is shown and teaches click-to-pin, which had no affordance.
+        _processFooterText = CreateTextBlock("Segoe UI Variable Text", 11);
+        _processFooterText.Foreground = ResolveBrush("TextMutedBrush", "#90959D");
+        _processFooterText.Margin = new Thickness(s_processRowPadding.Left, 0, s_processRowPadding.Right, 0);
+        _processFooterText.TextTrimming = TextTrimming.CharacterEllipsis;
+
         var processLayout = new Grid { RowSpacing = 10 };
         processLayout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         processLayout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         processLayout.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+        processLayout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         processLayout.Children.Add(processHeader);
         processLayout.Children.Add(processColumns);
         processLayout.Children.Add(_processScroller);
+        processLayout.Children.Add(_processFooterText);
         Grid.SetRow(processColumns, 1);
         Grid.SetRow(_processScroller, 2);
+        Grid.SetRow(_processFooterText, 3);
 
+        // The list lives in a popover anchored to the Processes button. Inside the card it got
+        // whatever height was left: on a standard card that squashed the chart to ~50px and
+        // still showed only a row or two.
         _processSection = new Border
         {
             Background = BrushFactory.CreateBrush("#00FFFFFF"),
             BorderThickness = new Thickness(0),
-            Padding = new Thickness(0, 8, 0, 0),
-            Margin = new Thickness(0, 12, 0, 0),
-            Visibility = Visibility.Collapsed,
+            Width = 480,
+            Height = 440,
             Child = processLayout,
+        };
+        _processFlyout = new Flyout
+        {
+            Content = _processSection,
+            Placement = FlyoutPlacementMode.BottomEdgeAlignedRight,
+            FlyoutPresenterStyle = CreateProcessFlyoutStyle(),
+        };
+        _processFlyout.Opened += (_, _) =>
+        {
+            _processSectionExpanded = true;
+            RefreshVisualMode(Panel);
+        };
+        _processFlyout.Closed += (_, _) =>
+        {
+            _processSectionExpanded = false;
+            RefreshVisualMode(Panel);
         };
 
         var panelActions = new StackPanel
@@ -444,7 +506,7 @@ public sealed class TelemetryPanelCard : UserControl
         {
             Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
             BorderThickness = new Thickness(0),
-            CornerRadius = new CornerRadius(9),
+            CornerRadius = new CornerRadius(UiMetrics.ControlRadius),
             Padding = new Thickness(2, 3, 10, 3),
             Child = _scaleText,
             HorizontalAlignment = HorizontalAlignment.Right,
@@ -495,22 +557,18 @@ public sealed class TelemetryPanelCard : UserControl
         // children (not RowSpacing) so collapsed rows cost nothing.
         _visualGrid.Margin = new Thickness(0, 12, 0, 0);
         _legendDivider.Margin = new Thickness(8, 12, 8, 0);
-        _processRow = new RowDefinition { Height = GridLength.Auto };
         _contentGrid = new Grid();
         _contentGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         _contentGrid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star), MinHeight = 76 });
         _contentGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         _contentGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        _contentGrid.RowDefinitions.Add(_processRow);
         _contentGrid.Children.Add(headerGrid);
         _contentGrid.Children.Add(_visualGrid);
         _contentGrid.Children.Add(_legendDivider);
         _contentGrid.Children.Add(_legendScroller);
-        _contentGrid.Children.Add(_processSection);
         Grid.SetRow(_visualGrid, 1);
         Grid.SetRow(_legendDivider, 2);
         Grid.SetRow(_legendScroller, 3);
-        Grid.SetRow(_processSection, 4);
 
         _cardBorder = new Border
         {
@@ -602,6 +660,43 @@ public sealed class TelemetryPanelCard : UserControl
     /// non-hit-testable and the card ignores presses, so panels behave exactly as before this
     /// feature existed - which is what keeps chart drag-to-zoom working after a layout is saved.
     /// </summary>
+    private void OnLayoutKeyDown(object sender, KeyRoutedEventArgs e)
+    {
+        if (!_isLayoutEditMode || _isFloating)
+        {
+            return;
+        }
+
+        var (dx, dy) = e.Key switch
+        {
+            Windows.System.VirtualKey.Left => (-1, 0),
+            Windows.System.VirtualKey.Right => (1, 0),
+            Windows.System.VirtualKey.Up => (0, -1),
+            Windows.System.VirtualKey.Down => (0, 1),
+            _ => (0, 0),
+        };
+        if (dx == 0 && dy == 0)
+        {
+            return;
+        }
+
+        var shift = Microsoft.UI.Input.InputKeyboardSource.GetKeyStateForCurrentThread(Windows.System.VirtualKey.Shift)
+            .HasFlag(Windows.UI.Core.CoreVirtualKeyStates.Down);
+        LayoutNudgeRequested?.Invoke(this, new LayoutNudgeEventArgs(dx, dy, shift));
+        // Handled either way, so the board's ScrollViewer doesn't also scroll.
+        e.Handled = true;
+    }
+
+    private void OnLayoutFocusChanged(bool focused)
+    {
+        _hasKeyboardFocus = focused && _isLayoutEditMode && FocusState == FocusState.Keyboard;
+        if (_isLayoutEditMode)
+        {
+            SetHandlesRevealed(_hasKeyboardFocus);
+            _cardBorder.BorderBrush = ResolveEditBorderBrush();
+        }
+    }
+
     public void SetLayoutEditMode(bool editing)
     {
         if (!editing)
@@ -613,6 +708,14 @@ public sealed class TelemetryPanelCard : UserControl
         _resizeHandleLayer.Visibility = editing ? Visibility.Visible : Visibility.Collapsed;
         _resizeHandleLayer.IsHitTestVisible = editing;
         SetHandlesRevealed(false);
+
+        // While arranging, each panel is one tab stop: arrows move it, Shift+arrows resize it.
+        // Eight resize handles as separate stops per panel would make tabbing a board tedious.
+        IsTabStop = editing;
+        if (!editing)
+        {
+            _hasKeyboardFocus = false;
+        }
 
         if (editing)
         {
@@ -628,13 +731,16 @@ public sealed class TelemetryPanelCard : UserControl
         // the press and the panel would refuse to move.
         _chart.IsHitTestVisible = !editing;
         _legendScroller.IsHitTestVisible = !editing;
-        _processSection.IsHitTestVisible = !editing;
+        if (editing)
+        {
+            _processFlyout.Hide();
+        }
         _rangeShell.IsHitTestVisible = !editing;
         FadeTo(_rangeShell, editing ? 0d : 1d);
         UpdateCursor();
     }
 
-    private Brush ResolveEditBorderBrush() => _isFloating
+    private Brush ResolveEditBorderBrush() => _isFloating || (_isLayoutEditMode && _hasKeyboardFocus)
         ? ResolveBrush("AccentStrongBrush", "#9FEFFF")
         : _isLayoutEditMode
             ? ResolveBrush("AccentBrush", "#79B8FF")
@@ -895,8 +1001,6 @@ public sealed class TelemetryPanelCard : UserControl
     private const double CornerIdleOpacity = 0.9;
     private const double EdgeIdleOpacity = 0.55;
 
-    private static readonly Dictionary<InputSystemCursorShape, InputSystemCursor> s_cursors = [];
-
     private static InputSystemCursorShape CursorFor(ResizeEdge edge) => edge switch
     {
         ResizeEdge.TopLeft or ResizeEdge.BottomRight => InputSystemCursorShape.SizeNorthwestSoutheast,
@@ -929,19 +1033,7 @@ public sealed class TelemetryPanelCard : UserControl
 
         try
         {
-            if (shape is not { } value)
-            {
-                ProtectedCursor = null;
-                return;
-            }
-
-            if (!s_cursors.TryGetValue(value, out var cursor))
-            {
-                cursor = InputSystemCursor.Create(value);
-                s_cursors[value] = cursor;
-            }
-
-            ProtectedCursor = cursor;
+            ProtectedCursor = shape is { } value ? PointerCursors.Get(value) : null;
         }
         catch
         {
@@ -1198,8 +1290,10 @@ public sealed class TelemetryPanelCard : UserControl
         var control = (TelemetryPanelCard)dependencyObject;
         if (!ReferenceEquals(args.OldValue, args.NewValue))
         {
+            control._processFlyout.Hide();
             control._processSectionExpanded = false;
             control._lastRenderedProcessRows = null;
+            control._lastRenderedSortMode = null;
             control._lastRenderedSupportsProcessTable = null;
             control._lastRenderedGaugeMode = null;
             control._thresholdLevel = 0;
@@ -1275,10 +1369,10 @@ public sealed class TelemetryPanelCard : UserControl
             _legendHost.Children.Clear();
             _legendRows.Clear();
             _legendScroller.Visibility = Visibility.Collapsed;
-            _processRowsHost.Children.Clear();
-            _processRowParts.Clear();
-            _processSection.Visibility = Visibility.Collapsed;
-            _processSectionExpanded = false;
+            HideProcessRowSlots(0);
+            _processEmptyText.Visibility = Visibility.Collapsed;
+            _displayedProcessKeys.Clear();
+            _processFlyout.Hide();
             RefreshProcessSortButtons(null);
             RefreshVisualMode(null);
             _lastRenderedSeries = null;
@@ -1308,6 +1402,7 @@ public sealed class TelemetryPanelCard : UserControl
         _secondaryValueText.Text = panel.SecondaryValue;
         _scaleText.Text = panel.ScaleLabel;
         _chart.EmptyStateText = panel.EmptyStateText;
+        _chart.IsLoading = panel.IsHistoryLoading;
         _scalePill.Visibility = string.IsNullOrWhiteSpace(panel.ScaleLabel) ? Visibility.Collapsed : Visibility.Visible;
 
         if (!_isEffectivelyVisible)
@@ -1421,12 +1516,10 @@ public sealed class TelemetryPanelCard : UserControl
         // skips measuring them entirely — this is the biggest layout cost saver
         _chart.Visibility = resizing ? Visibility.Collapsed : Visibility.Visible;
         _legendScroller.Visibility = resizing ? Visibility.Collapsed : Visibility.Visible;
-        _processSection.Visibility = !resizing && Panel?.SupportsProcessTable == true && _processSectionExpanded
-            ? Visibility.Visible
-            : Visibility.Collapsed;
-        _processRow.Height = _processSection.Visibility == Visibility.Visible
-            ? new GridLength(1.2, GridUnitType.Star)
-            : GridLength.Auto;
+        if (resizing)
+        {
+            _processFlyout.Hide();
+        }
     }
 
     private static bool IsPriorityPanelProperty(string? propertyName)
@@ -1499,15 +1592,24 @@ public sealed class TelemetryPanelCard : UserControl
             rowParts.ValueText.Foreground = primaryBrush;
         }
 
-        foreach (var rowParts in _processRowParts.Values)
+        foreach (var slot in _processRowSlots)
         {
-            rowParts.NameText.Foreground = primaryBrush;
-            rowParts.ValueText.Foreground = primaryBrush;
-            rowParts.CaptionText.Foreground = mutedBrush;
+            slot.NameText.Foreground = primaryBrush;
+            slot.ValueText.Foreground = primaryBrush;
+            slot.CaptionText.Foreground = slot.IsPinned ? ResolveBrush("TextSecondaryBrush", "#C4C8CE") : mutedBrush;
+            if (!slot.IsHovered)
+            {
+                slot.RowBorder.Background = ProcessRowRestBrush(slot.IsPinned);
+            }
         }
+
+        _processEmptyText.Foreground = mutedBrush;
 
         if (Panel is { } panel)
         {
+            // Rebuilt, not skipped as unchanged: on a light palette the icon holds a darkened copy
+            // of the accent, which went stale when switching back to a dark one.
+            _lastBadgeAccentBrush = null;
             UpdateBadgeIcon(panel);
             ApplyPalette(panel);
             // Re-apply sort button states so active highlights use the new theme colors.
@@ -1540,8 +1642,10 @@ public sealed class TelemetryPanelCard : UserControl
 
         // A single-series panel already states its value in the header (and again in the gauge,
         // where there is one), so a one-row legend repeating it a third time is noise — and with
-        // nothing to compare against, click-to-isolate has nothing to isolate from.
-        var legendEarnsItsSpace = !panel.SupportsProcessTable && panel.VisibleSeries.Count > 1;
+        // nothing to compare against, click-to-isolate has nothing to isolate from. Pinned
+        // processes are the exception on CPU Total and Memory: their lines need names.
+        var legendEarnsItsSpace = panel.VisibleSeries.Count > 1 &&
+            (!panel.SupportsProcessTable || panel.PerProcessChartsEnabled);
         if (!legendEarnsItsSpace)
         {
             _legendRows.Clear();
@@ -1563,18 +1667,30 @@ public sealed class TelemetryPanelCard : UserControl
         // from different hardware, or a renamed adapter in loaded history), and keying by name
         // put the same row in the list twice - adding an element that already has a parent is
         // a hard COMException (0x800F1000) in WinUI.
-        var activeKeys = new HashSet<string>(panel.VisibleSeries.Select(LegendKey), StringComparer.OrdinalIgnoreCase);
+        // On CPU Total and Memory the legend names the pinned processes only: the panel's own line
+        // is the headline above it, and its row pushed the second pin out of the legend's height.
+        var legendSeries = panel.SupportsProcessTable
+            ? panel.VisibleSeries.Where(series => MetricPanelViewModel.IsProcessSeriesKey(series.Key)).ToList()
+            : panel.VisibleSeries;
+        var activeKeys = new HashSet<string>(legendSeries.Select(LegendKey), StringComparer.OrdinalIgnoreCase);
         foreach (var staleKey in _legendRows.Keys.Where(key => !activeKeys.Contains(key)).ToArray())
         {
             _legendHost.Children.Remove(_legendRows[staleKey].Row);
             _legendRows.Remove(staleKey);
         }
 
-        var orderedRows = new List<UIElement>(panel.VisibleSeries.Count);
+        var orderedRows = new List<UIElement>(legendSeries.Count);
         var seenKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // The index runs over every visible series, listed or not: the chart picks dash patterns
+        // by that position, and the legend's pattern has to match it.
         for (var index = 0; index < panel.VisibleSeries.Count; index++)
         {
             var series = panel.VisibleSeries[index];
+            if (!activeKeys.Contains(LegendKey(series)))
+            {
+                continue;
+            }
+
             var legendKey = LegendKey(series);
             if (!seenKeys.Add(legendKey))
             {
@@ -1594,12 +1710,26 @@ public sealed class TelemetryPanelCard : UserControl
                 // Click legend row to isolate/focus that series on the chart
                 var capturedKey = series.Key;
                 rowParts.Row.Tapped += (_, _) => Panel?.ToggleSeriesFocus(capturedKey);
+                rowParts.Row.Invoked += (_, _) => Panel?.ToggleSeriesFocus(capturedKey);
             }
 
             // Dim unfocused legend rows when a series is focused
             var isFocused = panel.FocusedSeriesKey is null ||
                 string.Equals(series.Key, panel.FocusedSeriesKey, StringComparison.OrdinalIgnoreCase);
             rowParts.Row.Opacity = isFocused ? 1.0 : 0.35;
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(rowParts.Row, $"{series.Name}, {value}");
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetHelpText(rowParts.Row,
+                panel.FocusedSeriesKey is not null && isFocused
+                    ? "Press Enter to show every series again"
+                    : "Press Enter to show only this series");
+
+            var patterned = SeriesDash.AppliesTo(panel.VisibleSeries.Count);
+            rowParts.Pattern.Visibility = patterned ? Visibility.Visible : Visibility.Collapsed;
+            rowParts.Dot.Visibility = patterned ? Visibility.Collapsed : Visibility.Visible;
+            if (patterned)
+            {
+                SeriesDash.Apply(rowParts.Pattern, index, panel.VisibleSeries.Count);
+            }
 
             rowParts.ValueText.Text = value;
             orderedRows.Add(rowParts.Row);
@@ -1619,131 +1749,125 @@ public sealed class TelemetryPanelCard : UserControl
     private static string LegendKey(ChartSeriesViewModel series)
         => string.IsNullOrEmpty(series.Key) ? series.Name : series.Key;
 
+    /// <summary>
+    /// Shows the process list in a fixed set of row slots that are re-bound in place. Rows used to
+    /// be created, cleared and re-added on every re-sort: the list flickered, the hovered row
+    /// jumped, and the churn of rows entering and leaving the tree is what set off the cursor
+    /// crash (see PointerCursors). Slots are only ever added, and hidden when not needed.
+    /// </summary>
     private void RefreshProcessRows(MetricPanelViewModel panel)
     {
+        panel._forceProcessRowRebuild = false;
         if (!panel.SupportsProcessTable)
         {
-            _processRowsHost.Children.Clear();
-            _processRowParts.Clear();
-
+            HideProcessRowSlots(0);
+            _processEmptyText.Visibility = Visibility.Collapsed;
+            _displayedProcessKeys.Clear();
             return;
         }
 
         _processSectionTitleText.Text = panel.ProcessTableTitle;
         if (panel.ProcessRows.Count == 0)
         {
-            _processRowParts.Clear();
-            _processRowsHost.Children.Clear();
-            _processRowsHost.Children.Add(CreateEmptyText("Process table warming up"));
-
+            HideProcessRowSlots(0);
+            _processEmptyText.Visibility = Visibility.Visible;
+            _processFooterText.Text = string.Empty;
+            _displayedProcessKeys.Clear();
             return;
         }
 
-        // One row per key. A repeated key would add the same element twice (a WinUI
-        // COMException) on the fast path, or throw a duplicate-key exception on the slow one.
+        _processEmptyText.Visibility = Visibility.Collapsed;
         var seenRowKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var rows = panel.ProcessRows.Where(row => seenRowKeys.Add(row.Key)).ToList();
+        _processFooterText.Text = panel.TotalProcessCount > rows.Count
+            ? $"Top {rows.Count} of {panel.TotalProcessCount:N0} · Click a process to pin it to the chart"
+            : "Click a process to pin it to the chart";
 
-        // Fast path: if all rows already exist as UI elements, just reorder + update in-place.
-        // Skip fast path if a pin state changed (need full rebuild for bold/dot visuals).
-        var forceRebuild = panel._forceProcessRowRebuild;
-        if (forceRebuild) panel._forceProcessRowRebuild = false; // consume the flag
-        var allExist = !forceRebuild && rows.Count <= _processRowParts.Count;
-        if (allExist)
+        // While the pointer is over the list, rows stay where they are and only their numbers
+        // change: re-sorting every refresh moved the row under the cursor as it was clicked.
+        if (_processListHovered && _displayedProcessKeys.Count > 0)
         {
-            for (var i = 0; i < rows.Count; i++)
-            {
-                if (!_processRowParts.ContainsKey(rows[i].Key))
-                {
-                    allExist = false;
-                    break;
-                }
-            }
+            rows = KeepDisplayedProcessOrder(rows);
         }
 
-        if (allExist && rows.Count > 0)
+        for (var index = 0; index < rows.Count; index++)
         {
-            var requiresReorder = _processRowsHost.Children.Count != rows.Count;
-            for (var i = 0; i < rows.Count; i++)
-            {
-                var item = rows[i];
-                var rp = _processRowParts[item.Key];
-                rp.NameText.Text = item.Name;
-                rp.ValueText.Text = item.Value;
-                rp.CaptionText.Text = item.Caption;
-                rp.Row.Tag = item.Key;
-                var intensity = Math.Clamp(item.Intensity, 0d, 1d);
-                if (rp.FillBrush.GradientStops.Count >= 3)
-                {
-                    rp.FillBrush.GradientStops[1].Offset = intensity;
-                    rp.FillBrush.GradientStops[2].Offset = Math.Min(intensity + 0.03, 1.0);
-                }
-
-                if (!requiresReorder)
-                {
-                    requiresReorder =
-                        _processRowsHost.Children[i] is not FrameworkElement current ||
-                        !string.Equals(current.Tag as string, item.Key, StringComparison.OrdinalIgnoreCase);
-                }
-            }
-
-            if (requiresReorder)
-            {
-                _processRowsHost.Children.Clear();
-                for (var i = 0; i < rows.Count; i++)
-                {
-                    _processRowsHost.Children.Add(_processRowParts[rows[i].Key].Row);
-                }
-            }
-
-            // Remove entries for rows no longer shown
-            if (_processRowParts.Count > rows.Count)
-            {
-                var activeKeys = new HashSet<string>(rows.Count, StringComparer.OrdinalIgnoreCase);
-                foreach (var r in rows) activeKeys.Add(r.Key);
-                foreach (var key in _processRowParts.Keys.Where(k => !activeKeys.Contains(k)).ToArray())
-                    _processRowParts.Remove(key);
-            }
-
-            return;
+            var slot = index < _processRowSlots.Count ? _processRowSlots[index] : AddProcessRowSlot();
+            BindProcessRow(slot, rows[index], panel.AccentBrush);
         }
 
-        // Slow path: rebuild the row list (sort change, new/removed processes)
-        _processRowsHost.Children.Clear();
-        _processRowParts.Clear();
-
-        for (var i = 0; i < rows.Count; i++)
+        HideProcessRowSlots(rows.Count);
+        _displayedProcessKeys.Clear();
+        foreach (var row in rows)
         {
-            var item = rows[i];
-            var rowParts = CreateProcessRow(item, panel.AccentBrush);
-            rowParts.Row.Tag = item.Key;
-            _processRowParts.Add(item.Key, rowParts);
-            _processRowsHost.Children.Add(rowParts.Row);
+            _displayedProcessKeys.Add(row.Key);
+        }
+    }
 
-            // Track press/release to distinguish taps from scroll drags.
-            // Use AddHandler with handledEventsToo so events fire even when
-            // the parent ScrollViewer has already marked them as Handled.
-            var processName = item.Name;
-            Windows.Foundation.Point pressPos = default;
-            rowParts.Row.AddHandler(PointerPressedEvent, new PointerEventHandler((sender, args) =>
-            {
-                pressPos = args.GetCurrentPoint((UIElement)sender).Position;
-            }), true);
-            rowParts.Row.AddHandler(PointerReleasedEvent, new PointerEventHandler((sender, args) =>
-            {
-                if (Panel is not { } p) return;
-                var releasePos = args.GetCurrentPoint((UIElement)sender).Position;
-                // Only count as a click if the pointer didn't move far (not a scroll)
-                var dx = Math.Abs(releasePos.X - pressPos.X);
-                var dy = Math.Abs(releasePos.Y - pressPos.Y);
-                if (dx < 12 && dy < 12)
-                {
-                    p.ToggleProcessPin(processName);
-                }
-                args.Handled = true;
-            }), true);
+    private List<ProcessListItemViewModel> KeepDisplayedProcessOrder(List<ProcessListItemViewModel> rows)
+    {
+        var position = new Dictionary<string, int>(_displayedProcessKeys.Count, StringComparer.OrdinalIgnoreCase);
+        for (var index = 0; index < _displayedProcessKeys.Count; index++)
+        {
+            position[_displayedProcessKeys[index]] = index;
         }
 
+        // Rows already on screen keep their places; newcomers queue after them in sorted order.
+        return rows
+            .Select((row, sortedIndex) => (row, rank: position.TryGetValue(row.Key, out var shown) ? shown : _displayedProcessKeys.Count + sortedIndex))
+            .OrderBy(entry => entry.rank)
+            .Select(entry => entry.row)
+            .ToList();
+    }
+
+    private void HideProcessRowSlots(int fromIndex)
+    {
+        for (var index = fromIndex; index < _processRowSlots.Count; index++)
+        {
+            var slot = _processRowSlots[index];
+            if (slot.Row.Visibility != Visibility.Collapsed)
+            {
+                slot.Row.Visibility = Visibility.Collapsed;
+            }
+
+            slot.Key = null;
+        }
+    }
+
+    private ProcessRowSlot AddProcessRowSlot()
+    {
+        var slot = CreateProcessRowSlot();
+        _processRowSlots.Add(slot);
+        _processRowsHost.Children.Add(slot.Row);
+
+        // Press and release are tracked to tell a tap from a scroll drag. handledEventsToo, so
+        // they still arrive after the ScrollViewer has handled the gesture. The slot is asked for
+        // its process at click time: it shows a different one after every re-sort.
+        Windows.Foundation.Point pressPosition = default;
+        slot.Row.AddHandler(PointerPressedEvent, new PointerEventHandler((sender, args) =>
+        {
+            pressPosition = args.GetCurrentPoint((UIElement)sender).Position;
+        }), true);
+        slot.Row.AddHandler(PointerReleasedEvent, new PointerEventHandler((sender, args) =>
+        {
+            var releasePosition = args.GetCurrentPoint((UIElement)sender).Position;
+            if (slot.Key is not null &&
+                Math.Abs(releasePosition.X - pressPosition.X) < 12 &&
+                Math.Abs(releasePosition.Y - pressPosition.Y) < 12)
+            {
+                Panel?.ToggleProcessPin(slot.ProcessName);
+            }
+
+            args.Handled = true;
+        }), true);
+        slot.Row.Invoked += (_, _) =>
+        {
+            if (slot.Key is not null)
+            {
+                Panel?.ToggleProcessPin(slot.ProcessName);
+            }
+        };
+        return slot;
     }
 
     private void RefreshVisualMode(MetricPanelViewModel? panel)
@@ -1752,44 +1876,54 @@ public sealed class TelemetryPanelCard : UserControl
         _gaugeHost.Visibility = showGauge ? Visibility.Visible : Visibility.Collapsed;
         Grid.SetColumn(_chartFrame, showGauge ? 1 : 0);
         Grid.SetColumnSpan(_chartFrame, showGauge ? 1 : 2);
-        _legendScroller.Visibility = panel?.SupportsProcessTable == true ? Visibility.Collapsed : Visibility.Visible;
+        // CPU Total and Memory show a legend only for pinned processes (see RefreshLegend).
+        _legendScroller.Visibility = panel is { SupportsProcessTable: true, PerProcessChartsEnabled: false }
+            ? Visibility.Collapsed
+            : Visibility.Visible;
         var supportsProcesses = panel?.SupportsProcessTable == true;
         _processToggleButton.Visibility = supportsProcesses ? Visibility.Visible : Visibility.Collapsed;
-        _processToggleButton.Text = _processSectionExpanded ? "Hide processes" : "Processes";
         _processToggleButton.IsActive = _processSectionExpanded;
-        _processToggleButton.IsFilled = _processSectionExpanded;
-        _processSection.Visibility = supportsProcesses && _processSectionExpanded
-            ? Visibility.Visible
-            : Visibility.Collapsed;
-
-        // Expanded, the list shares the card's height with the chart instead of growing the
-        // card past its grid span; collapsed, the row takes nothing.
-        _processRow.Height = _processSection.Visibility == Visibility.Visible
-            ? new GridLength(1.2, GridUnitType.Star)
-            : GridLength.Auto;
+        if (!supportsProcesses && _processSectionExpanded)
+        {
+            _processFlyout.Hide();
+        }
     }
 
     private void OnProcessSectionToggleClick(object? sender, EventArgs e)
     {
-        if (Panel?.SupportsProcessTable != true)
+        if (Panel is not { SupportsProcessTable: true } panel)
         {
             return;
         }
 
-        _processSectionExpanded = !_processSectionExpanded;
-        if (_processSectionExpanded && Panel is { } panel)
+        if (_processSectionExpanded)
         {
-            RefreshProcessRows(panel);
-            _lastRenderedProcessRows = panel.ProcessRows;
+            _processFlyout.Hide();
+            return;
         }
 
-        RefreshVisualMode(Panel);
-        if (_processSectionExpanded && Motion.AnimationsEnabled)
-        {
-            // The list arrives rather than pops in; the chart's row resizes underneath it.
-            _processSection.Opacity = 0;
-            FadeTo(_processSection, 1d, MotionTokens.Standard);
-        }
+        RefreshProcessRows(panel);
+        RefreshProcessSortButtons(panel);
+        _lastRenderedProcessRows = panel.ProcessRows;
+        _processScroller.ChangeView(null, 0, null, true);
+        _processFlyout.ShowAt(_processToggleButton);
+    }
+
+    private static Style CreateProcessFlyoutStyle()
+    {
+        // Same surface as the shell's other popovers. No ThemeShadow: it barely showed, and with
+        // the list refreshing under it the UI thread stalled for over a second in every eight.
+        // The border is the muted text colour instead of the hairline stroke, so the list's edge
+        // reads clearly against the panels it covers.
+        var style = new Style(typeof(FlyoutPresenter));
+        style.Setters.Add(new Setter(Control.BackgroundProperty, ResolveBrush("SurfaceElevatedBrush", "#222529")));
+        style.Setters.Add(new Setter(Control.BorderBrushProperty, ResolveBrush("TextMutedBrush", "#90959D")));
+        style.Setters.Add(new Setter(Control.BorderThicknessProperty, new Thickness(UiMetrics.Hairline)));
+        style.Setters.Add(new Setter(Control.CornerRadiusProperty, new CornerRadius(UiMetrics.OverlayRadius)));
+        style.Setters.Add(new Setter(Control.PaddingProperty, new Thickness(16, 14, 12, 12)));
+        style.Setters.Add(new Setter(FrameworkElement.MaxWidthProperty, 560d));
+        style.Setters.Add(new Setter(FrameworkElement.MaxHeightProperty, 560d));
+        return style;
     }
 
     private void RefreshProcessSortButtons(MetricPanelViewModel? panel)
@@ -1798,14 +1932,18 @@ public sealed class TelemetryPanelCard : UserControl
         ApplyRangeState(_sortLowestButton, panel?.ProcessSortMode == ProcessSortMode.Lowest);
         var isNameSort = panel?.ProcessSortMode is ProcessSortMode.Name or ProcessSortMode.NameReverse;
         ApplyRangeState(_sortNameButton, isNameSort);
-        _sortNameButton.Text = panel?.ProcessSortMode == ProcessSortMode.NameReverse ? "Name \u2191" : "Name \u2193";
+        // The direction arrow only while the list is sorted by name; under Highest it suggested
+        // a name order that wasn't in effect. MinWidth keeps the chip from changing size.
+        _sortNameButton.MinWidth = 72;
+        _sortNameButton.Text = !isNameSort ? "Name"
+            : panel?.ProcessSortMode == ProcessSortMode.NameReverse ? "Name \u2191" : "Name \u2193";
     }
 
     private static void ApplyRangeState(ActionChip control, bool isActive)
     {
+        // The chip's own active/inactive styling carries the state; an extra opacity dip made
+        // the inactive options look disabled.
         control.IsActive = isActive;
-        control.IsFilled = isActive;
-        control.Opacity = isActive ? 1 : 0.76;
     }
 
     private void ApplyPalette(MetricPanelViewModel panel)
@@ -1913,7 +2051,7 @@ public sealed class TelemetryPanelCard : UserControl
         var button = new ActionChip
         {
             Tag = sortMode,
-            MinHeight = 28,
+            MinHeight = UiMetrics.MinHitTarget,
             MinWidth = 58,
             Text = text,
         };
@@ -1968,7 +2106,7 @@ public sealed class TelemetryPanelCard : UserControl
         Panel?.ResetZoom();
     }
 
-    private static (ClickableBorder Row, Border InnerBorder, TextBlock NameText, TextBlock ValueText, Ellipse Dot) CreateLegendRow(string name, Brush strokeBrush)
+    private static (ClickableBorder Row, Border InnerBorder, TextBlock NameText, TextBlock ValueText, Ellipse Dot, Line Pattern) CreateLegendRow(string name, Brush strokeBrush)
     {
         var row = new Grid();
         row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
@@ -1983,6 +2121,24 @@ public sealed class TelemetryPanelCard : UserControl
             Fill = strokeBrush,
         };
         row.Children.Add(dot);
+
+        // Shown instead of the dot while the chart draws series with dash patterns, so the
+        // legend shows which line is which without relying on colour.
+        var pattern = new Line
+        {
+            X1 = 1,
+            Y1 = 0,
+            X2 = 15,
+            Y2 = 0,
+            Stroke = strokeBrush,
+            StrokeThickness = 2,
+            StrokeStartLineCap = PenLineCap.Round,
+            StrokeEndLineCap = PenLineCap.Round,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(0, 2, 8, 0),
+            Visibility = Visibility.Collapsed,
+        };
+        row.Children.Add(pattern);
 
         var nameText = new TextBlock
         {
@@ -2032,58 +2188,97 @@ public sealed class TelemetryPanelCard : UserControl
             border.Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
         };
 
-        var wrapper = new ClickableBorder(border);
-        return (wrapper, border, nameText, valueText, dot);
+        var wrapper = new ClickableBorder(border, invokable: true);
+        return (wrapper, border, nameText, valueText, dot, pattern);
     }
 
-    private static (ClickableBorder Row, TextBlock NameText, TextBlock ValueText, TextBlock CaptionText, LinearGradientBrush FillBrush, Border RowBorder, Ellipse? ChartDot) CreateProcessRow(ProcessListItemViewModel item, Brush accentBrush)
+    /// <summary>
+    /// Columns shared by the process header and every row, so the labels sit exactly over their
+    /// values: name, details, meter, value.
+    /// </summary>
+    private static void AddProcessColumns(Grid grid)
     {
-        // Small color dot showing the process chart line color (if charted)
-        Ellipse? chartDot = null;
-        var nameContent = (FrameworkElement)new TextBlock
+        grid.ColumnSpacing = 10;
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star), MinWidth = 90 });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(0.8, GridUnitType.Star) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(ProcessMeterWidth) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto, MinWidth = 52 });
+    }
+
+    private const double ProcessMeterWidth = 48;
+    private static readonly Thickness s_processRowPadding = new(10, 6, 10, 6);
+
+    /// <summary>One reusable row of the process list. What it shows changes on every re-sort.</summary>
+    private sealed class ProcessRowSlot
+    {
+        public required ClickableBorder Row { get; init; }
+        public required Border RowBorder { get; init; }
+        public required TextBlock NameText { get; init; }
+        public required TextBlock CaptionText { get; init; }
+        public required TextBlock ValueText { get; init; }
+        public required Border MeterFill { get; init; }
+        public required ScaleTransform Meter { get; init; }
+        public required Ellipse ChartDot { get; init; }
+        public required ToolTip Tip { get; init; }
+        public string? Key { get; set; }
+        public string ProcessName { get; set; } = string.Empty;
+        public bool IsPinned { get; set; }
+        public bool IsHovered { get; set; }
+    }
+
+    private static ProcessRowSlot CreateProcessRowSlot()
+    {
+        var nameText = new TextBlock
         {
             FontFamily = new FontFamily("Segoe UI Variable Text"),
             FontSize = 12,
             Foreground = ResolveBrush("TextPrimaryBrush", "#F2F8FF"),
-            Text = item.Name,
             TextTrimming = TextTrimming.CharacterEllipsis,
             VerticalAlignment = VerticalAlignment.Center,
         };
-        var nameText = (TextBlock)nameContent;
 
-        // Bold name + color dot when pinned
-        if (item.IsPinned)
+        // A pinned process is drawn on the chart; its dot is the line's colour, so the row reads as
+        // that line's legend entry.
+        var chartDot = new Ellipse
         {
-            nameText.FontWeight = FontWeights.SemiBold;
-        }
-
-        if (item.ChartColor is not null)
-        {
-            chartDot = new Ellipse
-            {
-                Width = 7,
-                Height = 7,
-                Fill = item.ChartColor,
-                VerticalAlignment = VerticalAlignment.Center,
-                Margin = new Thickness(0, 0, 6, 0),
-            };
-            var nameStack = new StackPanel
-            {
-                Orientation = Orientation.Horizontal,
-                Children = { chartDot, nameText },
-            };
-            nameContent = nameStack;
-        }
+            Width = 8,
+            Height = 8,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(0, 0, 8, 0),
+            Visibility = Visibility.Collapsed,
+        };
+        var nameGrid = new Grid();
+        nameGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        nameGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        nameGrid.Children.Add(chartDot);
+        nameGrid.Children.Add(nameText);
+        Grid.SetColumn(nameText, 1);
 
         var captionText = new TextBlock
         {
             FontFamily = new FontFamily("Segoe UI Variable Text"),
             FontSize = 11,
-            Foreground = ResolveBrush("TextMutedBrush", "#7D9AB6"),
-            Text = item.Caption,
+            Foreground = ResolveBrush("TextMutedBrush", "#90959D"),
             TextTrimming = TextTrimming.CharacterEllipsis,
             VerticalAlignment = VerticalAlignment.Center,
-            Margin = new Thickness(8, 0, 0, 0),
+        };
+
+        // Meter: a track with a fill scaled by intensity. ScaleX is a render transform, so a
+        // value update every scrape never re-runs layout for the row.
+        var meter = new ScaleTransform { ScaleX = 0d, ScaleY = 1 };
+        var meterFill = new Border
+        {
+            CornerRadius = new CornerRadius(2),
+            RenderTransform = meter,
+            RenderTransformOrigin = new Windows.Foundation.Point(0, 0.5),
+        };
+        var meterTrack = new Border
+        {
+            Height = 4,
+            CornerRadius = new CornerRadius(2),
+            Background = ResolveBrush("SurfaceStrongBrush", "#292D31"),
+            VerticalAlignment = VerticalAlignment.Center,
+            Child = meterFill,
         };
 
         var valueText = new TextBlock
@@ -2092,88 +2287,130 @@ public sealed class TelemetryPanelCard : UserControl
             FontSize = 12,
             FontWeight = FontWeights.SemiBold,
             Foreground = ResolveBrush("TextPrimaryBrush", "#F2F8FF"),
-            Text = item.Value,
             HorizontalAlignment = HorizontalAlignment.Right,
             VerticalAlignment = VerticalAlignment.Center,
-            MinWidth = 46,
             TextAlignment = TextAlignment.Right,
         };
         UseTabularFigures(valueText);
 
-        // Table row: Name | Caption | Value
-        var rowGrid = new Grid
-        {
-            ColumnSpacing = 6,
-        };
-        rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star), MinWidth = 90 });
-        rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(0.7, GridUnitType.Star) });
-        rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-
-        rowGrid.Children.Add(nameContent);
+        var rowGrid = new Grid();
+        AddProcessColumns(rowGrid);
+        rowGrid.Children.Add(nameGrid);
         rowGrid.Children.Add(captionText);
         Grid.SetColumn(captionText, 1);
+        rowGrid.Children.Add(meterTrack);
+        Grid.SetColumn(meterTrack, 2);
         rowGrid.Children.Add(valueText);
-        Grid.SetColumn(valueText, 2);
-
-        // Background gradient fill — row itself acts as the meter (Grafana-style)
-        var intensity = Math.Clamp(item.Intensity, 0d, 1d);
-        var accentColor = accentBrush is SolidColorBrush scb ? scb.Color : BrushFactory.ParseColor("#66E7FF");
-        var baseAlpha = item.IsPinned ? (byte)70 : (byte)55;
-        var edgeAlpha = item.IsPinned ? (byte)50 : (byte)35;
-
-        var fillBrush = new LinearGradientBrush
-        {
-            StartPoint = new Windows.Foundation.Point(0, 0),
-            EndPoint = new Windows.Foundation.Point(1, 0),
-            GradientStops =
-            {
-                new GradientStop { Color = Color.FromArgb(baseAlpha, accentColor.R, accentColor.G, accentColor.B), Offset = 0 },
-                new GradientStop { Color = Color.FromArgb(edgeAlpha, accentColor.R, accentColor.G, accentColor.B), Offset = intensity },
-                new GradientStop { Color = Color.FromArgb(0, accentColor.R, accentColor.G, accentColor.B), Offset = Math.Min(intensity + 0.03, 1.0) },
-            },
-        };
+        Grid.SetColumn(valueText, 3);
 
         var rowBorder = new Border
         {
-            Padding = new Thickness(8, 5, 8, 5),
-            BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E"),
-            BorderThickness = new Thickness(0, 0, 0, 0.4),
-            Background = fillBrush,
-            // Transparent background on the grid ensures the entire row is hit-testable
-            Child = new Grid { Background = BrushFactory.CreateBrush("#01000000"), Children = { rowGrid } },
+            Padding = s_processRowPadding,
+            CornerRadius = new CornerRadius(6),
+            Background = BrushFactory.CreateBrush("#01000000"),
+            Child = rowGrid,
         };
 
-        // Hover feedback — accent border + subtle background brighten
+        // One tooltip per slot, its text updated in place, so an open tooltip is never orphaned.
+        var tip = new ToolTip();
+        ToolTipService.SetToolTip(rowBorder, tip);
+
+        // Invokable: the row is a Tab stop and Enter or Space pins it like a click.
+        var slot = new ProcessRowSlot
+        {
+            Row = new ClickableBorder(rowBorder, invokable: true),
+            RowBorder = rowBorder,
+            NameText = nameText,
+            CaptionText = captionText,
+            ValueText = valueText,
+            MeterFill = meterFill,
+            Meter = meter,
+            ChartDot = chartDot,
+            Tip = tip,
+        };
+
+        // Rest: transparent (pinned: a soft accent wash). Hover: a raised fill. Background only,
+        // so hover never re-runs layout.
         rowBorder.PointerEntered += (_, _) =>
         {
-            // Brush only. Thickening the hairline (0.4 -> 1.2) re-ran layout for the row and
-            // shunted its text by most of a pixel on every pointer move across the list.
-            rowBorder.BorderBrush = ResolveBrush("AccentBrush", "#66E7FF");
-            // Boost fill opacity on hover for clear visual feedback
-            if (fillBrush.GradientStops.Count >= 3)
-            {
-                var c0 = fillBrush.GradientStops[0].Color;
-                var c1 = fillBrush.GradientStops[1].Color;
-                fillBrush.GradientStops[0].Color = Color.FromArgb(Math.Min((byte)120, (byte)(c0.A + 40)), c0.R, c0.G, c0.B);
-                fillBrush.GradientStops[1].Color = Color.FromArgb(Math.Min((byte)100, (byte)(c1.A + 40)), c1.R, c1.G, c1.B);
-            }
+            slot.IsHovered = true;
+            rowBorder.Background = ResolveBrush("SurfaceElevatedBrush", "#222529");
         };
         rowBorder.PointerExited += (_, _) =>
         {
-            rowBorder.BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#2C3035");
-            // Restore original fill opacity
-            if (fillBrush.GradientStops.Count >= 3)
-            {
-                var c0 = fillBrush.GradientStops[0].Color;
-                var c1 = fillBrush.GradientStops[1].Color;
-                fillBrush.GradientStops[0].Color = Color.FromArgb(baseAlpha, c0.R, c0.G, c0.B);
-                fillBrush.GradientStops[1].Color = Color.FromArgb(edgeAlpha, c1.R, c1.G, c1.B);
-            }
+            slot.IsHovered = false;
+            rowBorder.Background = ProcessRowRestBrush(slot.IsPinned);
         };
+        return slot;
+    }
 
-        // Wrap in ClickableBorder for hand cursor + click handlers in slow path
-        var clickableRow = new ClickableBorder(rowBorder);
-        return (clickableRow, nameText, valueText, captionText, fillBrush, rowBorder, chartDot);
+    private static Brush ProcessRowRestBrush(bool pinned) =>
+        pinned ? ResolveBrush("AccentSoftBrush", "#294A6B") : BrushFactory.CreateBrush("#01000000");
+
+    private static void BindProcessRow(ProcessRowSlot slot, ProcessListItemViewModel item, Brush accentBrush)
+    {
+        var pinStateChanged = slot.Key is null || slot.IsPinned != item.IsPinned;
+        slot.Key = item.Key;
+        slot.ProcessName = item.Name;
+        slot.IsPinned = item.IsPinned;
+        slot.Row.Tag = item.Key;
+        SetTextIfChanged(slot.NameText, item.Name);
+        SetTextIfChanged(slot.CaptionText, item.Caption);
+        SetTextIfChanged(slot.ValueText, item.Value);
+        slot.Meter.ScaleX = Math.Clamp(item.Intensity, 0d, 1d);
+        if (!ReferenceEquals(slot.MeterFill.Background, accentBrush))
+        {
+            slot.MeterFill.Background = accentBrush;
+        }
+
+        if (pinStateChanged)
+        {
+            slot.NameText.FontWeight = item.IsPinned ? FontWeights.SemiBold : FontWeights.Normal;
+            // Muted text on the pinned row's accent tint fell under 4.5:1 in most themes.
+            slot.CaptionText.Foreground = ResolveBrush(item.IsPinned ? "TextSecondaryBrush" : "TextMutedBrush", "#90959D");
+            if (!slot.IsHovered)
+            {
+                slot.RowBorder.Background = ProcessRowRestBrush(item.IsPinned);
+            }
+
+            slot.Tip.Content = item.IsPinned
+                ? $"{item.Name} is pinned to the chart. Click to unpin."
+                : $"Click to pin {item.Name} to the chart";
+        }
+        else if (slot.Tip.Content is not string tipText || !tipText.Contains(item.Name, StringComparison.Ordinal))
+        {
+            slot.Tip.Content = item.IsPinned
+                ? $"{item.Name} is pinned to the chart. Click to unpin."
+                : $"Click to pin {item.Name} to the chart";
+        }
+
+        if (item.ChartColor is { } chartColor)
+        {
+            slot.ChartDot.Fill = chartColor;
+            slot.ChartDot.Visibility = Visibility.Visible;
+        }
+        else if (slot.ChartDot.Visibility != Visibility.Collapsed)
+        {
+            slot.ChartDot.Visibility = Visibility.Collapsed;
+        }
+
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(slot.Row, $"{item.Name}, {item.Value}{(item.IsPinned ? ", pinned" : string.Empty)}");
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetHelpText(slot.Row, item.IsPinned
+            ? "Press Enter to remove it from the chart"
+            : "Press Enter to pin it to the chart");
+        if (slot.Row.Visibility != Visibility.Visible)
+        {
+            slot.Row.Visibility = Visibility.Visible;
+        }
+    }
+
+    /// <summary>Skips equal strings: a new string instance re-measures the TextBlock even when it reads the same.</summary>
+    private static void SetTextIfChanged(TextBlock textBlock, string text)
+    {
+        if (!string.Equals(textBlock.Text, text, StringComparison.Ordinal))
+        {
+            textBlock.Text = text;
+        }
     }
 
     private void UpdateBadgeIcon(MetricPanelViewModel? panel)
@@ -2234,7 +2471,7 @@ public sealed class TelemetryPanelCard : UserControl
     private static string FormatValue(double value, MetricUnit unit) => unit switch
     {
         MetricUnit.Percent => $"{value:0.#}%",
-        MetricUnit.Celsius => $"{value:0.#} C",
+        MetricUnit.Celsius => $"{value:0.#} °C",
         MetricUnit.Gigabytes when value >= 1024d => $"{value / 1024d:0.0} TiB",
         MetricUnit.Gigabytes => $"{value:0.0} GiB",
         MetricUnit.MegabytesPerSecond => $"{value:0.0} MB/s",
@@ -2260,4 +2497,14 @@ public sealed class LayoutGestureEventArgs(TelemetryPanelCard.ResizeEdge edge, W
 public sealed class LayoutGestureEndedEventArgs(bool cancelled) : EventArgs
 {
     public bool Cancelled { get; } = cancelled;
+}
+
+/// <summary>One-cell keyboard move (or resize of the right/bottom edge) in grid units.</summary>
+public sealed class LayoutNudgeEventArgs(int columns, int rows, bool resize) : EventArgs
+{
+    public int Columns { get; } = columns;
+
+    public int Rows { get; } = rows;
+
+    public bool Resize { get; } = resize;
 }

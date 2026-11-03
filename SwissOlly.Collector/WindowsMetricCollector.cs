@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -11,9 +12,10 @@ namespace SwissOlly.Collector;
 public sealed class WindowsMetricCollector : IMetricCollector
 {
     private const double BytesPerMegabyte = 1024d * 1024d;
+    private const double BytesPerGigabyte = 1024d * 1024d * 1024d;
     private const double BitsPerMegabit = 1_000_000d;
+    private const int InitialProcessBufferBytes = 1 << 20;
     private static readonly TimeSpan DriveUsageRefreshInterval = TimeSpan.FromSeconds(15);
-    private static readonly TimeSpan HostActivityRefreshInterval = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan ProcessActivityRefreshInterval = TimeSpan.FromSeconds(8);
     private static readonly TimeSpan TemperatureRefreshInterval = TimeSpan.FromSeconds(20);
 
@@ -21,6 +23,7 @@ public sealed class WindowsMetricCollector : IMetricCollector
     private readonly nint _cpuTotalCounter;
     private readonly nint _cpuPerCoreCounter;
     private readonly nint _cpuFrequencyCounter;
+    private readonly nint _cpuPerformanceCounter;
     private readonly nint _diskReadCounter;
     private readonly nint _diskWriteCounter;
     private readonly nint _networkReceiveCounter;
@@ -28,6 +31,7 @@ public sealed class WindowsMetricCollector : IMetricCollector
     private readonly nint _gpuEngineCounter;
     private readonly nint _gpuMemoryCounter;
     private readonly bool _hasAnyPdhCounters;
+    private readonly int _logicalProcessorCount;
     private readonly Dictionary<string, NetworkBaseline> _networkBaselines = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<int, ProcessCpuBaseline> _processCpuBaselines = [];
     private readonly List<CachedMetricValue> _cachedDriveUsageValues = [];
@@ -40,32 +44,48 @@ public sealed class WindowsMetricCollector : IMetricCollector
     // dictionary up to 7x every scrape. Keyed by counter handle since some callers (disk,
     // network) need two of these arrays alive at once, so a single shared scratch dict isn't safe.
     private readonly Dictionary<nint, Dictionary<string, double>> _arrayValueScratch = [];
-    private readonly List<(int Index, double Value)> _coreListScratch = [];
+    private readonly List<(int Group, int Number, double Value)> _coreListScratch = [];
+    private readonly Dictionary<string, double> _gpuEngineScratch = new(StringComparer.OrdinalIgnoreCase);
     private LiveBoardDetails? _cachedLiveBoardDetails;
     private readonly TemperatureSensorReader _temperatureReader = new();
     private nint _pdhArrayBuffer;
     private uint _pdhArrayBufferSize;
+    private nint _processBuffer;
+    private int _processBufferSize;
 
     private ulong _previousIdleTime;
     private ulong _previousKernelTime;
     private ulong _previousUserTime;
     private bool _cpuFallbackInitialized;
-    private DateTimeOffset _lastDriveUsageRefreshUtc = DateTimeOffset.MinValue;
-    private DateTimeOffset _lastHostActivityRefreshUtc = DateTimeOffset.MinValue;
-    private DateTimeOffset _lastProcessActivityRefreshUtc = DateTimeOffset.MinValue;
-    private DateTimeOffset _lastTemperatureRefreshUtc = DateTimeOffset.MinValue;
+    // Refresh intervals and rates run on the monotonic clock. Wall-clock deltas went negative when
+    // the system clock was set back, which froze drive and temperature readings until it caught up
+    // and turned the next network rate into a spike.
+    private long _lastDriveUsageRefreshTicks;
+    private long _lastProcessActivityRefreshTicks;
+    private long _lastTemperatureRefreshTicks;
     private int _processBaselineSamplesCollected;
-    private int _cachedProcessCount;
-    private long _cachedThreadCount;
-    private long _cachedHandleCount;
+    private double _nominalClockMhz;
 
     public WindowsMetricCollector()
     {
         ThrowIfFailed(PdhNative.PdhOpenQuery(null, nint.Zero, out _query), "Failed to open the PDH query.");
 
-        _cpuTotalCounter = TryAddCounter(@"\Processor(_Total)\% Processor Time");
-        _cpuPerCoreCounter = TryAddCounter(@"\Processor(*)\% Processor Time");
+        // Task Manager reports % Processor Utility, which accounts for boost and power states;
+        // % Processor Time reads several points apart from it. Fall back where Utility is missing.
+        _cpuTotalCounter = TryAddCounter(@"\Processor Information(_Total)\% Processor Utility");
+        if (_cpuTotalCounter == nint.Zero)
+        {
+            _cpuTotalCounter = TryAddCounter(@"\Processor(_Total)\% Processor Time");
+        }
+
+        _cpuPerCoreCounter = TryAddCounter(@"\Processor Information(*)\% Processor Utility");
+        if (_cpuPerCoreCounter == nint.Zero)
+        {
+            _cpuPerCoreCounter = TryAddCounter(@"\Processor(*)\% Processor Time");
+        }
+
         _cpuFrequencyCounter = TryAddCounter(@"\Processor Information(_Total)\Processor Frequency");
+        _cpuPerformanceCounter = TryAddCounter(@"\Processor Information(_Total)\% Processor Performance");
         _diskReadCounter = TryAddCounter(@"\LogicalDisk(*)\Disk Read Bytes/sec");
         _diskWriteCounter = TryAddCounter(@"\LogicalDisk(*)\Disk Write Bytes/sec");
         _networkReceiveCounter = TryAddCounter(@"\Network Interface(*)\Bytes Received/sec");
@@ -89,6 +109,9 @@ public sealed class WindowsMetricCollector : IMetricCollector
             _ = PdhNative.PdhCollectQueryData(_query);
         }
 
+        // Every logical processor in every group, not this process's affinity or job limit.
+        var activeProcessors = (int)ProcessNative.GetActiveProcessorCount(ProcessNative.AllProcessorGroups);
+        _logicalProcessorCount = activeProcessors > 0 ? activeProcessors : Environment.ProcessorCount;
     }
 
     public Task<MetricSnapshot> CollectAsync(CancellationToken cancellationToken)
@@ -96,6 +119,7 @@ public sealed class WindowsMetricCollector : IMetricCollector
         cancellationToken.ThrowIfCancellationRequested();
 
         var timestamp = DateTimeOffset.UtcNow;
+        var nowTicks = Stopwatch.GetTimestamp();
         var samples = new List<MetricSample>(64);
         var pdhAvailable = TryCollectPdhData();
 
@@ -110,19 +134,19 @@ public sealed class WindowsMetricCollector : IMetricCollector
         }
 
         AddMemory(samples, timestamp);
-        var liveDetails = AddHostActivity(samples, timestamp);
-        AddDriveUsage(samples, timestamp);
-        AddTemperatures(samples, timestamp);
+        var liveDetails = AddHostActivity(samples, timestamp, nowTicks);
+        AddDriveUsage(samples, timestamp, nowTicks);
+        AddTemperatures(samples, timestamp, nowTicks);
 
         if (pdhAvailable)
         {
             AddDisk(samples, timestamp);
-            AddNetwork(samples, timestamp);
+            AddNetwork(samples, timestamp, nowTicks);
             AddGpu(samples, timestamp);
         }
         else
         {
-            AddNetworkFallback(samples, timestamp);
+            AddNetworkFallback(samples, timestamp, nowTicks);
         }
 
         return Task.FromResult(new MetricSnapshot(timestamp, samples, liveDetails));
@@ -142,6 +166,13 @@ public sealed class WindowsMetricCollector : IMetricCollector
             Marshal.FreeHGlobal(_pdhArrayBuffer);
             _pdhArrayBuffer = nint.Zero;
             _pdhArrayBufferSize = 0;
+        }
+
+        if (_processBuffer != nint.Zero)
+        {
+            Marshal.FreeHGlobal(_processBuffer);
+            _processBuffer = nint.Zero;
+            _processBufferSize = 0;
         }
 
         return ValueTask.CompletedTask;
@@ -171,14 +202,16 @@ public sealed class WindowsMetricCollector : IMetricCollector
         _coreListScratch.Clear();
         foreach (var (key, val) in coreValues)
         {
-            if (int.TryParse(key, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var coreIndex))
+            if (CounterMath.TryParseProcessorInstance(key, out var group, out var number))
             {
-                _coreListScratch.Add((coreIndex, val));
+                _coreListScratch.Add((group, number, val));
             }
         }
-        _coreListScratch.Sort((a, b) => a.Index.CompareTo(b.Index));
+        // Processor Information names cores "group,number"; numbering them in that order gives the
+        // same sequence as Task Manager's logical processor graphs, across processor groups too.
+        _coreListScratch.Sort((a, b) => a.Group != b.Group ? a.Group.CompareTo(b.Group) : a.Number.CompareTo(b.Number));
 
-        foreach (var (coreIdx, value) in _coreListScratch)
+        for (var coreIdx = 0; coreIdx < _coreListScratch.Count; coreIdx++)
         {
             samples.Add(new MetricSample(
                 "cpu-cores",
@@ -187,7 +220,7 @@ public sealed class WindowsMetricCollector : IMetricCollector
                 $"Core {coreIdx}",
                 MetricCategory.Cpu,
                 MetricUnit.Percent,
-                Math.Clamp(value, 0d, 100d),
+                Math.Clamp(_coreListScratch[coreIdx].Value, 0d, 100d),
                 timestamp));
         }
     }
@@ -243,6 +276,8 @@ public sealed class WindowsMetricCollector : IMetricCollector
             return;
         }
 
+        // Also the yardstick for per-process CPU, which is measured in cycles.
+        _nominalClockMhz = value.Value;
         samples.Add(new MetricSample(
             "cpu-frequency",
             "CPU Clock",
@@ -250,7 +285,7 @@ public sealed class WindowsMetricCollector : IMetricCollector
             "Clock",
             MetricCategory.Cpu,
             MetricUnit.Megahertz,
-            value.Value,
+            CounterMath.EffectiveClockMhz(value.Value, TryGetSingleValue(_cpuPerformanceCounter)),
             timestamp));
     }
 
@@ -262,8 +297,11 @@ public sealed class WindowsMetricCollector : IMetricCollector
             return;
         }
 
-        var totalGb = memoryStatus.TotalPhys / 1024d / 1024d / 1024d;
-        var availableGb = memoryStatus.AvailPhys / 1024d / 1024d / 1024d;
+        // Used is total minus available (standby and free count as available), which is the
+        // figure behind Task Manager's memory percentage. Its "In use" also leaves out the
+        // modified list, usually a few hundred MB.
+        var totalGb = memoryStatus.TotalPhys / BytesPerGigabyte;
+        var availableGb = memoryStatus.AvailPhys / BytesPerGigabyte;
         var usedGb = Math.Max(0d, totalGb - availableGb);
 
         samples.Add(new MetricSample(
@@ -335,9 +373,9 @@ public sealed class WindowsMetricCollector : IMetricCollector
         }
     }
 
-    private void AddDriveUsage(List<MetricSample> samples, DateTimeOffset timestamp)
+    private void AddDriveUsage(List<MetricSample> samples, DateTimeOffset timestamp, long nowTicks)
     {
-        var shouldRefresh = _cachedDriveUsageValues.Count == 0 || timestamp - _lastDriveUsageRefreshUtc >= DriveUsageRefreshInterval;
+        var shouldRefresh = _cachedDriveUsageValues.Count == 0 || Stopwatch.GetElapsedTime(_lastDriveUsageRefreshTicks, nowTicks) >= DriveUsageRefreshInterval;
         if (shouldRefresh)
         {
             _cachedDriveUsageValues.Clear();
@@ -356,8 +394,8 @@ public sealed class WindowsMetricCollector : IMetricCollector
                         continue;
                     }
 
-                    var totalGb = totalBytes / 1024d / 1024d / 1024d;
-                    var usedGb = Math.Max(0d, totalGb - (drive.AvailableFreeSpace / 1024d / 1024d / 1024d));
+                    var totalGb = totalBytes / BytesPerGigabyte;
+                    var usedGb = Math.Max(0d, totalGb - (drive.AvailableFreeSpace / BytesPerGigabyte));
                     var usedPercent = Math.Clamp((1d - (drive.AvailableFreeSpace / (double)totalBytes)) * 100d, 0d, 100d);
                     var driveLabel = drive.Name.TrimEnd('\\');
                     var panelKey = $"volume-{Sanitize(driveLabel)}";
@@ -398,7 +436,7 @@ public sealed class WindowsMetricCollector : IMetricCollector
                 }
             }
 
-            _lastDriveUsageRefreshUtc = timestamp;
+            _lastDriveUsageRefreshTicks = nowTicks;
         }
 
         foreach (var cachedValue in _cachedDriveUsageValues)
@@ -415,36 +453,21 @@ public sealed class WindowsMetricCollector : IMetricCollector
         }
     }
 
-    private LiveBoardDetails? AddHostActivity(List<MetricSample> samples, DateTimeOffset timestamp)
+    private LiveBoardDetails? AddHostActivity(List<MetricSample> samples, DateTimeOffset timestamp, long nowTicks)
     {
-        var shouldRefresh = _cachedHostActivityValues.Count == 0 || timestamp - _lastHostActivityRefreshUtc >= HostActivityRefreshInterval;
-        // First two process scans happen quickly (6s apart) to establish CPU baselines, then every 60s
+        // The first two process scans happen quickly (6s apart) to establish CPU baselines.
         var processInterval = _processBaselineSamplesCollected < 2
             ? TimeSpan.FromSeconds(6)
             : ProcessActivityRefreshInterval;
-        var shouldRefreshProcesses = _cachedProcessActivity.Count == 0 || timestamp - _lastProcessActivityRefreshUtc >= processInterval;
-        if (shouldRefresh || shouldRefreshProcesses)
+        var shouldRefresh = _cachedHostActivityValues.Count == 0 || Stopwatch.GetElapsedTime(_lastProcessActivityRefreshTicks, nowTicks) >= processInterval;
+        if (shouldRefresh)
         {
-            _cachedHostActivityValues.Clear();
-            if (shouldRefreshProcesses)
-            {
-                _cachedProcessActivity.Clear();
-            }
-
+            _cachedProcessActivity.Clear();
+            _activeProcessIds.Clear();
             var processCount = 0;
             var threadCount = 0L;
-            var handleCount = _cachedHandleCount;
-            _activeProcessIds.Clear();
-            EnumerateProcesses(
-                timestamp,
-                shouldRefreshProcesses,
-                shouldRefresh || _cachedHandleCount == 0,
-                _activeProcessIds,
-                ref processCount,
-                ref threadCount,
-                ref handleCount);
-
-            if (shouldRefreshProcesses)
+            var handleCount = 0L;
+            if (EnumerateProcesses(nowTicks, _activeProcessIds, ref processCount, ref threadCount, ref handleCount))
             {
                 _staleProcessIds.Clear();
                 foreach (var pid in _processCpuBaselines.Keys)
@@ -459,45 +482,43 @@ public sealed class WindowsMetricCollector : IMetricCollector
                     _processCpuBaselines.Remove(pid);
                 }
 
-                _lastProcessActivityRefreshUtc = timestamp;
                 _processBaselineSamplesCollected++;
                 _cachedLiveBoardDetails = _cachedProcessActivity.Count == 0
                     ? null
                     : new LiveBoardDetails(_cachedProcessActivity.ToArray());
+
+                // Counted the way \System\Processes, \System\Threads and Task Manager do: every
+                // process including System Idle, and every thread including the idle threads.
+                _cachedHostActivityValues.Clear();
+                _cachedHostActivityValues.Add(new CachedMetricValue(
+                    "host-activity",
+                    "Host Activity",
+                    "processes",
+                    "Processes",
+                    MetricCategory.System,
+                    MetricUnit.Count,
+                    processCount));
+
+                _cachedHostActivityValues.Add(new CachedMetricValue(
+                    "host-activity",
+                    "Host Activity",
+                    "threads",
+                    "Threads",
+                    MetricCategory.System,
+                    MetricUnit.Count,
+                    threadCount));
+
+                _cachedHostActivityValues.Add(new CachedMetricValue(
+                    "host-activity",
+                    "Host Activity",
+                    "handles",
+                    "Handles",
+                    MetricCategory.System,
+                    MetricUnit.Count,
+                    handleCount));
             }
 
-            _cachedProcessCount = processCount;
-            _cachedThreadCount = threadCount;
-            _cachedHandleCount = handleCount;
-
-            _cachedHostActivityValues.Add(new CachedMetricValue(
-                "host-activity",
-                "Host Activity",
-                "processes",
-                "Processes",
-                MetricCategory.System,
-                MetricUnit.Count,
-                _cachedProcessCount));
-
-            _cachedHostActivityValues.Add(new CachedMetricValue(
-                "host-activity",
-                "Host Activity",
-                "threads",
-                "Threads",
-                MetricCategory.System,
-                MetricUnit.Count,
-                _cachedThreadCount));
-
-            _cachedHostActivityValues.Add(new CachedMetricValue(
-                "host-activity",
-                "Host Activity",
-                "handles",
-                "Handles",
-                MetricCategory.System,
-                MetricUnit.Count,
-                _cachedHandleCount));
-
-            _lastHostActivityRefreshUtc = timestamp;
+            _lastProcessActivityRefreshTicks = nowTicks;
         }
 
         foreach (var cachedValue in _cachedHostActivityValues)
@@ -516,13 +537,13 @@ public sealed class WindowsMetricCollector : IMetricCollector
         return _cachedLiveBoardDetails;
     }
 
-    private void AddNetwork(List<MetricSample> samples, DateTimeOffset timestamp)
+    private void AddNetwork(List<MetricSample> samples, DateTimeOffset timestamp, long nowTicks)
     {
         var receives = TryGetArrayValues(_networkReceiveCounter);
         var sends = TryGetArrayValues(_networkSendCounter);
         if (receives.Count == 0 && sends.Count == 0)
         {
-            AddNetworkFallback(samples, timestamp);
+            AddNetworkFallback(samples, timestamp, nowTicks);
             return;
         }
 
@@ -563,34 +584,17 @@ public sealed class WindowsMetricCollector : IMetricCollector
 
     private void AddGpu(List<MetricSample> samples, DateTimeOffset timestamp)
     {
-        var usageValues = TryGetArrayValues(_gpuEngineCounter);
-        var maxEngineUsage = -1d;
-        foreach (var (key, val) in usageValues)
-        {
-            if (string.IsNullOrWhiteSpace(key) ||
-                key.Equals("_Total", StringComparison.OrdinalIgnoreCase) ||
-                key.Contains("engtype_copy", StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
-
-            var clamped = Math.Max(0d, val);
-            if (clamped > maxEngineUsage)
-            {
-                maxEngineUsage = clamped;
-            }
-        }
-
-        if (maxEngineUsage >= 0d)
+        var busiestEngine = CounterMath.BusiestGpuEnginePercent(TryGetArrayValues(_gpuEngineCounter), _gpuEngineScratch);
+        if (busiestEngine.HasValue)
         {
             samples.Add(new MetricSample(
                 "gpu-total",
-                    "GPU Usage",
+                "GPU Usage",
                 "usage",
                 "Usage",
                 MetricCategory.Gpu,
                 MetricUnit.Percent,
-                Math.Clamp(maxEngineUsage, 0d, 100d),
+                busiestEngine.Value,
                 timestamp));
         }
 
@@ -613,12 +617,12 @@ public sealed class WindowsMetricCollector : IMetricCollector
                 "Dedicated",
                 MetricCategory.Gpu,
                 MetricUnit.Gigabytes,
-                dedicatedBytes / 1024d / 1024d / 1024d,
+                dedicatedBytes / BytesPerGigabyte,
                 timestamp));
         }
     }
 
-    private void AddNetworkFallback(List<MetricSample> samples, DateTimeOffset timestamp)
+    private void AddNetworkFallback(List<MetricSample> samples, DateTimeOffset timestamp, long nowTicks)
     {
         foreach (var networkInterface in NetworkInterface.GetAllNetworkInterfaces())
         {
@@ -638,16 +642,16 @@ public sealed class WindowsMetricCollector : IMetricCollector
 
                 if (_networkBaselines.TryGetValue(panelKey, out var baseline))
                 {
-                    var seconds = Math.Max(0.25d, (timestamp - baseline.Timestamp).TotalSeconds);
+                    var seconds = Math.Max(0.25d, Stopwatch.GetElapsedTime(baseline.Ticks, nowTicks).TotalSeconds);
                     var receiveDelta = Math.Max(0L, stats.BytesReceived - baseline.BytesReceived);
                     var sendDelta = Math.Max(0L, stats.BytesSent - baseline.BytesSent);
                     receiveMbps = (receiveDelta * 8d) / seconds / BitsPerMegabit;
                     sendMbps = (sendDelta * 8d) / seconds / BitsPerMegabit;
-                    _networkBaselines[panelKey] = new NetworkBaseline(stats.BytesReceived, stats.BytesSent, timestamp);
+                    _networkBaselines[panelKey] = new NetworkBaseline(stats.BytesReceived, stats.BytesSent, nowTicks);
                 }
                 else
                 {
-                    _networkBaselines.Add(panelKey, new NetworkBaseline(stats.BytesReceived, stats.BytesSent, timestamp));
+                    _networkBaselines.Add(panelKey, new NetworkBaseline(stats.BytesReceived, stats.BytesSent, nowTicks));
                 }
 
                 samples.Add(new MetricSample(
@@ -679,9 +683,9 @@ public sealed class WindowsMetricCollector : IMetricCollector
         }
     }
 
-    private void AddTemperatures(List<MetricSample> samples, DateTimeOffset timestamp)
+    private void AddTemperatures(List<MetricSample> samples, DateTimeOffset timestamp, long nowTicks)
     {
-        var shouldRefresh = _cachedTemperatureValues.Count == 0 || timestamp - _lastTemperatureRefreshUtc >= TemperatureRefreshInterval;
+        var shouldRefresh = _cachedTemperatureValues.Count == 0 || Stopwatch.GetElapsedTime(_lastTemperatureRefreshTicks, nowTicks) >= TemperatureRefreshInterval;
         if (shouldRefresh)
         {
             _cachedTemperatureValues.Clear();
@@ -713,7 +717,7 @@ public sealed class WindowsMetricCollector : IMetricCollector
                     gpuTemperature.Value));
             }
 
-            _lastTemperatureRefreshUtc = timestamp;
+            _lastTemperatureRefreshTicks = nowTicks;
         }
 
         foreach (var cachedValue in _cachedTemperatureValues)
@@ -898,155 +902,129 @@ public sealed class WindowsMetricCollector : IMetricCollector
         public ulong ToUInt64() => ((ulong)HighDateTime << 32) | LowDateTime;
     }
 
-    private readonly record struct NetworkBaseline(long BytesReceived, long BytesSent, DateTimeOffset Timestamp);
+    private readonly record struct NetworkBaseline(long BytesReceived, long BytesSent, long Ticks);
 
-    private void EnumerateProcesses(
-        DateTimeOffset timestamp,
-        bool shouldRefreshProcesses,
-        bool shouldRefreshHandleCounts,
+    /// <summary>
+    /// Walks one SYSTEM_PROCESS_INFORMATION snapshot. Unlike opening each process, this sees
+    /// services and protected processes too (System, dwm, csrss, antivirus), which a normal user
+    /// cannot open and which used to read as 0% CPU, 0 memory and no handles.
+    /// </summary>
+    private bool EnumerateProcesses(
+        long nowTicks,
         HashSet<int> activePids,
         ref int processCount,
         ref long threadCount,
         ref long handleCount)
     {
-        var snapshotHandle = ProcessNative.CreateToolhelp32Snapshot(ProcessNative.Th32csSnapProcess, 0);
-        if (!ProcessNative.IsValidHandle(snapshotHandle))
-        {
-            return;
-        }
-
-        try
-        {
-            var entry = new ProcessNative.ProcessEntry32
-            {
-                dwSize = (uint)Marshal.SizeOf<ProcessNative.ProcessEntry32>(),
-                szExeFile = string.Empty,
-            };
-
-            if (!ProcessNative.Process32First(snapshotHandle, ref entry))
-            {
-                return;
-            }
-
-            do
-            {
-                var processId = unchecked((int)entry.th32ProcessID);
-                if (processId <= 0)
-                {
-                    ResetProcessEntry(ref entry);
-                    continue;
-                }
-
-                processCount++;
-                var processThreads = unchecked((int)entry.cntThreads);
-                threadCount += processThreads;
-
-                var processHandles = 0;
-                var cpuPercent = 0d;
-                var workingSetGb = 0d;
-                var processName = NormalizeProcessName(entry.szExeFile, processId);
-
-                var shouldOpenProcess = shouldRefreshProcesses || shouldRefreshHandleCounts;
-                if (shouldOpenProcess)
-                {
-                    var desiredAccess = shouldRefreshProcesses
-                        ? ProcessNative.ProcessQueryLimitedInformation | ProcessNative.ProcessVmRead
-                        : ProcessNative.ProcessQueryLimitedInformation;
-
-                    var processHandle = ProcessNative.OpenProcess(
-                        desiredAccess,
-                        false,
-                        processId);
-
-                    if (!ProcessNative.IsValidHandle(processHandle) && shouldRefreshProcesses)
-                    {
-                        processHandle = ProcessNative.OpenProcess(
-                            ProcessNative.ProcessQueryLimitedInformation,
-                            false,
-                            processId);
-                    }
-
-                    if (ProcessNative.IsValidHandle(processHandle))
-                    {
-                        try
-                        {
-                            if (shouldRefreshHandleCounts && ProcessNative.GetProcessHandleCount(processHandle, out var handleValue))
-                            {
-                                processHandles = unchecked((int)handleValue);
-                                handleCount += processHandles;
-                            }
-
-                            if (shouldRefreshProcesses)
-                            {
-                                activePids.Add(processId);
-                                TryGetProcessCpuUsage(processHandle, processId, timestamp, out cpuPercent);
-
-                                if (ProcessNative.GetProcessMemoryInfo(
-                                        processHandle,
-                                        out var memoryCounters,
-                                        (uint)Marshal.SizeOf<ProcessNative.ProcessMemoryCounters>()))
-                                {
-                                    workingSetGb = Math.Max(0d, (double)memoryCounters.WorkingSetSize / 1024d / 1024d / 1024d);
-                                }
-                            }
-                        }
-                        finally
-                        {
-                            ProcessNative.CloseHandle(processHandle);
-                        }
-                    }
-                    else if (shouldRefreshProcesses)
-                    {
-                        activePids.Add(processId);
-                    }
-                }
-
-                if (shouldRefreshProcesses)
-                {
-                    _cachedProcessActivity.Add(new ProcessActivitySample(
-                        processId,
-                        processName,
-                        cpuPercent,
-                        workingSetGb,
-                        processThreads,
-                        processHandles));
-                }
-
-                ResetProcessEntry(ref entry);
-            }
-            while (ProcessNative.Process32Next(snapshotHandle, ref entry));
-        }
-        finally
-        {
-            ProcessNative.CloseHandle(snapshotHandle);
-        }
-    }
-
-    private bool TryGetProcessCpuUsage(nint processHandle, int processId, DateTimeOffset timestamp, out double cpuPercent)
-    {
-        cpuPercent = 0d;
-        if (!ProcessNative.GetProcessTimes(
-                processHandle,
-                out var creationTime,
-                out _,
-                out var kernelTime,
-                out var userTime))
+        if (nint.Size != 8 || !TryQuerySystemProcesses(out var length))
         {
             return false;
         }
 
-        var totalProcessorTime = TimeSpan.FromTicks((long)(kernelTime.ToUInt64() + userTime.ToUInt64()));
-        var creationStamp = creationTime.ToUInt64();
-        if (_processCpuBaselines.TryGetValue(processId, out var baseline) &&
-            baseline.CreationTime == creationStamp)
+        var offset = 0;
+        while (offset + ProcessNative.MinimumEntrySize <= length)
         {
-            var elapsedSeconds = Math.Max(0.25d, (timestamp - baseline.Timestamp).TotalSeconds);
-            var cpuSeconds = Math.Max(0d, (totalProcessorTime - baseline.TotalProcessorTime).TotalSeconds);
-            cpuPercent = Math.Clamp((cpuSeconds / (elapsedSeconds * Environment.ProcessorCount)) * 100d, 0d, 100d);
+            var entry = _processBuffer + offset;
+            var nextEntryOffset = Marshal.ReadInt32(entry, ProcessNative.NextEntryOffset);
+            var processId = unchecked((int)Marshal.ReadInt64(entry, ProcessNative.UniqueProcessIdOffset));
+            var threads = Marshal.ReadInt32(entry, ProcessNative.NumberOfThreadsOffset);
+            var handles = Marshal.ReadInt32(entry, ProcessNative.HandleCountOffset);
+
+            processCount++;
+            threadCount += Math.Max(0, threads);
+            handleCount += Math.Max(0, handles);
+
+            // PID 0 is System Idle: its "CPU" is idle time, which would top every list.
+            if (processId > 0)
+            {
+                activePids.Add(processId);
+                var cpuTime = Marshal.ReadInt64(entry, ProcessNative.KernelTimeOffset) + Marshal.ReadInt64(entry, ProcessNative.UserTimeOffset);
+                var cycles = Marshal.ReadInt64(entry, ProcessNative.CycleTimeOffset);
+                var createTime = Marshal.ReadInt64(entry, ProcessNative.CreateTimeOffset);
+                var cpuPercent = 0d;
+                string name;
+                if (_processCpuBaselines.TryGetValue(processId, out var baseline) && baseline.CreateTime == createTime)
+                {
+                    var elapsedSeconds = Stopwatch.GetElapsedTime(baseline.Ticks, nowTicks).TotalSeconds;
+                    cpuPercent = CounterMath.ProcessCpuPercent(
+                        cycles - baseline.Cycles, cpuTime - baseline.CpuTime, elapsedSeconds, _nominalClockMhz, _logicalProcessorCount);
+                    name = baseline.Name;
+                }
+                else
+                {
+                    name = ReadProcessName(entry, processId);
+                }
+
+                _processCpuBaselines[processId] = new ProcessCpuBaseline(cpuTime, cycles, nowTicks, createTime, name);
+
+                // Private working set: the measure in Task Manager's Memory column. The full
+                // working set also counts shared DLL pages, which inflates every process.
+                var privateWorkingSet = Math.Max(0L, Marshal.ReadInt64(entry, ProcessNative.WorkingSetPrivateSizeOffset));
+                _cachedProcessActivity.Add(new ProcessActivitySample(
+                    processId,
+                    name,
+                    cpuPercent,
+                    privateWorkingSet / BytesPerGigabyte,
+                    Math.Max(0, threads),
+                    Math.Max(0, handles)));
+            }
+
+            if (nextEntryOffset <= 0)
+            {
+                break;
+            }
+
+            offset += nextEntryOffset;
         }
 
-        _processCpuBaselines[processId] = new ProcessCpuBaseline(totalProcessorTime, timestamp, creationStamp);
         return true;
+    }
+
+    private bool TryQuerySystemProcesses(out int length)
+    {
+        length = 0;
+        if (_processBuffer == nint.Zero)
+        {
+            _processBufferSize = InitialProcessBufferBytes;
+            _processBuffer = Marshal.AllocHGlobal(_processBufferSize);
+        }
+
+        // The process list can grow between the size query and the copy; retry a few times.
+        for (var attempt = 0; attempt < 4; attempt++)
+        {
+            var status = ProcessNative.NtQuerySystemInformation(
+                ProcessNative.SystemProcessInformation,
+                _processBuffer,
+                _processBufferSize,
+                out var returnLength);
+
+            if (status == ProcessNative.StatusSuccess)
+            {
+                length = Math.Min(returnLength > 0 ? returnLength : _processBufferSize, _processBufferSize);
+                return true;
+            }
+
+            if (status != ProcessNative.StatusInfoLengthMismatch)
+            {
+                return false;
+            }
+
+            Marshal.FreeHGlobal(_processBuffer);
+            _processBufferSize = Math.Max(_processBufferSize * 2, returnLength + (64 * 1024));
+            _processBuffer = Marshal.AllocHGlobal(_processBufferSize);
+        }
+
+        return false;
+    }
+
+    private static string ReadProcessName(nint entry, int processId)
+    {
+        var lengthBytes = (ushort)Marshal.ReadInt16(entry, ProcessNative.ImageNameLengthOffset);
+        var buffer = Marshal.ReadIntPtr(entry, ProcessNative.ImageNameBufferOffset);
+        var imageName = lengthBytes == 0 || buffer == nint.Zero
+            ? string.Empty
+            : Marshal.PtrToStringUni(buffer, lengthBytes / 2);
+        return NormalizeProcessName(imageName, processId);
     }
 
     private static string NormalizeProcessName(string executableName, int processId)
@@ -1055,13 +1033,7 @@ public sealed class WindowsMetricCollector : IMetricCollector
         return string.IsNullOrWhiteSpace(trimmed) ? $"PID {processId}" : trimmed;
     }
 
-    private static void ResetProcessEntry(ref ProcessNative.ProcessEntry32 entry)
-    {
-        entry.dwSize = (uint)Marshal.SizeOf<ProcessNative.ProcessEntry32>();
-        entry.szExeFile = string.Empty;
-    }
-
-    private readonly record struct ProcessCpuBaseline(TimeSpan TotalProcessorTime, DateTimeOffset Timestamp, ulong CreationTime);
+    private readonly record struct ProcessCpuBaseline(long CpuTime, long Cycles, long Ticks, long CreateTime, string Name);
 
     private readonly record struct CachedMetricValue(
         string PanelKey,

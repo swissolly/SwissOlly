@@ -1,6 +1,6 @@
 # SwissOlly Roadmap
 
-## Current Version: v1
+## Current version: 1.2.0
 
 ## Planned
 
@@ -10,11 +10,6 @@ CPU temperature sensors on AMD and Intel require kernel-level access (PCI config
 LibreHardwareMonitor supports CPU temps through the [PawnIO](https://pawnio.eu/) kernel driver. The plan is to bundle PawnIO into the SwissOlly installer so CPU temperatures work out of the box with no extra setup.
 
 **Status:** GPU temps work today. CPU temp panel exists in the UI — just needs the driver bundled.
-
-### Panel Resizing
-Allow users to resize panels between standard (1x1), wide (2x1), and tall (1x2) sizes. Panel sizes would persist across sessions just like panel positions do today.
-
-**Status:** Architecture designed, implementation deferred to a future release.
 
 ### Notifications & Alerts
 Toast notifications when metrics cross configurable thresholds — e.g., CPU > 90%, memory > 85%, drive > 95% full. Gives you passive monitoring without keeping the window open.
@@ -27,34 +22,42 @@ Export historical metric data as CSV or JSON for analysis in external tools. Use
 **Status:** Planned.
 
 ### Prometheus Metrics Endpoint
-Expose SwissOlly's collected metrics via a local HTTP endpoint in Prometheus exposition format. This lets advanced users scrape SwissOlly from a Prometheus instance for long-term storage, alerting, or multi-machine dashboards — bridging the gap between SwissOlly's simplicity and Prometheus/Grafana's power.
+Expose SwissOlly's collected metrics via a local HTTP endpoint in Prometheus exposition format. This lets advanced users scrape SwissOlly from a Prometheus instance for long-term storage, alerting, or multi-machine dashboards — bridging the gap between SwissOlly's simplicity and Prometheus/Grafana's power. Off by default and bound to localhost, so the no-network default stands.
+
+**Status:** Planned.
+
+### Per-process History
+See how an individual process's CPU and memory use changed over time, not just right now. Today a process's line only exists while it is pinned to a chart.
+
+**Status:** Planned.
+
+### More Colour Themes
+Additional palettes on top of the eight available today.
 
 **Status:** Planned.
 
 ## Shipped
 
-### v1.2.0 — In-Game Telemetry Overlay
-A compact, always-on-top overlay that renders FPS and selected system metrics on top of running games. Owned by the main SwissOlly process — no second window, no taskbar entry, no Alt+Tab entry.
+### v1.2.0 — SwissOlly
+The first release under the SwissOlly name (previously Vaktr). An existing install upgrades in place and keeps its settings, history and startup entry.
 
-- Three display modes: Simple (FPS only), Advanced (FPS + CPU + GPU + GPU temp + memory), Custom (pick your own)
-- True per-process FPS, counted from the game's own DXGI/D3D9 present calls via a read-only ETW trace — no DLL injection, no anti-cheat conflicts (safe with Vanguard, EAC, BattlEye), and SwissOlly never runs elevated. The installer grants Performance Log Users membership so the app itself stays unprivileged; the overlay degrades to an approximate reading, clearly labelled, when that right is absent
-- Auto-shows when a game has focus; hides when focus returns to desktop
-- Corner positioning (top-left, top-right, bottom-left, bottom-right)
-- Outlined text with no background box — reads cleanly over any game background
-- Configurable text color via a color picker with quick presets (or a custom hex value), font size (10–32px), opacity (30–100%), and toggle hotkey
-- Configured entirely from the existing control deck — no second settings window
-- Click-through layered Win32 window: `WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE` — invisible to the shell, no code-signing or UIAccess required
-- Resource cost: ~0.4–0.6% CPU, ~12 MB memory added
+- **Layout editor:** drag panels on a 12-column grid and resize them from any edge or corner; Tab, arrows and Shift+arrows do the same from the keyboard
+- **Process popover:** the CPU and Memory panels list every process, services included, with Task Manager's measures (machine-wide CPU share; private working set); sort, and pin processes to the chart with the mouse or the keyboard
+- **Accurate counters:** CPU usage and per-core load as Task Manager reports them, the real clock speed including boost, and GPU usage that adds up every process using an engine
+- **Tray and startup:** closing keeps SwissOlly recording in the notification area (or exits, if you prefer); Start with Windows; a second launch brings the running window forward
+- **Themes:** twelve palettes, among them Obsidian (true black for OLED), Synthwave, Frost and Blossom, previewed in Settings and each checked against the WCAG AA contrast floor
+- **Text fields and settings:** new text fields with undo, selection and clipboard; Apply and Revert with clear messages; lowering retention asks before deleting history
+- **Charts:** gaps in history stay gaps, a "Collecting since" marker, a loading state, dash patterns that tell series apart without colour, and times in your regional format
+- **Accessibility:** buttons, rows and fields carry names and roles for screen readers, and every control works from the keyboard
+- **Resilience:** a full disk or unplugged storage drive stops history, not the live board, and saving resumes on its own
+- **In-game overlay:** FPS counted from the game's own present calls via a read-only ETW trace — no DLL injection, no anti-cheat conflicts, and SwissOlly never runs elevated. The installer offers the Performance Log Users membership this needs and removes it on uninstall. Three modes (FPS only, all metrics, Custom), any corner, classic and neon colours or any hex value, size, opacity and hotkey, with a live preview in Settings. Click-through layered window: no taskbar or Alt+Tab entry, no code-signing or UIAccess needed
 
 **Known limitations in v1.2.0:**
-- Exclusive fullscreen isn't supported — an intentional scope decision. SwissOlly targets borderless and windowed-fullscreen games only, which avoids ever requiring code-signing or elevated UIAccess.
-- HDR games render dim (SDR overlay). Deferred to v1.3.0.
-- Group membership only applies to a new logon token, so the first session after install shows approximate FPS until you sign out and back in.
-- ETW delivers events in buffers, so the reading trails live by about a second.
-
-**Follow-ups tracked for v1.3.0:**
-- HDR-aware overlay rendering
-- Overlay UI/UX polish pass — see `TASKS.md`
+- Exclusive fullscreen isn't supported by the overlay — an intentional scope decision. SwissOlly targets borderless and windowed-fullscreen games only, which avoids ever requiring code-signing or elevated UIAccess.
+- HDR games render the overlay dim (SDR overlay).
+- Group membership only applies to a new logon token, so the first session after install shows `--` for FPS until you sign out and back in.
+- ETW delivers events in buffers, so the FPS reading trails live by about a second.
+- Windows contrast themes aren't followed; SwissOlly always draws with its own palettes.
 
 ### v1 — Polished Local Telemetry Dashboard
 - Live time-series panels for CPU, GPU, memory, disk, network, system activity

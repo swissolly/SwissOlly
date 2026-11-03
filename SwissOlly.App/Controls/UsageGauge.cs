@@ -67,7 +67,7 @@ public sealed class UsageGauge : UserControl
         {
             CornerRadius = new CornerRadius(8),
             BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E"),
-            BorderThickness = new Thickness(0.8),
+            BorderThickness = new Thickness(UiMetrics.Hairline),
             Background = CreateThemedGradient(),
         };
         _innerBorder = new Border
@@ -75,7 +75,7 @@ public sealed class UsageGauge : UserControl
             Margin = new Thickness(6),
             CornerRadius = new CornerRadius(8),
             BorderBrush = ResolveBrush("SurfaceGridBrush", "#35587A"),
-            BorderThickness = new Thickness(0.8),
+            BorderThickness = new Thickness(UiMetrics.Hairline),
             Opacity = 0.18,
         };
         _valueText = new TextBlock

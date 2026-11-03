@@ -95,6 +95,14 @@ public sealed class OverlayController : IDisposable
 
     public void RegisterHotkey(IntPtr ownerHwnd)
     {
+        // Only while the overlay is on: a registered hotkey is taken from every other app, which
+        // is no trade for a key that does nothing.
+        if (!_config.Enabled)
+        {
+            _hotkey.Unregister();
+            return;
+        }
+
         if (!_hotkey.Register(ownerHwnd, _config.HotkeyGesture))
             StatusMessage?.Invoke($"Could not register hotkey '{_config.HotkeyGesture}' — may already be in use.");
     }
@@ -106,11 +114,13 @@ public sealed class OverlayController : IDisposable
         bool gestureChanged = config.HotkeyGesture != _config.HotkeyGesture;
         bool enabledChanged = config.Enabled != _config.Enabled;
         _config = config;
+        _window.SetCorner(config.Corner);
 
         lock (_renderLock)
             _renderer.Invalidate();
 
-        if (gestureChanged)
+        // Registered only while enabled, so turning the overlay on or off re-registers too.
+        if (gestureChanged || enabledChanged)
             StatusMessage?.Invoke("__reregister_hotkey__");
 
         if (enabledChanged)
@@ -288,10 +298,11 @@ public sealed class OverlayController : IDisposable
         }
     }
 
-    // Matches the dashboard's threshold palette (WarningBrush / CriticalBrush in
-    // TelemetryPanelCard) so the HUD and the app agree on what "hot" looks like.
+    // Amber, then red: the same meaning as the dashboard's Warning and Critical. Critical was an
+    // orange (#FF9761) that sat too close to the amber, and to the neon orange and yellow text
+    // colours, to read as a second, more urgent step over a busy game scene.
     private static readonly Color WarningColor = Color.FromArgb(0xF0, 0xC9, 0x68);
-    private static readonly Color CriticalColor = Color.FromArgb(0xFF, 0x97, 0x61);
+    private static readonly Color CriticalColor = Color.FromArgb(0xFF, 0x5A, 0x4F);
 
     private OverlayLine[] BuildLines()
     {
@@ -317,8 +328,8 @@ public sealed class OverlayController : IDisposable
                     string value = _fpsError != null || double.IsNaN(_lastFps)
                         ? "  --"
                         : _fpsAccuracy == FpsAccuracy.Approximate
-                            ? $"~{_lastFps,3:F0}"
-                            : $"{_lastFps,4:F0}";
+                            ? Figures($"~{_lastFps,3:F0}")
+                            : Figures($"{_lastFps,4:F0}");
                     lines.Add(new OverlayLine("FPS",
                         value,
                         baseColor));
@@ -331,7 +342,7 @@ public sealed class OverlayController : IDisposable
                     break;
                 case "gpu-temp":
                     lines.Add(new OverlayLine("GPU Temp",
-                        double.IsNaN(_lastGpuTemp) ? " --" : $"{_lastGpuTemp,3:F0}°C",
+                        double.IsNaN(_lastGpuTemp) ? " --" : Figures($"{_lastGpuTemp,3:F0}°C"),
                         TempColor(_lastGpuTemp, baseColor)));
                     break;
                 case "memory":
@@ -347,7 +358,14 @@ public sealed class OverlayController : IDisposable
     }
 
     private static string FormatPercent(double value)
-        => double.IsNaN(value) ? " --%" : $"{value,3:F0}%";
+        => double.IsNaN(value) ? " --%" : Figures($"{value,3:F0}%");
+
+    /// <summary>
+    /// Pads with figure spaces (U+2007), which are as wide as a digit. The padding was plain
+    /// spaces, about half a digit wide in Segoe UI, so a value still moved sideways crossing
+    /// 9→10 or 99→100 despite the fixed character count.
+    /// </summary>
+    private static string Figures(string text) => text.Replace(' ', ' ');
 
     private static Color UsageColor(double percent, Color normal)
         => double.IsNaN(percent) ? normal

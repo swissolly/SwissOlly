@@ -3,6 +3,7 @@ using SwissOlly.Core.Models;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml.Media;
+using Microsoft.UI.Xaml.Media.Animation;
 using System.Linq;
 using System.Text;
 using Windows.UI;
@@ -150,11 +151,13 @@ public sealed class TelemetryChart : UserControl
             Opacity = 0.55,
             IsHitTestVisible = false,
         };
+        // One line per series: wrapped names grew the tooltip taller than a compact chart.
         _hoverTooltipText = new TextBlock
         {
             FontFamily = s_numericFont,
             FontSize = 10.5,
-            TextWrapping = TextWrapping.Wrap,
+            TextWrapping = TextWrapping.NoWrap,
+            TextTrimming = TextTrimming.CharacterEllipsis,
             Foreground = ResolveBrush("TextPrimaryBrush", "#F2F8FF"),
             MaxWidth = 210,
         };
@@ -184,6 +187,8 @@ public sealed class TelemetryChart : UserControl
             Opacity = 0.82,
             Visibility = Visibility.Collapsed,
         };
+        _loadingSkeleton = BuildLoadingSkeleton();
+
         // Transparent, not null: the plot must be hit-testable everywhere for drag-to-zoom and
         // click-to-pin. Every drawn element is non-hit-testable (retained rendering), so without a
         // background the chart caught no pointer input at all and zoom silently stopped working.
@@ -195,13 +200,16 @@ public sealed class TelemetryChart : UserControl
                 _plotCanvas,
                 _gridCanvas,
                 _dataCanvas,
+                _axisLabelCanvas,
                 _interactionCanvas,
                 _emptyStateText,
+                _loadingSkeleton,
             },
         };
 
-        // Crosshair says "this surface takes a selection" - the only cue drag-to-zoom has.
-        ProtectedCursor = Microsoft.UI.Input.InputSystemCursor.Create(Microsoft.UI.Input.InputSystemCursorShape.Cross);
+        // Crosshair says "this surface takes a selection" - the only cue drag-to-zoom has. Set once
+        // here from the shared cursor; see PointerCursors.
+        ProtectedCursor = PointerCursors.Get(Microsoft.UI.Input.InputSystemCursorShape.Cross);
         Loaded += (_, _) => ScheduleRedraw();
         SizeChanged += OnChartSizeChanged;
         PointerPressed += OnPointerPressed;
@@ -257,6 +265,99 @@ public sealed class TelemetryChart : UserControl
         set => SetValue(EmptyStateTextProperty, value);
     }
 
+    private readonly Grid _loadingSkeleton;
+    private Border? _loadingBlock;
+    private Storyboard? _loadingPulse;
+    private bool _isLoading;
+
+    /// <summary>History is being read. With no points yet, shows a placeholder instead of
+    /// "Waiting for samples"; with partial points, suppresses the collection-start marker.</summary>
+    public bool IsLoading
+    {
+        get => _isLoading;
+        set
+        {
+            if (_isLoading == value)
+            {
+                return;
+            }
+
+            _isLoading = value;
+            _lastRenderedSeries = null;
+            ScheduleRedraw();
+        }
+    }
+
+    private Grid BuildLoadingSkeleton()
+    {
+        _loadingBlock = new Border
+        {
+            CornerRadius = new CornerRadius(UiMetrics.ControlRadius),
+            Background = ResolveBrush("SurfaceStrongBrush", "#292D31"),
+            Opacity = 0.55,
+        };
+        var caption = new TextBlock
+        {
+            Text = "Loading history",
+            FontSize = 11,
+            Foreground = ResolveBrush("TextMutedBrush", "#90959D"),
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        var grid = new Grid
+        {
+            Margin = new Thickness(LeftPadding, TopPadding, RightPadding, BottomPadding),
+            IsHitTestVisible = false,
+            Visibility = Visibility.Collapsed,
+            RowDefinitions =
+            {
+                new RowDefinition { Height = new GridLength(55, GridUnitType.Star) },
+                new RowDefinition { Height = new GridLength(45, GridUnitType.Star) },
+            },
+            Children = { caption, _loadingBlock },
+        };
+        Grid.SetRow(_loadingBlock, 1);
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(grid, "Loading history");
+        return grid;
+    }
+
+    private void SetLoadingSkeletonVisible(bool visible)
+    {
+        var target = visible ? Visibility.Visible : Visibility.Collapsed;
+        if (_loadingSkeleton.Visibility == target)
+        {
+            return;
+        }
+
+        _loadingSkeleton.Visibility = target;
+        _loadingPulse?.Stop();
+        _loadingPulse = null;
+        if (!visible || _loadingBlock is null)
+        {
+            return;
+        }
+
+        _loadingBlock.Background = ResolveBrush("SurfaceStrongBrush", "#292D31");
+        if (!Motion.AnimationsEnabled)
+        {
+            return;
+        }
+
+        var pulse = new DoubleAnimation
+        {
+            From = 0.35,
+            To = 0.7,
+            Duration = new Duration(TimeSpan.FromMilliseconds(900)),
+            AutoReverse = true,
+            RepeatBehavior = RepeatBehavior.Forever,
+            EasingFunction = new SineEase { EasingMode = EasingMode.EaseInOut },
+        };
+        Storyboard.SetTarget(pulse, _loadingBlock);
+        Storyboard.SetTargetProperty(pulse, "Opacity");
+        _loadingPulse = new Storyboard { Children = { pulse } };
+        _loadingPulse.Begin();
+    }
+
     private static void OnChartPropertyChanged(DependencyObject dependencyObject, DependencyPropertyChangedEventArgs args)
     {
         ((TelemetryChart)dependencyObject).ScheduleRedraw();
@@ -264,6 +365,13 @@ public sealed class TelemetryChart : UserControl
 
     private void OnChartSizeChanged(object sender, SizeChangedEventArgs e)
     {
+        // Nothing the chart draws (tooltips, pinned readings, captions) may spill over the card's
+        // edge onto neighbouring panels.
+        _interactionCanvas.Clip = new RectangleGeometry
+        {
+            Rect = new Windows.Foundation.Rect(0, 0, Math.Max(0d, e.NewSize.Width), Math.Max(0d, e.NewSize.Height)),
+        };
+
         // Skip if rendering is suspended (window resize) — the redraw will
         // happen when rendering resumes via the deferred refresh path.
         if (_renderingSuspended)
@@ -362,18 +470,33 @@ public sealed class TelemetryChart : UserControl
             return false;
         }
 
-        // Quick hash: compare series count and last point timestamp of each series
-        var hash = series.Count;
-        for (var i = 0; i < series.Count; i++)
+        return HashSeries(series) == _lastRenderedPointHash;
+    }
+
+    /// <summary>
+    /// A cheap fingerprint of what would be drawn: each series' key, point count, first and last
+    /// point. The last timestamp alone missed changes at the head of a series - older history
+    /// merged in front, samples folded into minute averages - and kept the old drawing.
+    /// </summary>
+    private static int HashSeries(IReadOnlyList<ChartSeriesViewModel> series)
+    {
+        var hash = new HashCode();
+        hash.Add(series.Count);
+        foreach (var item in series)
         {
-            var pts = series[i].Points;
-            if (pts.Count > 0)
+            var points = item.Points;
+            hash.Add(item.Key);
+            hash.Add(points.Count);
+            if (points.Count > 0)
             {
-                hash = unchecked(hash * 31 + pts[^1].Timestamp.GetHashCode());
+                hash.Add(points[0].Timestamp);
+                hash.Add(points[0].Value);
+                hash.Add(points[^1].Timestamp);
+                hash.Add(points[^1].Value);
             }
         }
 
-        return hash == _lastRenderedPointHash;
+        return hash.ToHashCode();
     }
 
     // ---- Retained rendering ------------------------------------------------------------------
@@ -405,6 +528,7 @@ public sealed class TelemetryChart : UserControl
     private TextBlock? _ceilingLabel;
     private TextBlock? _midLabel;
     private TextBlock? _floorLabel;
+    private readonly Canvas _axisLabelCanvas = new() { IsHitTestVisible = false };
 
     private void Redraw()
     {
@@ -435,14 +559,7 @@ public sealed class TelemetryChart : UserControl
         _lastRenderedCeiling = CeilingValue;
         _lastRenderedWidth = width;
         _lastRenderedHeight = height;
-        var hash = series.Count;
-        for (var i = 0; i < series.Count; i++)
-        {
-            var pts = series[i].Points;
-            if (pts.Count > 0)
-                hash = unchecked(hash * 31 + pts[^1].Timestamp.GetHashCode());
-        }
-        _lastRenderedPointHash = hash;
+        _lastRenderedPointHash = HashSeries(series);
 
         if (!TryGetPointBounds(series, out var minTimestamp, out var maxTimestamp, out var maxObservedValue))
         {
@@ -453,15 +570,18 @@ public sealed class TelemetryChart : UserControl
             DrawGrid(width, height, DateTimeOffset.UtcNow.AddMinutes(-1), DateTimeOffset.UtcNow, _lastResolvedMaxValue, includeLabels: false);
             HideSeriesVisuals(0);
             HideFrom(_soloDots, 0);
+            HideCollectionStartMarker();
             // Plain text: an emoji hourglass clashed with the Fluent icon set used everywhere else.
             _emptyStateText.Text = string.IsNullOrWhiteSpace(EmptyStateText) ? "Waiting for samples" : EmptyStateText;
-            _emptyStateText.Visibility = Visibility.Visible;
+            _emptyStateText.Visibility = _isLoading ? Visibility.Collapsed : Visibility.Visible;
+            SetLoadingSkeletonVisible(_isLoading);
             _hasRenderedFrame = true;
             HideHover();
             return;
         }
 
         _emptyStateText.Visibility = Visibility.Collapsed;
+        SetLoadingSkeletonVisible(false);
 
         var start = WindowStartUtc == default ? minTimestamp : WindowStartUtc;
         var end = WindowEndUtc == default ? maxTimestamp : WindowEndUtc;
@@ -488,29 +608,42 @@ public sealed class TelemetryChart : UserControl
 
         UpdatePlotSurface(plotWidth, plotHeight);
         DrawGrid(width, height, start, end, maxValue);
+        UpdateCollectionStartMarker(minTimestamp, start, end, plotWidth, plotHeight);
 
         var visualIndex = 0;
         var soloIndex = 0;
         var runs = new List<IReadOnlyList<Windows.Foundation.Point>>();
+        var seriesIndex = -1;
         foreach (var item in series)
         {
+            // Position in the list, not among drawn series, so dash patterns match the legend.
+            seriesIndex++;
             if (item.Points.Count == 0)
             {
                 continue;
             }
 
-            var renderablePoints = GetRenderablePoints(item.Points, start, end);
-            if (renderablePoints.Count == 0)
+            // Break at the outages the view model found on the stored samples, then downsample
+            // each run on its own share of the budget. With nothing at all in view, the old
+            // behaviour stands: a flat line at the nearest value.
+            var seriesRuns = SplitIntoRuns(item, start, end);
+            if (seriesRuns.Count == 0)
             {
-                continue;
+                var nearest = GetRenderablePoints(item.Points, start, end);
+                if (nearest.Count == 0)
+                {
+                    continue;
+                }
+
+                seriesRuns.Add(nearest);
             }
 
-            var downsampled = Downsample(renderablePoints, pointBudget);
-
-            // Split into contiguous segments at gaps (>3x the expected interval between points)
+            var windowMs = Math.Max(1d, (end - start).TotalMilliseconds);
             runs.Clear();
-            foreach (var segment in SplitAtGaps(downsampled))
+            foreach (var run in seriesRuns)
             {
+                var runMs = run.Count > 1 ? (run[^1].Timestamp - run[0].Timestamp).TotalMilliseconds : 0d;
+                var segment = Downsample(run, Math.Max(4, (int)Math.Ceiling(pointBudget * runMs / windowMs)));
                 var rawProjected = new Windows.Foundation.Point[segment.Count];
                 for (var pi = 0; pi < segment.Count; pi++)
                 {
@@ -548,6 +681,7 @@ public sealed class TelemetryChart : UserControl
                 SetFigures(visual.LineGeometry, runs, plotBottom, closed: false);
                 visual.Line.Stroke = item.StrokeBrush;
                 visual.Line.StrokeThickness = strokeThickness;
+                SeriesDash.Apply(visual.Line, seriesIndex, seriesCount);
                 visual.Line.Visibility = Visibility.Visible;
             }
             else
@@ -561,7 +695,8 @@ public sealed class TelemetryChart : UserControl
             var isDimmed = item.StrokeBrush is SolidColorBrush scb && scb.Color.A < 80;
             if (drawPointMarkers && !isDimmed)
             {
-                var lastPoint = Project(renderablePoints[^1], LeftPadding, TopPadding, plotWidth, plotHeight, start, end, maxValue);
+                var lastRun = seriesRuns[^1];
+                var lastPoint = Project(lastRun[lastRun.Count - 1], LeftPadding, TopPadding, plotWidth, plotHeight, start, end, maxValue);
                 visual.Glow.Fill = item.StrokeBrush;
                 visual.Dot.Fill = item.StrokeBrush;
                 Canvas.SetLeft(visual.Glow, lastPoint.X - (visual.Glow.Width / 2d));
@@ -581,6 +716,86 @@ public sealed class TelemetryChart : UserControl
         HideSeriesVisuals(visualIndex);
         HideFrom(_soloDots, soloIndex);
         _hasRenderedFrame = true;
+    }
+
+    private Line? _collectionStartLine;
+    private TextBlock? _collectionStartLabel;
+
+    /// <summary>
+    /// When the data starts well inside the window (fresh install, or a window longer than the
+    /// history), marks where collection began. The axis is not clamped to the data: a clamped axis
+    /// would creep for the first minutes and make the same window look different each scrape.
+    /// </summary>
+    private void UpdateCollectionStartMarker(DateTimeOffset firstSample, DateTimeOffset start, DateTimeOffset end, double plotWidth, double plotHeight)
+    {
+        var window = end - start;
+        // While history loads, the partial data's left edge is not where collection began.
+        if (_isLoading || window <= TimeSpan.Zero || firstSample - start < TimeSpan.FromTicks(window.Ticks / 20))
+        {
+            HideCollectionStartMarker();
+            return;
+        }
+
+        if (_collectionStartLine is null || _collectionStartLabel is null)
+        {
+            _collectionStartLine = new Line
+            {
+                StrokeThickness = 1,
+                StrokeDashArray = new DoubleCollection { 2, 3 },
+                Opacity = 0.55,
+                IsHitTestVisible = false,
+            };
+            _collectionStartLabel = new TextBlock
+            {
+                FontSize = 10,
+                Opacity = 0.85,
+                IsHitTestVisible = false,
+            };
+            _fillLayer.Children.Add(_collectionStartLine);
+            _fillLayer.Children.Add(_collectionStartLabel);
+        }
+
+        var x = Project(new MetricPoint(firstSample, 0), LeftPadding, TopPadding, plotWidth, plotHeight, start, end, 1).X;
+        var muted = ResolveBrush("TextMutedBrush", "#90959D");
+        _collectionStartLine.Stroke = muted;
+        _collectionStartLine.X1 = _collectionStartLine.X2 = Math.Round(x) + 0.5;
+        _collectionStartLine.Y1 = TopPadding;
+        _collectionStartLine.Y2 = TopPadding + plotHeight;
+        _collectionStartLine.Visibility = Visibility.Visible;
+
+        _collectionStartLabel.Foreground = muted;
+        var firstLocal = firstSample.ToLocalTime().DateTime;
+        _collectionStartLabel.Text = $"Collecting since {(window >= TimeSpan.FromDays(1) || firstLocal.Date != DateTime.Today ? TimeLabels.DayAndTime(firstLocal) : TimeLabels.ShortTime(firstLocal))}";
+        // Visible before measuring: a collapsed element measures zero wide, which put the caption
+        // right of the line, over the data, whenever it had been hidden on the previous draw.
+        _collectionStartLabel.Visibility = Visibility.Visible;
+        _collectionStartLabel.Measure(new Windows.Foundation.Size(double.PositiveInfinity, double.PositiveInfinity));
+        var labelWidth = _collectionStartLabel.DesiredSize.Width;
+        // In the empty stretch it explains, left of the line. When that stretch is too narrow
+        // for it, the line stands alone: placed right of the line instead, the caption sat on
+        // top of the data.
+        var labelLeft = x - 6 - labelWidth;
+        if (labelLeft < LeftPadding)
+        {
+            _collectionStartLabel.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        Canvas.SetLeft(_collectionStartLabel, labelLeft);
+        Canvas.SetTop(_collectionStartLabel, TopPadding + 2);
+    }
+
+    private void HideCollectionStartMarker()
+    {
+        if (_collectionStartLine is not null)
+        {
+            _collectionStartLine.Visibility = Visibility.Collapsed;
+        }
+
+        if (_collectionStartLabel is not null)
+        {
+            _collectionStartLabel.Visibility = Visibility.Collapsed;
+        }
     }
 
     private SeriesVisual SeriesVisualAt(int index)
@@ -828,9 +1043,11 @@ public sealed class TelemetryChart : UserControl
                 continue;
             }
 
-            // Skip interior labels at narrow widths to prevent overlap
+            // Skip interior labels at narrow widths to prevent overlap. The room a label needs grows
+            // with the format: "Nov 1 8:53 PM" is nearly twice "15:47".
             var labelSpacing = plotWidth / divisions;
-            if (labelSpacing < 70 && index != 0 && index != divisions)
+            var labelRoom = Math.Max(70, (FormatTimeLabel(end, end - start).Length * 6) + 12);
+            if (labelSpacing < labelRoom && index != 0 && index != divisions)
             {
                 continue;
             }
@@ -839,7 +1056,11 @@ public sealed class TelemetryChart : UserControl
             var label = Pooled(_timeLabels, labelIndex++, _gridCanvas, () => CreateAxisLabel(10));
             label.Foreground = ResolveBrush("TextMutedBrush", "#7D9AB6");
             SetText(label, FormatTimeLabel(tick, end - start));
-            Canvas.SetLeft(label, Math.Clamp(x - 20, LeftPadding, width - 58));
+            // Centred on its tick and kept inside the chart, by its measured width: placing every
+            // label as if it were 40-58px wide clipped "Nov 1 8:53 PM" at the right edge.
+            label.Measure(new Windows.Foundation.Size(double.PositiveInfinity, double.PositiveInfinity));
+            var labelWidth = label.DesiredSize.Width;
+            Canvas.SetLeft(label, Math.Clamp(x - (labelWidth / 2), LeftPadding, Math.Max(LeftPadding, width - labelWidth - 2)));
             Canvas.SetTop(label, bottomY + 4);
         }
 
@@ -847,13 +1068,13 @@ public sealed class TelemetryChart : UserControl
         HideFrom(_timeLabels, labelIndex);
 
         _ceilingLabel ??= AddAxisLabel(10);
-        _midLabel ??= AddAxisLabel(10);
-        _floorLabel ??= AddAxisLabel(10);
+        _midLabel ??= AddValueLabel();
+        _floorLabel ??= AddValueLabel();
         if (!includeLabels)
         {
             _ceilingLabel.Visibility = Visibility.Collapsed;
-            _midLabel.Visibility = Visibility.Collapsed;
-            _floorLabel.Visibility = Visibility.Collapsed;
+            PlaceValueLabel(_midLabel, 0, 0, visible: false);
+            PlaceValueLabel(_floorLabel, 0, 0, visible: false);
             return;
         }
 
@@ -865,20 +1086,48 @@ public sealed class TelemetryChart : UserControl
 
         // Mid-point Y-axis label for context
         var showMid = maxValue > 0 && plotHeight >= 80;
-        _midLabel.Visibility = showMid ? Visibility.Visible : Visibility.Collapsed;
         if (showMid)
         {
             _midLabel.Foreground = ResolveBrush("TextMutedBrush", "#7D9AB6");
             SetText(_midLabel, FormatAxisValue(maxValue / 2d, Unit));
-            Canvas.SetLeft(_midLabel, LeftPadding);
-            Canvas.SetTop(_midLabel, TopPadding + (plotHeight / 2d) - 6);
         }
+
+        PlaceValueLabel(_midLabel, LeftPadding, TopPadding + (plotHeight / 2d) - 7, showMid);
 
         _floorLabel.Foreground = ResolveBrush("TextSecondaryBrush", "#A8C2DA");
         SetText(_floorLabel, FormatAxisValue(0d, Unit));
-        Canvas.SetLeft(_floorLabel, LeftPadding);
-        Canvas.SetTop(_floorLabel, bottomY - 15);
-        _floorLabel.Visibility = Visibility.Visible;
+        PlaceValueLabel(_floorLabel, LeftPadding, bottomY - 16, visible: true);
+    }
+
+    /// <summary>
+    /// A value label inside the plot, on a plate the plot's own colour, drawn above the data. On
+    /// the grid layer underneath, a line running through "1.1 GiB" or "0%" left it half legible.
+    /// </summary>
+    private TextBlock AddValueLabel()
+    {
+        var label = CreateAxisLabel(10);
+        _axisLabelCanvas.Children.Add(new Border
+        {
+            Child = label,
+            Padding = new Thickness(3, 0, 3, 1),
+            CornerRadius = new CornerRadius(3),
+            Background = ResolveBrush("SurfaceInsetBrush", "#091321"),
+            IsHitTestVisible = false,
+        });
+        return label;
+    }
+
+    private static void PlaceValueLabel(TextBlock label, double left, double top, bool visible)
+    {
+        if (label.Parent is not Border plate)
+        {
+            return;
+        }
+
+        // The plate's padding sits left of the text, so the digits keep their old position.
+        Canvas.SetLeft(plate, left - 3);
+        Canvas.SetTop(plate, top);
+        plate.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
     }
 
     private static TextBlock CreateAxisLabel(double fontSize, double opacity = 1d)
@@ -1100,6 +1349,43 @@ public sealed class TelemetryChart : UserControl
         return filtered;
     }
 
+    /// <summary>
+    /// The series cut at its outage breaks (<see cref="ChartSeriesViewModel.RunStarts"/>), each run
+    /// trimmed to [start, end]. Slices share the series' array, so this allocates no copies.
+    /// </summary>
+    private static List<IReadOnlyList<MetricPoint>> SplitIntoRuns(ChartSeriesViewModel series, DateTimeOffset start, DateTimeOffset end)
+    {
+        var runs = new List<IReadOnlyList<MetricPoint>>(series.RunStarts.Count + 1);
+        var points = series.Points;
+        var from = 0;
+        for (var run = 0; run <= series.RunStarts.Count; run++)
+        {
+            var to = run < series.RunStarts.Count ? Math.Clamp(series.RunStarts[run], from, points.Count) : points.Count;
+            var clipFrom = from;
+            while (clipFrom < to && points[clipFrom].Timestamp < start)
+            {
+                clipFrom++;
+            }
+
+            var clipTo = to;
+            while (clipTo > clipFrom && points[clipTo - 1].Timestamp > end)
+            {
+                clipTo--;
+            }
+
+            if (clipTo > clipFrom)
+            {
+                runs.Add(points is MetricPoint[] array
+                    ? new ArraySegment<MetricPoint>(array, clipFrom, clipTo - clipFrom)
+                    : points.Skip(clipFrom).Take(clipTo - clipFrom).ToArray());
+            }
+
+            from = to;
+        }
+
+        return runs;
+    }
+
     private static IReadOnlyList<Windows.Foundation.Point> NormalizeProjectedPoints(Windows.Foundation.Point[] source)
     {
         if (source.Length == 0)
@@ -1107,22 +1393,17 @@ public sealed class TelemetryChart : UserControl
             return source;
         }
 
-        var normalized = new List<Windows.Foundation.Point>(source.Length);
-        var active = source[0];
-        normalized.Add(active);
-
-        for (var index = 1; index < source.Length; index++)
+        var xs = new double[source.Length];
+        for (var index = 0; index < source.Length; index++)
         {
-            var point = source[index];
-            if (Math.Abs(point.X - active.X) < 0.8d)
-            {
-                active = point;
-                normalized[^1] = point;
-                continue;
-            }
+            xs[index] = source[index].X;
+        }
 
-            active = point;
-            normalized.Add(point);
+        var kept = SwissOlly.Core.Models.ChartPointReducer.CollapseByX(xs, 0.8d);
+        var normalized = new Windows.Foundation.Point[kept.Length];
+        for (var index = 0; index < kept.Length; index++)
+        {
+            normalized[index] = source[kept[index]];
         }
 
         return normalized;
@@ -1195,96 +1476,6 @@ public sealed class TelemetryChart : UserControl
             topPadding + plotHeight - (Math.Clamp(yRatio, 0d, 1d) * plotHeight));
     }
 
-    private static IReadOnlyList<IReadOnlyList<MetricPoint>> SplitAtGaps(
-        IReadOnlyList<MetricPoint> points)
-    {
-        if (points.Count <= 1)
-        {
-            return [points];
-        }
-
-        // Fast path: check if there are any gaps at all before allocating segment lists
-        var hasGap = false;
-        for (var i = 1; i < points.Count; i++)
-        {
-            if (IsGap(points, i))
-            {
-                hasGap = true;
-                break;
-            }
-        }
-
-        if (!hasGap)
-        {
-            return [points];
-        }
-
-        var segments = new List<IReadOnlyList<MetricPoint>>();
-        var segStart = 0;
-        for (var i = 1; i < points.Count; i++)
-        {
-            if (IsGap(points, i))
-            {
-                if (i > segStart)
-                {
-                    var segment = new MetricPoint[i - segStart];
-                    for (var j = 0; j < segment.Length; j++)
-                        segment[j] = points[segStart + j];
-                    segments.Add(segment);
-                }
-                segStart = i;
-            }
-        }
-
-        if (segStart < points.Count)
-        {
-            var segment = new MetricPoint[points.Count - segStart];
-            for (var j = 0; j < segment.Length; j++)
-                segment[j] = points[segStart + j];
-            segments.Add(segment);
-        }
-
-        return segments;
-    }
-
-    /// <summary>
-    /// True when the interval ending at <paramref name="index"/> is a real outage: more than 3x
-    /// the typical spacing on BOTH sides (and over 10s). It used to compare against one median
-    /// for the whole series, but a series is mixed-resolution right after launch - minute
-    /// averages from history, then live samples every scrape - so the live spacing set the
-    /// median and every history point read as its own gap, drawing the chart as scattered dots.
-    /// </summary>
-    private static bool IsGap(IReadOnlyList<MetricPoint> points, int index)
-    {
-        const double MinimumGapMs = 10_000d;
-        var intervalMs = (points[index].Timestamp - points[index - 1].Timestamp).TotalMilliseconds;
-        if (intervalMs <= MinimumGapMs)
-        {
-            return false;
-        }
-
-        var typicalMs = Math.Max(
-            NeighbourIntervalMaxMs(points, index, -1),
-            NeighbourIntervalMaxMs(points, index, +1));
-        return intervalMs > typicalMs * 3d;
-    }
-
-    /// <summary>
-    /// Largest of up to three intervals beside <paramref name="index"/> in one direction; 0 if none.
-    /// The largest, not the median: min/max-downsampled points alternate short (within a bucket)
-    /// and long (between buckets) intervals, and a median could land on a short one.
-    /// </summary>
-    private static double NeighbourIntervalMaxMs(IReadOnlyList<MetricPoint> points, int index, int direction)
-    {
-        var largest = 0d;
-        var seen = 0;
-        for (var k = index + direction; seen < 3 && k >= 1 && k < points.Count; k += direction, seen++)
-        {
-            largest = Math.Max(largest, (points[k].Timestamp - points[k - 1].Timestamp).TotalMilliseconds);
-        }
-
-        return largest;
-    }
 
     private static Brush ResolveBrush(string key, string fallbackHex) => ThemeVisuals.ResolveBrush(key, fallbackHex);
 
@@ -1323,37 +1514,32 @@ public sealed class TelemetryChart : UserControl
 
         if (window <= TimeSpan.FromMinutes(5))
         {
-            return local.ToString("HH:mm:ss");
+            return TimeLabels.LongTime(local);
         }
 
         if (window <= TimeSpan.FromHours(12) && isToday)
         {
-            return local.ToString("HH:mm");
-        }
-
-        if (window <= TimeSpan.FromHours(12))
-        {
-            // Data from a different day - show the date
-            return local.ToString("MMM d HH:mm");
+            return TimeLabels.ShortTime(local);
         }
 
         if (window <= TimeSpan.FromDays(2))
         {
-            return local.ToString("MMM d HH:mm");
+            // Spans or sits on another day: show which one.
+            return TimeLabels.DayAndTime(local);
         }
 
         if (window <= TimeSpan.FromDays(90))
         {
-            return local.ToString("MMM d");
+            return TimeLabels.ShortDay(local);
         }
 
-        return local.ToString("yyyy-MM-dd");
+        return local.ToString(System.Globalization.CultureInfo.CurrentCulture.DateTimeFormat.ShortDatePattern, System.Globalization.CultureInfo.CurrentCulture);
     }
 
     private static string FormatAxisValue(double value, MetricUnit unit) => unit switch
     {
         MetricUnit.Percent => $"{value:0.#}%",
-        MetricUnit.Celsius => $"{value:0.#} C",
+        MetricUnit.Celsius => $"{value:0.#} °C",
         MetricUnit.Gigabytes when value >= 1024d => $"{value / 1024d:0.0} TiB",
         MetricUnit.Gigabytes => $"{value:0.0} GiB",
         MetricUnit.MegabytesPerSecond => $"{value:0.0} MB/s",
@@ -1621,18 +1807,28 @@ public sealed class TelemetryChart : UserControl
         var builder = new StringBuilder();
         builder.AppendLine(FormatHoverTime(anchorTime.Value, end - start));
 
-        // Sort by value descending, show top 5 with clean formatting
+        // Highest first, as many lines as the chart is tall (up to five) so the tooltip always
+        // fits inside the plot, with long process names shortened rather than wrapped.
         lines.Sort((a, b) => b.Value.CompareTo(a.Value));
-        var visibleLines = Math.Min(lines.Count, 5);
+        const double LineHeight = 15d;
+        var linesThatFit = (int)Math.Floor((Math.Max(0d, ActualHeight - 26d) / LineHeight) - 1);
+        var maxLines = Math.Clamp(linesThatFit, 1, 5);
+        if (lines.Count > maxLines)
+        {
+            maxLines = Math.Max(1, maxLines - 1); // room for the "+N more" line
+        }
+
+        var visibleLines = Math.Min(lines.Count, maxLines);
         for (var i = 0; i < visibleLines; i++)
         {
             var line = lines[i];
-            builder.AppendLine($"\u25CF {line.Name}  {FormatAxisValue(line.Value, Unit)}");
+            var name = line.Name.Length > 24 ? $"{line.Name[..23]}\u2026" : line.Name;
+            builder.AppendLine($"\u25CF {name}  {FormatAxisValue(line.Value, Unit)}");
         }
 
-        if (lines.Count > 5)
+        if (lines.Count > visibleLines)
         {
-            builder.Append($"+{lines.Count - 5} more");
+            builder.Append($"+{lines.Count - visibleLines} more");
         }
 
         tooltip = builder.ToString().TrimEnd();
@@ -1686,7 +1882,7 @@ public sealed class TelemetryChart : UserControl
     private static string FormatHoverTime(DateTimeOffset timestamp, TimeSpan window)
     {
         // Always show full date + time in hover tooltips for maximum clarity
-        return timestamp.LocalDateTime.ToString("MMM d, yyyy  h:mm:ss tt");
+        return TimeLabels.Full(timestamp.LocalDateTime);
     }
 
     private void TryPinTooltip(double pointerX)
@@ -1722,7 +1918,8 @@ public sealed class TelemetryChart : UserControl
         var pinnedText = new TextBlock
         {
             FontSize = 10,
-            TextWrapping = TextWrapping.Wrap,
+            TextWrapping = TextWrapping.NoWrap,
+            TextTrimming = TextTrimming.CharacterEllipsis,
             Foreground = ResolveBrush("TextPrimaryBrush", "#F2F8FF"),
             MaxWidth = 200,
             Text = tooltip,

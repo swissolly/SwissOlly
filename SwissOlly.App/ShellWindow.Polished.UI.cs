@@ -1,5 +1,9 @@
+using System.Globalization;
+using Microsoft.UI.Dispatching;
 using Microsoft.UI.Text;
+using Microsoft.UI.Xaml.Automation;
 using Microsoft.UI.Xaml.Data;
+using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Media.Animation;
 using System.IO;
@@ -115,6 +119,11 @@ public sealed partial class ShellWindow
         root.Children.Add(_scrollHost);
         Grid.SetRow(_scrollHost, 2);
 
+        // Over the scroll host, so Apply floats above the page rather than scrolling with it.
+        var applyBar = BuildSettingsApplyBar();
+        root.Children.Add(applyBar);
+        Grid.SetRow(applyBar, 2);
+
         root.Loaded += OnRootLoaded;
         root.SizeChanged += OnRootLayoutSizeChanged;
         return root;
@@ -140,6 +149,27 @@ public sealed partial class ShellWindow
 
     private const double StatusColumnWidth = 320;
 
+    /// <summary>Brand, title and the Overview/Settings pill need about this much beside the status.</summary>
+    private const double HeaderFixedContentWidth = 470;
+
+    private ColumnDefinition? _statusColumn;
+
+    private void UpdateHeaderStatusWidth()
+    {
+        if (_statusColumn is null || _rootLayout.ActualWidth <= 0)
+        {
+            return;
+        }
+
+        var available = _rootLayout.ActualWidth - (PageGutter * 2) - HeaderFixedContentWidth;
+        var width = Math.Clamp(available, 0, StatusColumnWidth);
+        if (Math.Abs(_statusColumn.Width.Value - width) > 0.5)
+        {
+            _statusColumn.Width = new GridLength(width);
+            _statusText.MaxWidth = Math.Max(0, width - 20);
+        }
+    }
+
     private FrameworkElement BuildHeader()
     {
         StartupTrace.Write("BuildHeader // two-view-shell");
@@ -153,8 +183,10 @@ public sealed partial class ShellWindow
         heroGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         // Fixed, not Auto: the status line changes length constantly ("Applying theme", "Saving
         // settings", "Last sample ..."), and as an Auto column every change shoved the
-        // Overview/Settings pill sideways - the jitter seen when pressing Apply.
-        heroGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(StatusColumnWidth) });
+        // Overview/Settings pill sideways - the jitter seen when pressing Apply. Narrow windows
+        // shrink it (see UpdateHeaderStatusWidth) so it trims instead of running off the edge.
+        _statusColumn = new ColumnDefinition { Width = new GridLength(StatusColumnWidth) };
+        heroGrid.ColumnDefinitions.Add(_statusColumn);
         heroGrid.Children.Add(_brandHost);
 
         var titleText = new TextBlock
@@ -182,7 +214,8 @@ public sealed partial class ShellWindow
             Background = ResolveBrush("SurfaceBrush", "#1C1F22"),
             BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#2C3035"),
             BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(10),
+            // Concentric with the 8px chips it wraps.
+            CornerRadius = new CornerRadius(UiMetrics.Enclosing(UiMetrics.ControlRadius, 3)),
             Padding = new Thickness(3),
             VerticalAlignment = VerticalAlignment.Center,
             Child = new StackPanel
@@ -250,262 +283,345 @@ public sealed partial class ShellWindow
 
     private FrameworkElement BuildThemePicker()
     {
-        // All eight themes on one row when the section spans the full window (it does at the
-        // three-column breakpoint); four per row below that, where eight would not fit. On one
-        // row the choice reads as a single strip instead of a block filling a quarter of a card.
-        //
-        // Deliberately rows of StackPanels rather than a Grid with star-width columns: this
-        // picker is measured by a parent that offers infinite width, and star columns resolve to
-        // zero under an infinite constraint — which collapsed the entire settings view to a
-        // ~195px sliver. Content-sized panels measure correctly under any constraint.
-        var columns = DetermineSettingsColumns() >= 3 ? 8 : 4;
-        var modes = Enum.GetValues<ThemeMode>();
-        var options = new StackPanel { Spacing = PanelSpacing };
-        StackPanel? currentRow = null;
-
-        var slot = 0;
-        foreach (var mode in modes)
+        // Dark themes, then light, each a grid of previews. Both grids get the same width, so they
+        // pick the same column count and the light cards line up under the dark ones.
+        _themeCards.Clear();
+        var groups = new StackPanel { Spacing = 8 };
+        foreach (var (title, isLight) in new[] { ("Dark", false), ("Light", true) })
         {
-            if (slot % columns == 0)
+            var cards = new UniformWrapPanel
             {
-                currentRow = new StackPanel
-                {
-                    Orientation = Orientation.Horizontal,
-                    Spacing = PanelSpacing,
-                };
-                options.Children.Add(currentRow);
+                MinItemWidth = 150,
+                MaxColumns = 8,
+                ColumnSpacing = 10,
+                RowSpacing = 10,
+                Margin = new Thickness(0, 0, 0, isLight ? 0 : 8),
+                // One Tab stop per group; the arrow keys move between themes.
+                TabFocusNavigation = KeyboardNavigationMode.Once,
+                XYFocusKeyboardNavigation = XYFocusKeyboardNavigationMode.Enabled,
+            };
+            foreach (var theme in ThemeCatalog.All.Where(theme => theme.IsLight == isLight))
+            {
+                var card = new ThemePreviewCard(theme);
+                card.Click += OnThemeCardClick;
+                _themeCards[theme.Mode] = card;
+                _settingsBindings.Add(() => card.IsSelected = _draftThemeMode == theme.Mode);
+                cards.Children.Add(card);
             }
 
-            var swatchColors = GetThemeSwatch(mode);
-            var swatches = new StackPanel
-            {
-                Orientation = Orientation.Horizontal,
-                HorizontalAlignment = HorizontalAlignment.Center,
-                Spacing = 3,
-                Children =
-                {
-                    new Border { Width = 18, Height = 16, CornerRadius = new CornerRadius(3), Background = BrushFactory.CreateBrush(swatchColors[0]), BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#2C3035"), BorderThickness = new Thickness(0.6) },
-                    new Border { Width = 18, Height = 16, CornerRadius = new CornerRadius(3), Background = BrushFactory.CreateBrush(swatchColors[1]), BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#2C3035"), BorderThickness = new Thickness(0.6) },
-                    new Border { Width = 18, Height = 16, CornerRadius = new CornerRadius(3), Background = BrushFactory.CreateBrush(swatchColors[2]), BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#2C3035"), BorderThickness = new Thickness(0.6) },
-                },
-            };
-            var choice = new ActionChip
-            {
-                Text = GetThemeLabel(mode),
-                Tag = mode,
-                MinHeight = 36,
-                MinWidth = 104,
-                IsActive = _draftThemeMode == mode,
-                IsFilled = _draftThemeMode == mode,
-            };
-            choice.Click += OnThemeChoiceClick;
-            ToolTipService.SetToolTip(choice, $"Preview {GetThemeLabel(mode)} theme");
-
-            currentRow!.Children.Add(new StackPanel
-            {
-                Spacing = 6,
-                Children = { swatches, choice },
-            });
-            slot++;
+            groups.Children.Add(CreateFieldLabel(title));
+            groups.Children.Add(cards);
         }
 
-        return options;
+        return groups;
     }
 
-    private static string GetThemeLabel(ThemeMode mode) => mode switch
-    {
-        ThemeMode.Light => "Light",
-        ThemeMode.Midnight => "Midnight",
-        ThemeMode.Ember => "Ember",
-        ThemeMode.Forest => "Forest",
-        ThemeMode.Violet => "Violet",
-        ThemeMode.Nord => "Nord",
-        ThemeMode.Sandstone => "Sandstone",
-        _ => "Dark",
-    };
-
-    // Backdrop / card / accent, mirroring each palette in App.ApplyThemeResources so the
-    // swatch previews what the theme actually looks like.
-    private static string[] GetThemeSwatch(ThemeMode mode) => mode switch
-    {
-        ThemeMode.Light => ["#F2F3F5", "#FFFFFF", "#1769C2"],
-        ThemeMode.Midnight => ["#070B14", "#101728", "#5CC8F5"],
-        ThemeMode.Ember => ["#14100E", "#1F1915", "#F0A04B"],
-        ThemeMode.Forest => ["#0D120F", "#161D19", "#6FD8A4"],
-        ThemeMode.Violet => ["#110E16", "#1C1726", "#B18AF0"],
-        ThemeMode.Nord => ["#2E3440", "#3B4252", "#88C0D0"],
-        ThemeMode.Sandstone => ["#EDE9E3", "#FAF8F5", "#3F6B5C"],
-        _ => ["#111315", "#1C1F22", "#79B8FF"],
-    };
-
     /// <summary>Themes whose surfaces are light, so XAML controls need the Light base theme.</summary>
-    internal static bool IsLightTheme(ThemeMode mode)
-        => mode is ThemeMode.Light or ThemeMode.Sandstone;
+    internal static bool IsLightTheme(ThemeMode mode) => ThemeCatalog.Get(mode).IsLight;
 
+    // ── Settings page ──────────────────────────────────────────────────────
+
+    /// <summary>Updates for the Settings controls on screen, registered as the page is built.</summary>
+    private readonly List<Action> _settingsBindings = [];
+    private readonly Dictionary<ThemeMode, ThemePreviewCard> _themeCards = [];
+    private bool _refreshingSettingsDeck;
+    private ThemeMode? _refocusThemeCard;
+
+    /// <summary>
+    /// Builds the Settings page. Only a new theme or a new column count rebuilds it; every other
+    /// change goes through <see cref="RefreshSettingsDeck"/>.
+    /// </summary>
     private void RenderEditableControlDeck()
     {
         StartupTrace.Write("RenderEditableControlDeck // polished-v19");
-        _controlDeckEditableActive = true;
-
-        var scrapeBox = CreateDeckInlineEntry(
-            string.IsNullOrWhiteSpace(_draftScrapeIntervalInput) ? string.Empty : _draftScrapeIntervalInput,
-            "2");
-        scrapeBox.Width = 160;
-        scrapeBox.HorizontalAlignment = HorizontalAlignment.Left;
-        scrapeBox.TextChanged += OnScrapeInputChanged;
-
-        var retentionBox = CreateDeckInlineEntry(_draftRetentionInput, "24h");
-        retentionBox.Width = 160;
-        retentionBox.HorizontalAlignment = HorizontalAlignment.Left;
-        retentionBox.TextChanged += OnRetentionInputChanged;
-
-        var storageBox = CreateDeckInlineEntry(
-            string.IsNullOrWhiteSpace(_draftStorageDirectory) ? string.Empty : _draftStorageDirectory.Trim(),
-            SwissOllyConfig.DefaultStorageDirectory);
-        storageBox.TextChanged += OnStorageInputChanged;
-
-        var storageFieldStack = new StackPanel
-        {
-            Spacing = 8,
-            AllowDrop = true,
-            Children =
-            {
-                CreateFieldLabel("Storage directory"),
-                storageBox,
-                CreateMutedText("Leave blank for the default location.", 12),
-            },
-        };
-        storageFieldStack.DragOver += OnStoragePathDragOver;
-        storageFieldStack.Drop += OnStoragePathDrop;
-
-        var fieldGrid = new Grid
-        {
-            ColumnSpacing = PanelSpacing,
-            RowSpacing = PanelSpacing,
-        };
+        _settingsBindings.Clear();
         var settingsColumns = DetermineSettingsColumns();
         _lastSettingsColumnCount = settingsColumns;
-        for (var column = 0; column < settingsColumns; column++)
-        {
-            fieldGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        }
 
-        AddCardToGrid(fieldGrid, 0, 0, CreateControlEditorCard(
+        var themeCard = CreateControlEditorCard(
             "appearance",
-            "APPEARANCE",
-            GetThemeLabel(_draftThemeMode),
-            "Application appearance",
-            "#79DCE5",
-            BuildThemePicker()), columnSpan: settingsColumns);
+            "THEME",
+            () => ThemeCatalog.Get(_draftThemeMode).Label,
+            () => ThemeCatalog.Get(_draftThemeMode).Description,
+            BuildThemePicker());
 
-        AddCardToGrid(fieldGrid, 1, 0, CreateControlEditorCard(
+        var scrapeBox = CreateBoundEntry(
+            () => _draftScrapeIntervalInput, value => _draftScrapeIntervalInput = value, "2", "Sample every, in seconds");
+        scrapeBox.Width = 160;
+        scrapeBox.HorizontalAlignment = HorizontalAlignment.Left;
+        var collectionCard = CreateControlEditorCard(
             "collection",
             "COLLECTION",
-            FormatScrapeInterval(GetDraftScrapeIntervalSeconds()),
-            string.IsNullOrWhiteSpace(_draftScrapeIntervalInput) ? "Live default" : "Custom cadence",
-            "#5DE6FF",
+            () => FormatScrapeInterval(GetDraftScrapeIntervalSeconds()),
+            () => string.IsNullOrWhiteSpace(_draftScrapeIntervalInput) ? "Default" : "Custom interval",
             new StackPanel
             {
                 Spacing = 14,
                 Children =
                 {
-                    new StackPanel
-                    {
-                        Spacing = 8,
-                        Children =
-                        {
-                            CreateFieldLabel("Scrape interval (seconds)"),
-                            scrapeBox,
-                            CreateMutedText("1–60 seconds. Leave blank for the default 2s.", 12),
-                        },
-                    },
+                    CreateLabeledField("Sample every (seconds)", scrapeBox, "1–60 seconds. Leave blank for the default 2s."),
                     CreateChipWrapRow(
-                        CreatePresetChip("1s", GetDraftScrapeIntervalSeconds() == 1, (_, _) => SetScrapeInterval(1)),
-                        CreatePresetChip("2s", string.IsNullOrWhiteSpace(_draftScrapeIntervalInput), (_, _) => ResetScrapeInterval()),
-                        CreatePresetChip("5s", GetDraftScrapeIntervalSeconds() == 5, (_, _) => SetScrapeInterval(5)),
-                        CreatePresetChip("10s", GetDraftScrapeIntervalSeconds() == 10, (_, _) => SetScrapeInterval(10)),
-                        CreatePresetChip("15s", GetDraftScrapeIntervalSeconds() == 15, (_, _) => SetScrapeInterval(15))),
+                        CreateBoundChip("1s", () => IsDraftScrapeInterval(1), () => SetScrapeInterval(1)),
+                        CreateBoundChip("2s", () => IsDraftScrapeInterval(2), ResetScrapeInterval),
+                        CreateBoundChip("5s", () => IsDraftScrapeInterval(5), () => SetScrapeInterval(5)),
+                        CreateBoundChip("10s", () => IsDraftScrapeInterval(10), () => SetScrapeInterval(10)),
+                        CreateBoundChip("15s", () => IsDraftScrapeInterval(15), () => SetScrapeInterval(15))),
                 },
-            }));
+            });
 
-        AddCardToGrid(fieldGrid, 1 + (1 / settingsColumns), 1 % settingsColumns, CreateControlEditorCard(
+        var retentionBox = CreateBoundEntry(
+            () => _draftRetentionInput, value => _draftRetentionInput = value, "24h", "Keep history for");
+        retentionBox.Width = 160;
+        retentionBox.HorizontalAlignment = HorizontalAlignment.Left;
+        // Spelled out like the collection card's "2 seconds"; "1d" sat oddly above a field and a
+        // chip that both said 24h.
+        var retentionCard = CreateControlEditorCard(
             "retention",
             "RETENTION",
-            GetRetentionFieldValue(_draftRetentionInput),
-            string.IsNullOrWhiteSpace(_draftRetentionInput) ? "Compact local history" : "Custom retention active",
-            "#67B7FF",
+            () => SwissOllyConfig.TryParseRetentionWindow(_draftRetentionInput, out var draftRetentionWindow, out _)
+                ? FormatDuration(draftRetentionWindow)
+                : string.IsNullOrWhiteSpace(_draftRetentionInput)
+                    ? FormatDuration(TimeSpan.FromHours(SwissOllyConfig.DefaultMaxRetentionHours))
+                    : GetRetentionFieldValue(_draftRetentionInput),
+            () => string.IsNullOrWhiteSpace(_draftRetentionInput) ? "Default · older history is deleted" : "Older history is deleted",
             new StackPanel
             {
                 Spacing = 14,
                 Children =
                 {
-                    new StackPanel
-                    {
-                        Spacing = 8,
-                        Children =
-                        {
-                            CreateFieldLabel("Retention window"),
-                            retentionBox,
-                            CreateMutedText("Format: 30m, 24h, or 7d.", 12),
-                        },
-                    },
+                    CreateLabeledField("Keep history for", retentionBox, "Like 30m, 24h or 7d, up to 10 years."),
                     CreateChipWrapRow(
-                        CreatePresetChip("6h", GetDraftRetentionHours() == 6, (_, _) => SetRetentionInput("6h")),
-                        CreatePresetChip("12h", GetDraftRetentionHours() == 12, (_, _) => SetRetentionInput("12h")),
-                        CreatePresetChip("24h", GetDraftRetentionHours() == 24, (_, _) => ResetRetentionHours()),
-                        CreatePresetChip("7d", GetDraftRetentionHours() == 168, (_, _) => SetRetentionInput("7d")),
-                        CreatePresetChip("30d", GetDraftRetentionHours() == 720, (_, _) => SetRetentionInput("30d")),
-                        CreatePresetChip("90d", GetDraftRetentionHours() == 2160, (_, _) => SetRetentionInput("90d"))),
+                        CreateBoundChip("6h", () => IsDraftRetentionHours(6), () => SetRetentionInput("6h")),
+                        CreateBoundChip("12h", () => IsDraftRetentionHours(12), () => SetRetentionInput("12h")),
+                        CreateBoundChip("24h", () => IsDraftRetentionHours(24), ResetRetentionHours),
+                        CreateBoundChip("7d", () => IsDraftRetentionHours(168), () => SetRetentionInput("7d")),
+                        CreateBoundChip("30d", () => IsDraftRetentionHours(720), () => SetRetentionInput("30d")),
+                        CreateBoundChip("90d", () => IsDraftRetentionHours(2160), () => SetRetentionInput("90d")),
+                        CreateBoundChip("1y", () => IsDraftRetentionHours(8760), () => SetRetentionInput("365d"))),
                 },
-            }));
+            });
 
-        AddCardToGrid(fieldGrid, 1 + (2 / settingsColumns), 2 % settingsColumns, CreateControlEditorCard(
+        var storageBox = CreateBoundEntry(
+            () => _draftStorageDirectory, value => _draftStorageDirectory = value, SwissOllyConfig.DefaultStorageDirectory, "History folder");
+        var storageField = CreateLabeledField(
+            "Folder",
+            storageBox,
+            "Leave blank for the default location. A different folder starts its own history; nothing is moved.");
+        storageField.AllowDrop = true;
+        storageField.DragOver += OnStoragePathDragOver;
+        storageField.Drop += OnStoragePathDrop;
+        var storageCard = CreateControlEditorCard(
             "storage",
-            "STORAGE PATH",
-            GetStorageFieldTitle(_draftStorageDirectory),
-            "Stored locally by default",
-            "#6EE7C8",
+            "HISTORY FOLDER",
+            () => GetStorageFieldTitle(_draftStorageDirectory),
+            () => string.IsNullOrWhiteSpace(_draftStorageDirectory) ? "Kept on this PC, in your app data" : "Kept in the folder below",
             new StackPanel
             {
                 Spacing = 14,
                 Children =
                 {
-                    storageFieldStack,
+                    storageField,
                     CreateChipWrapRow(
                         CreateActionChip("Browse folder", OnBrowseStorageClick, filled: true),
                         CreateActionChip("Use default", (_, _) => ResetStorageDirectory())),
                 },
-            }));
+            });
 
-        // ── Row 1: full-width overlay card ────────────────────────────────
-        var overlayRow = 1 + ((3 + settingsColumns - 1) / settingsColumns);
-        AddCardToGrid(fieldGrid, overlayRow, 0, BuildOverlayEditorCard(), columnSpan: settingsColumns);
-
-        var actionRow = new Grid
+        // Cards flow left to right; the last one stretches across what is left of its row.
+        var dataGrid = new Grid { ColumnSpacing = PanelSpacing, RowSpacing = PanelSpacing };
+        for (var column = 0; column < settingsColumns; column++)
         {
-            ColumnSpacing = PanelSpacing,
-            VerticalAlignment = VerticalAlignment.Center,
-        };
-        actionRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        actionRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            dataGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        }
 
-        var actionChips = CreateChipRow(
-            CreateActionChip("Revert", OnCancelSettingsClick),
-            CreateActionChip("Apply", OnSaveSettingsClick, filled: true));
-        actionRow.Children.Add(actionChips);
-        Grid.SetColumn(actionChips, 1);
+        var dataCards = new[] { collectionCard, retentionCard, storageCard };
+        for (var index = 0; index < dataCards.Length; index++)
+        {
+            var column = index % settingsColumns;
+            var span = index == dataCards.Length - 1 ? settingsColumns - column : 1;
+            AddCardToGrid(dataGrid, index / settingsColumns, column, dataCards[index], columnSpan: span);
+        }
 
         StartupTrace.Write("RenderEditableControlDeck // assign host");
+        // Grouped by what the settings do, and each group says when its changes take effect: a
+        // theme or the window behaviour applies on click, the rest waits for Apply.
         _controlsBodyHost.Child = new StackPanel
         {
-            Spacing = 14,
+            Spacing = 12,
             Children =
             {
-                fieldGrid,
-                actionRow,
+                CreateSettingsSectionHeader("Appearance", "Applies as soon as you pick a theme"),
+                themeCard,
+                CreateSettingsSectionHeader("Data and history", "Saved when you press Apply"),
+                dataGrid,
+                CreateSettingsSectionHeader("In-game overlay", "Saved when you press Apply"),
+                BuildOverlayEditorCard(wide: settingsColumns >= 2),
+                CreateSettingsSectionHeader("Startup and closing", "Applies as soon as you choose"),
+                BuildWindowBehaviorCard(wide: settingsColumns >= 2),
             },
         };
+
+        RefreshSettingsDeck();
+        RestoreThemeCardFocus();
         StartupTrace.Write("RenderEditableControlDeck // complete");
+    }
+
+    /// <summary>
+    /// Pushes the drafts into the Settings controls already on screen: chip selections, headlines,
+    /// field text, the overlay preview. Every Settings click comes through here. Each click used to
+    /// rebuild the whole page instead, 80-130ms in a Debug build, which made the chips feel slow
+    /// and dropped hover and keyboard focus every time.
+    /// </summary>
+    private void RefreshSettingsDeck()
+    {
+        // Setting a field's text raises its TextChanged, which lands back here mid-pass.
+        if (_refreshingSettingsDeck)
+        {
+            return;
+        }
+
+        _refreshingSettingsDeck = true;
+        try
+        {
+            foreach (var binding in _settingsBindings)
+            {
+                binding();
+            }
+        }
+        finally
+        {
+            _refreshingSettingsDeck = false;
+        }
+
+        UpdateSettingsActionState();
+    }
+
+    /// <summary>A preset chip whose selection follows the drafts.</summary>
+    private ActionChip CreateBoundChip(string text, Func<bool> isSelected, Action select)
+    {
+        var chip = CreatePresetChip(text, isSelected(), (_, _) =>
+        {
+            select();
+            RefreshSettingsDeck();
+        });
+        _settingsBindings.Add(() => chip.IsActive = isSelected());
+        return chip;
+    }
+
+    private TextBlock BindText(TextBlock block, Func<string> text)
+    {
+        block.Text = text();
+        _settingsBindings.Add(() =>
+        {
+            var value = text();
+            if (!string.Equals(block.Text, value, StringComparison.Ordinal))
+            {
+                block.Text = value;
+            }
+        });
+        return block;
+    }
+
+    /// <summary>
+    /// A field showing its draft. Typing updates the draft (and the chips and headline with it); a
+    /// chip, Browse or Revert that changes the draft updates the field.
+    /// </summary>
+    private InlineTextEntry CreateBoundEntry(Func<string> draft, Action<string> setDraft, string placeholder, string accessibleLabel)
+    {
+        var entry = CreateDeckInlineEntry(draft(), placeholder);
+        entry.AccessibleLabel = accessibleLabel;
+        entry.TextChanged += (_, _) =>
+        {
+            setDraft(entry.Text);
+            RefreshSettingsDeck();
+        };
+        entry.Submitted += OnSettingsEntrySubmitted;
+        _settingsBindings.Add(() =>
+        {
+            var value = draft() ?? string.Empty;
+            if (!string.Equals(entry.Text, value, StringComparison.Ordinal))
+            {
+                entry.Text = value;
+            }
+        });
+        return entry;
+    }
+
+    private static StackPanel CreateLabeledField(string label, FrameworkElement field, string hint) =>
+        new()
+        {
+            Spacing = 8,
+            Children = { CreateFieldLabel(label), field, CreateMutedText(hint, 12) },
+        };
+
+    /// <summary>A Settings group title with, beside it, when that group's changes take effect.</summary>
+    private static Grid CreateSettingsSectionHeader(string title, string hint)
+    {
+        // Baseline-aligned like the Performance band on the overview: both trimmed to their
+        // baseline and bottom-aligned, so 20px and 12px text share one line. Larger than the card
+        // headlines below it (18px), which outranked their own section at 16px.
+        var titleText = CreatePrimaryText(title, 20, true);
+        titleText.TextLineBounds = TextLineBounds.TrimToBaseline;
+        titleText.VerticalAlignment = VerticalAlignment.Bottom;
+        var hintText = CreateMutedText(hint, 12);
+        hintText.TextLineBounds = TextLineBounds.TrimToBaseline;
+        hintText.VerticalAlignment = VerticalAlignment.Bottom;
+        hintText.TextWrapping = TextWrapping.NoWrap;
+        hintText.TextTrimming = TextTrimming.CharacterEllipsis;
+
+        var header = new Grid { ColumnSpacing = 12, Margin = new Thickness(2, 12, 0, 2) };
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        header.Children.Add(titleText);
+        header.Children.Add(hintText);
+        Grid.SetColumn(hintText, 1);
+        return header;
+    }
+
+    private bool IsDraftScrapeInterval(int seconds) =>
+        string.IsNullOrWhiteSpace(_draftScrapeIntervalInput)
+            ? seconds == SwissOllyConfig.DefaultScrapeIntervalSeconds
+            : int.TryParse(_draftScrapeIntervalInput.Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out var parsed) && parsed == seconds;
+
+    private bool IsDraftRetentionHours(int hours) =>
+        string.IsNullOrWhiteSpace(_draftRetentionInput)
+            ? hours == SwissOllyConfig.DefaultMaxRetentionHours
+            : MainViewModel.TryParseRetentionInput(_draftRetentionInput, out var parsed, out _) && parsed == hours;
+
+    /// <summary>
+    /// A theme rebuilds this page in the new palette. A keyboard user's focus moves to the same
+    /// theme's new card instead of dropping back to the window.
+    /// </summary>
+    private void RestoreThemeCardFocus()
+    {
+        if (_refocusThemeCard is not { } mode)
+        {
+            return;
+        }
+
+        _refocusThemeCard = null;
+        if (_themeCards.TryGetValue(mode, out var card))
+        {
+            _ = _uiQueue.TryEnqueue(DispatcherQueuePriority.Low, () => card.Focus(FocusState.Keyboard));
+        }
+    }
+
+    private void OnThemeCardClick(object? sender, EventArgs e)
+    {
+        if (sender is not ThemePreviewCard card || card.Theme.Mode == _draftThemeMode)
+        {
+            return;
+        }
+
+        // A theme has nothing to validate, so it applies and saves on click. As a draft it
+        // looked applied, then silently reverted on the next launch unless you also found Apply.
+        var mode = card.Theme.Mode;
+        _draftThemeMode = mode;
+        _viewModel.SelectedTheme = mode;
+        RefreshSettingsDeck();
+        _refocusThemeCard = card.FocusState == FocusState.Keyboard ? mode : null;
+        App.CurrentApp.ApplyTheme(mode);
+        DebouncePersistLayout();
     }
 
     private UIElement BuildSummarySurface()
@@ -614,12 +730,13 @@ public sealed partial class ShellWindow
         return border;
     }
 
-    private static StackPanel CreateChipWrapRow(params ActionChip[] chips)
+    /// <summary>A row of chips that wraps onto a second line in a narrow card instead of clipping.</summary>
+    private static FlowPanel CreateChipWrapRow(params ActionChip[] chips)
     {
-        var row = new StackPanel
+        var row = new FlowPanel
         {
-            Orientation = Orientation.Horizontal,
             Spacing = 8,
+            RowSpacing = 8,
         };
 
         foreach (var chip in chips)
@@ -659,10 +776,11 @@ public sealed partial class ShellWindow
 
     private static ActionChip CreatePresetChip(string text, bool isActive, EventHandler onClick)
     {
-        var chip = CreateActionChip(text, onClick, isActive);
+        // Selection is IsActive alone. Passing it as "filled" too, as this once did, left the
+        // first selection lit for good once chips updated in place instead of being rebuilt: two
+        // chips in one group showed as chosen.
+        var chip = CreateActionChip(text, onClick);
         chip.IsActive = isActive;
-        // Width must not depend on selection. CreateActionChip widens filled chips for primary
-        // buttons, so a preset grew 60px the moment it was chosen and shoved its row sideways.
         chip.MinWidth = 44;
         return chip;
     }
@@ -742,7 +860,6 @@ public sealed partial class ShellWindow
         var chip = CreateActionChip(text, OnGlobalWindowRangeClick);
         chip.Tag = minutes;
         chip.MinWidth = 48;
-        chip.MinHeight = 0;
         return chip;
     }
 
@@ -826,17 +943,24 @@ public sealed partial class ShellWindow
         var boardTitle = CreatePrimaryText("Performance", 18, true);
         boardTitle.VerticalAlignment = VerticalAlignment.Bottom;
         boardTitle.TextLineBounds = TextLineBounds.TrimToBaseline;
-        grid.Children.Add(new StackPanel
+        // A grid, not a horizontal StackPanel: a StackPanel measures its children at infinite
+        // width, so the hint never trimmed and ran underneath the range and layout buttons on a
+        // narrow window. In a star column it ellipsizes, and the full text is in the tooltip.
+        var titleRow = new Grid
         {
-            Orientation = Orientation.Horizontal,
-            Spacing = 16,
+            ColumnSpacing = 16,
+            Margin = new Thickness(0, 0, 12, 0),
             VerticalAlignment = VerticalAlignment.Center,
-            Children =
-            {
-                boardTitle,
-                _editModeHint,
-            },
-        });
+        };
+        titleRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        titleRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        titleRow.Children.Add(boardTitle);
+        titleRow.Children.Add(_editModeHint);
+        Grid.SetColumn(_editModeHint, 1);
+        _editModeHint.IsTextTrimmedChanged += (sender, _) =>
+            ToolTipService.SetToolTip(sender, sender.IsTextTrimmed ? sender.Text : null);
+        _editModeHint.IsHitTestVisible = true;
+        grid.Children.Add(titleRow);
 
         // Edit/Done is the trailing control so the mode toggle never moves: Done appears exactly
         // where Edit was, with Cancel beside it.
@@ -879,11 +1003,12 @@ public sealed partial class ShellWindow
         };
     }
 
-    private static Border CreateControlEditorCard(string iconKey, string eyebrow, string headline, string caption, string accentHex, FrameworkElement body)
+    /// <summary>A Settings card: icon, eyebrow, a headline and caption that follow the drafts, then its controls.</summary>
+    private Border CreateControlEditorCard(string iconKey, string eyebrow, Func<string> headline, Func<string> caption, FrameworkElement body)
     {
-        // The palette accent, not the per-card hex: those were legacy cyans that ignored the
-        // theme, so Ember, Violet and Sandstone still showed cyan icons in Settings.
-        var accentBrush = ResolveBrush("AccentBrush", accentHex);
+        // The palette accent: per-card hexes were legacy cyans that ignored the theme, so Ember,
+        // Violet and Sandstone still showed cyan icons in Settings.
+        var accentBrush = ResolveBrush("AccentBrush", "#79B8FF");
         var token = IconFactory.CreateTile(iconKey, accentBrush, 40, 16);
 
         var headerGrid = new Grid
@@ -901,7 +1026,7 @@ public sealed partial class ShellWindow
             Children =
             {
                 CreateLabelText(eyebrow, 11),
-                CreatePrimaryText(headline, 18, true),
+                BindText(CreatePrimaryText(string.Empty, 18, true), headline),
             },
         };
         headerGrid.Children.Add(labelStack);
@@ -913,7 +1038,7 @@ public sealed partial class ShellWindow
         contentStack.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
 
         contentStack.Children.Add(headerGrid);
-        var captionText = CreateSecondaryText(caption, 11);
+        var captionText = BindText(CreateSecondaryText(string.Empty, 11), caption);
         captionText.Margin = new Thickness(0, 12, 0, 0);
         contentStack.Children.Add(captionText);
         Grid.SetRow(captionText, 1);
@@ -931,7 +1056,7 @@ public sealed partial class ShellWindow
         {
             Background = ResolveBrush("SurfaceBrush", "#1C1F22"),
             BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E"),
-            BorderThickness = new Thickness(0.9),
+            BorderThickness = new Thickness(UiMetrics.Hairline),
             CornerRadius = new CornerRadius(8),
             Padding = new Thickness(16),
             VerticalAlignment = VerticalAlignment.Stretch,
@@ -944,7 +1069,7 @@ public sealed partial class ShellWindow
         {
             Background = ResolveBrush("PanelOverlayBrush", "#091321"),
             BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#2A4662"),
-            BorderThickness = new Thickness(0.8),
+            BorderThickness = new Thickness(UiMetrics.Hairline),
             CornerRadius = new CornerRadius(8),
             Padding = new Thickness(16, 10, 16, 10),
             Child = new Grid
@@ -965,10 +1090,10 @@ public sealed partial class ShellWindow
             CornerRadius = new CornerRadius(12),
             Background = ResolveBrush("SurfaceInsetBrush", "#091321"),
             BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#315274"),
-            BorderThickness = new Thickness(0.9),
+            BorderThickness = new Thickness(UiMetrics.Hairline),
         };
 
-        var imagePath = System.IO.Path.Combine(AppContext.BaseDirectory, "Assets", "swissolly.png");
+        var imagePath = System.IO.Path.Combine(AppContext.BaseDirectory, "Assets", "swissolly-256.png");
         if (!File.Exists(imagePath))
         {
             host.Child = new Grid
@@ -977,7 +1102,7 @@ public sealed partial class ShellWindow
                 {
                     new TextBlock
                     {
-                        Text = "V",
+                        Text = "S",
                         FontFamily = new FontFamily("Segoe UI Variable Display"),
                         FontSize = 15,
                         FontWeight = FontWeights.SemiBold,
@@ -1019,7 +1144,7 @@ public sealed partial class ShellWindow
         {
             Background = ResolveBrush("SurfaceInsetBrush", "#091321"),
             BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E"),
-            BorderThickness = new Thickness(0.9),
+            BorderThickness = new Thickness(UiMetrics.Hairline),
             CornerRadius = new CornerRadius(8),
             Padding = new Thickness(14, 12, 14, 12),
             Child = new StackPanel
@@ -1087,272 +1212,543 @@ public sealed partial class ShellWindow
 
     private static Color ParseColor(string hex) => ThemeVisuals.ParseColor(hex);
 
-    // ── Overlay card helpers ───────────────────────────────────────────────
-
-    private Border BuildOverlayEditorCard()
+    /// <summary>
+    /// Start with Windows and what closing the window does. Both apply on click, like the theme:
+    /// there is nothing to validate, and a draft here would only look applied.
+    /// </summary>
+    private Border BuildWindowBehaviorCard(bool wide)
     {
-        // Row 1: enable toggle + mode segmented chips
-        var enableChips = CreateChipWrapRow(
-            CreatePresetChip("Off", !_draftOverlayEnabled,
-                (_, _) => { _draftOverlayEnabled = false; QueueEditableControlDeckRender(); }),
-            CreatePresetChip("On", _draftOverlayEnabled,
-                (_, _) => { _draftOverlayEnabled = true; QueueEditableControlDeckRender(); }));
-
-        var modeChips = CreateChipWrapRow(
-            CreatePresetChip("Simple", _draftOverlayMode == OverlayMode.Simple,
-                (_, _) => { _draftOverlayMode = OverlayMode.Simple; QueueEditableControlDeckRender(); }),
-            CreatePresetChip("Advanced", _draftOverlayMode == OverlayMode.Advanced,
-                (_, _) => { _draftOverlayMode = OverlayMode.Advanced; QueueEditableControlDeckRender(); }),
-            CreatePresetChip("Custom", _draftOverlayMode == OverlayMode.Custom,
-                (_, _) => { _draftOverlayMode = OverlayMode.Custom; QueueEditableControlDeckRender(); }));
-
-        var row1 = new StackPanel
+        var startupGroup = new StackPanel
         {
-            Spacing = 10,
+            Spacing = 8,
             Children =
             {
-                new StackPanel
-                {
-                    Orientation = Orientation.Horizontal,
-                    Spacing = 16,
-                    Children = { enableChips, modeChips },
-                },
-                CreateMutedText("Simple: FPS only  ·  Advanced: all five metrics  ·  Custom: pick your own", 11),
+                CreateFieldLabel("Start with Windows"),
+                CreateChipWrapRow(
+                    CreateBoundChip("Off", () => !_viewModel.LaunchOnStartup, () => SetStartWithWindows(false)),
+                    CreateBoundChip("On", () => _viewModel.LaunchOnStartup, () => SetStartWithWindows(true))),
+                BindText(CreateMutedText(string.Empty, 12), () => _viewModel.MinimizeToTray
+                    ? "When on, SwissOlly starts in the notification area as you sign in."
+                    : "When on, SwissOlly opens as you sign in."),
             },
         };
 
-        // Row 2: custom metric picker (only when mode = Custom)
-        var contentStack = new StackPanel { Spacing = 14, Children = { row1 } };
-
-        if (_draftOverlayMode == OverlayMode.Custom)
+        var closeGroup = new StackPanel
         {
-            var allMetrics = new[] { ("fps", "FPS"), ("cpu", "CPU%"), ("gpu", "GPU%"), ("gpu-temp", "GPU temp"), ("memory", "Memory%") };
-            var metricChips = allMetrics.Select(kv =>
+            Spacing = 8,
+            Children =
             {
-                var key = kv.Item1;
-                var isActive = _draftOverlayCustomMetrics.Contains(key, StringComparer.OrdinalIgnoreCase);
-                return CreatePresetChip(kv.Item2, isActive, (_, _) =>
-                {
-                    if (_draftOverlayCustomMetrics.Contains(key, StringComparer.OrdinalIgnoreCase))
-                        _draftOverlayCustomMetrics.Remove(key);
-                    else
-                        _draftOverlayCustomMetrics.Add(key);
-                    QueueEditableControlDeckRender();
-                });
-            }).ToArray();
+                CreateFieldLabel("When you close the window"),
+                CreateChipWrapRow(
+                    CreateBoundChip("Keep running", () => _viewModel.MinimizeToTray, () => SetKeepRunningInTray(true)),
+                    CreateBoundChip("Exit", () => !_viewModel.MinimizeToTray, () => SetKeepRunningInTray(false))),
+                BindText(CreateMutedText(string.Empty, 12), () => _viewModel.MinimizeToTray
+                    ? "Keeps recording history from the notification area."
+                    : "History stops recording until you open SwissOlly again."),
+            },
+        };
 
-            contentStack.Children.Add(new StackPanel
-            {
-                Spacing = 8,
-                Children =
-                {
-                    CreateChipWrapRow(metricChips),
-                    CreateMutedText("Pick at least one. Order in overlay matches order shown here.", 11),
-                },
-            });
+        FrameworkElement body;
+        if (wide)
+        {
+            var grid = new Grid { ColumnSpacing = 32 };
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            grid.Children.Add(startupGroup);
+            grid.Children.Add(closeGroup);
+            Grid.SetColumn(closeGroup, 1);
+            body = grid;
+        }
+        else
+        {
+            body = new StackPanel { Spacing = 14, Children = { startupGroup, closeGroup } };
         }
 
-        // Row 3: corner + color
-        var swatchFill = new Border
-        {
-            Width = 20,
-            Height = 20,
-            CornerRadius = new CornerRadius(10),
-            Background = new SolidColorBrush(ParseColor(_draftOverlayColor)),
-            VerticalAlignment = VerticalAlignment.Center,
-        };
-        var hexLabel = new TextBlock
-        {
-            Text = _draftOverlayColor.ToUpperInvariant(),
-            FontSize = 12,
-            VerticalAlignment = VerticalAlignment.Center,
-            Foreground = ResolveBrush("TextSecondaryBrush", "#B7CCE1"),
-            FontFamily = new FontFamily("Cascadia Code, Consolas, Courier New"),
-        };
-        var colorPicker = new ColorPicker
-        {
-            ColorSpectrumShape = ColorSpectrumShape.Ring,
-            IsAlphaEnabled = false,
-            IsHexInputVisible = true,
-            IsColorPreviewVisible = true,
-            IsColorSliderVisible = true,
-            Color = ParseColor(_draftOverlayColor),
-        };
-        colorPicker.ColorChanged += (_, e) =>
-        {
-            _draftOverlayColor = $"#{e.NewColor.R:X2}{e.NewColor.G:X2}{e.NewColor.B:X2}";
-            swatchFill.Background = new SolidColorBrush(e.NewColor);
-            hexLabel.Text = _draftOverlayColor.ToUpperInvariant();
-        };
-        var swatchButton = new Button
-        {
-            Padding = new Thickness(8, 6, 8, 6),
-            CornerRadius = new CornerRadius(8),
-            Flyout = new Flyout { Content = colorPicker },
-            Content = new StackPanel
-            {
-                Orientation = Orientation.Horizontal,
-                Spacing = 8,
-                VerticalAlignment = VerticalAlignment.Center,
-                Children = { swatchFill, hexLabel },
-            },
-        };
-
-        var presetRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
-        foreach (var presetHex in OverlayColorPresets)
-        {
-            var presetColor = ParseColor(presetHex);
-            var presetButton = new Button
-            {
-                Width = 22,
-                Height = 22,
-                Padding = new Thickness(0),
-                CornerRadius = new CornerRadius(11),
-                Background = new SolidColorBrush(presetColor),
-                BorderThickness = new Thickness(1),
-                BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E"),
-            };
-            presetButton.Click += (_, _) =>
-            {
-                _draftOverlayColor = presetHex;
-                swatchFill.Background = new SolidColorBrush(presetColor);
-                hexLabel.Text = presetHex.ToUpperInvariant();
-                colorPicker.Color = presetColor;
-            };
-            presetRow.Children.Add(presetButton);
-        }
-
-        var cornerChips = CreateChipWrapRow(
-            CreatePresetChip("↖ TL", _draftOverlayCorner == OverlayCorner.TopLeft,
-                (_, _) => { _draftOverlayCorner = OverlayCorner.TopLeft; QueueEditableControlDeckRender(); }),
-            CreatePresetChip("↗ TR", _draftOverlayCorner == OverlayCorner.TopRight,
-                (_, _) => { _draftOverlayCorner = OverlayCorner.TopRight; QueueEditableControlDeckRender(); }),
-            CreatePresetChip("↙ BL", _draftOverlayCorner == OverlayCorner.BottomLeft,
-                (_, _) => { _draftOverlayCorner = OverlayCorner.BottomLeft; QueueEditableControlDeckRender(); }),
-            CreatePresetChip("↘ BR", _draftOverlayCorner == OverlayCorner.BottomRight,
-                (_, _) => { _draftOverlayCorner = OverlayCorner.BottomRight; QueueEditableControlDeckRender(); }));
-
-        var row3Grid = new Grid { ColumnSpacing = PanelSpacing };
-        row3Grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        row3Grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-
-        var cornerStack = new StackPanel { Spacing = 8, Children = { CreateFieldLabel("Position"), cornerChips } };
-        row3Grid.Children.Add(cornerStack);
-
-        var colorStack = new StackPanel { Spacing = 8, Children = { CreateFieldLabel("Text color"), swatchButton, presetRow } };
-        row3Grid.Children.Add(colorStack);
-        Grid.SetColumn(colorStack, 1);
-
-        contentStack.Children.Add(row3Grid);
-
-        // Row 4: font size + opacity
-        var fontBox = CreateDeckInlineEntry(_draftOverlayFontSize, "14");
-        fontBox.Width = 120;
-        fontBox.HorizontalAlignment = HorizontalAlignment.Left;
-        fontBox.TextChanged += (_, _) => { _draftOverlayFontSize = fontBox.Text; };
-
-        var opacityBox = CreateDeckInlineEntry(_draftOverlayOpacity, "90");
-        opacityBox.Width = 120;
-        opacityBox.HorizontalAlignment = HorizontalAlignment.Left;
-        opacityBox.TextChanged += (_, _) => { _draftOverlayOpacity = opacityBox.Text; };
-
-        var row4Grid = new Grid { ColumnSpacing = PanelSpacing };
-        row4Grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        row4Grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-
-        var fontStack = new StackPanel
-        {
-            Spacing = 8,
-            Children =
-            {
-                CreateFieldLabel("Font size (px)"),
-                fontBox,
-                CreateChipWrapRow(
-                    CreatePresetChip("12", _draftOverlayFontSize == "12", (_, _) => { _draftOverlayFontSize = "12"; QueueEditableControlDeckRender(); }),
-                    CreatePresetChip("14", _draftOverlayFontSize == "14", (_, _) => { _draftOverlayFontSize = "14"; QueueEditableControlDeckRender(); }),
-                    CreatePresetChip("16", _draftOverlayFontSize == "16", (_, _) => { _draftOverlayFontSize = "16"; QueueEditableControlDeckRender(); }),
-                    CreatePresetChip("20", _draftOverlayFontSize == "20", (_, _) => { _draftOverlayFontSize = "20"; QueueEditableControlDeckRender(); })),
-            },
-        };
-        row4Grid.Children.Add(fontStack);
-
-        var opacityStack = new StackPanel
-        {
-            Spacing = 8,
-            Children =
-            {
-                CreateFieldLabel("Opacity (%)"),
-                opacityBox,
-                CreateChipWrapRow(
-                    CreatePresetChip("60%", _draftOverlayOpacity == "60", (_, _) => { _draftOverlayOpacity = "60"; QueueEditableControlDeckRender(); }),
-                    CreatePresetChip("75%", _draftOverlayOpacity == "75", (_, _) => { _draftOverlayOpacity = "75"; QueueEditableControlDeckRender(); }),
-                    CreatePresetChip("90%", _draftOverlayOpacity == "90", (_, _) => { _draftOverlayOpacity = "90"; QueueEditableControlDeckRender(); }),
-                    CreatePresetChip("100%", _draftOverlayOpacity == "100", (_, _) => { _draftOverlayOpacity = "100"; QueueEditableControlDeckRender(); })),
-            },
-        };
-        row4Grid.Children.Add(opacityStack);
-        Grid.SetColumn(opacityStack, 1);
-
-        contentStack.Children.Add(row4Grid);
-
-        // Row 5: hotkey
-        var hotkeyBox = CreateDeckInlineEntry(_draftOverlayHotkey, "Ctrl+Shift+F11");
-        hotkeyBox.Width = 280;
-        hotkeyBox.HorizontalAlignment = HorizontalAlignment.Left;
-        hotkeyBox.TextChanged += (_, _) => { _draftOverlayHotkey = hotkeyBox.Text; };
-
-        var hotkeyRow = new Grid { ColumnSpacing = 12 };
-        hotkeyRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        hotkeyRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-
-        var hotkeyStack = new StackPanel
-        {
-            Spacing = 8,
-            Children =
-            {
-                CreateFieldLabel("Toggle hotkey"),
-                hotkeyBox,
-                CreateMutedText("Modifiers: Ctrl, Alt, Shift, Win  ·  Key: letter, F1–F24. Default: Ctrl+Shift+F11", 11),
-            },
-        };
-        hotkeyRow.Children.Add(hotkeyStack);
-
-        var resetChip = CreateActionChip("Reset", (_, _) => { _draftOverlayHotkey = "Ctrl+Shift+F11"; QueueEditableControlDeckRender(); });
-        resetChip.VerticalAlignment = VerticalAlignment.Bottom;
-        hotkeyRow.Children.Add(resetChip);
-        Grid.SetColumn(resetChip, 1);
-
-        contentStack.Children.Add(hotkeyRow);
-
-        var summaryValue = _draftOverlayEnabled
-            ? _draftOverlayMode switch
-            {
-                OverlayMode.Simple => "FPS",
-                OverlayMode.Advanced => "FPS + 4 metrics",
-                OverlayMode.Custom => $"{_draftOverlayCustomMetrics.Count} of 5",
-                _ => "On",
-            }
-            : "Off";
-
-        var caption = _draftOverlayEnabled ? "Active when game has focus" : "In-game telemetry";
-
-        return CreateControlEditorCard("overlay", "OVERLAY", summaryValue, caption, "#7CE38B", contentStack);
+        return CreateControlEditorCard(
+            "window",
+            "WINDOW",
+            () => _viewModel.LaunchOnStartup ? "Starts with Windows" : "Starts when you open it",
+            () => _viewModel.MinimizeToTray ? "Closing keeps it running in the tray" : "Closing exits SwissOlly",
+            body);
     }
 
-    private static Border CreateColorSwatch(string hex)
-    {
-        Color swatchColor;
-        try { swatchColor = ParseColor(hex); }
-        catch { swatchColor = ParseColor("#66E7FF"); }
+    // ── Overlay card ───────────────────────────────────────────────────────
 
-        return new Border
+    private const string DefaultOverlayHotkey = "Ctrl+Shift+F11";
+    private const string DefaultOverlayColor = "#66E7FF";
+
+    /// <summary>The overlay's metrics in the order it draws them.</summary>
+    private static readonly (string Key, string Chip, string Label, string Sample)[] OverlayMetricChoices =
+    [
+        ("fps", "FPS", "FPS", "144"),
+        ("cpu", "CPU %", "CPU", "23%"),
+        // Over the 90% line on purpose: the preview shows the red a hot reading turns.
+        ("gpu", "GPU %", "GPU", "92%"),
+        ("gpu-temp", "GPU temp", "GPU Temp", "62°C"),
+        ("memory", "Memory %", "MEM", "48%"),
+    ];
+
+    private static readonly (string Name, string Hex)[] OverlayClassicColors =
+    [
+        ("Ice", DefaultOverlayColor),
+        ("Mint", "#7CE38B"),
+        ("Amber", "#F5B54A"),
+        ("Coral", "#FF6B6B"),
+        ("Lavender", "#B9A3FF"),
+        ("White", "#FFFFFF"),
+    ];
+
+    /// <summary>Fully saturated colours that stay readable over bright, busy game scenes.</summary>
+    private static readonly (string Name, string Hex)[] OverlayNeonColors =
+    [
+        ("Neon cyan", "#00F0FF"),
+        ("Electric blue", "#2F7BFF"),
+        ("Ultraviolet", "#9D4DFF"),
+        ("Neon magenta", "#FF2BD6"),
+        ("Hot pink", "#FF3B8D"),
+        ("Neon red", "#FF2D4A"),
+        ("Neon orange", "#FF7B1C"),
+        ("Laser yellow", "#FFF01F"),
+        ("Electric lime", "#BFFF00"),
+        ("Neon green", "#39FF14"),
+    ];
+
+    /// <summary>
+    /// What the overlay shows at the top; where it sits and how big it is on the left; how it
+    /// looks on the right, beside a live preview of the overlay over a stand-in game scene.
+    /// </summary>
+    private Border BuildOverlayEditorCard(bool wide)
+    {
+        var showGroup = CreateSettingGroup("Overlay", CreateChipWrapRow(
+            CreateBoundChip("Off", () => !_draftOverlayEnabled, () => _draftOverlayEnabled = false),
+            CreateBoundChip("On", () => _draftOverlayEnabled, () => _draftOverlayEnabled = true)));
+
+        var contentGroup = CreateSettingGroup("Shows", CreateChipWrapRow(
+            CreateBoundChip("FPS only", () => _draftOverlayMode == OverlayMode.Simple, () => _draftOverlayMode = OverlayMode.Simple),
+            CreateBoundChip("All metrics", () => _draftOverlayMode == OverlayMode.Advanced, () => _draftOverlayMode = OverlayMode.Advanced),
+            CreateBoundChip("Custom", () => _draftOverlayMode == OverlayMode.Custom, () => _draftOverlayMode = OverlayMode.Custom)));
+
+        var metricsGroup = CreateSettingGroup(
+            "Metrics",
+            CreateChipWrapRow([.. OverlayMetricChoices.Select(choice => CreateBoundChip(
+                choice.Chip,
+                () => _draftOverlayCustomMetrics.Contains(choice.Key, StringComparer.OrdinalIgnoreCase),
+                () => ToggleOverlayMetric(choice.Key)))]),
+            "Pick at least one. The overlay lists them in this order.");
+        _settingsBindings.Add(() => metricsGroup.Visibility =
+            _draftOverlayMode == OverlayMode.Custom ? Visibility.Visible : Visibility.Collapsed);
+
+        var positionGroup = CreateSettingGroup("Position", CreateChipWrapRow(
+            CreateBoundChip("Top left", () => _draftOverlayCorner == OverlayCorner.TopLeft, () => _draftOverlayCorner = OverlayCorner.TopLeft),
+            CreateBoundChip("Top right", () => _draftOverlayCorner == OverlayCorner.TopRight, () => _draftOverlayCorner = OverlayCorner.TopRight),
+            CreateBoundChip("Bottom left", () => _draftOverlayCorner == OverlayCorner.BottomLeft, () => _draftOverlayCorner = OverlayCorner.BottomLeft),
+            CreateBoundChip("Bottom right", () => _draftOverlayCorner == OverlayCorner.BottomRight, () => _draftOverlayCorner = OverlayCorner.BottomRight)));
+
+        var fontBox = CreateBoundEntry(() => _draftOverlayFontSize, value => _draftOverlayFontSize = value, "14", "Overlay text size in pixels");
+        fontBox.Width = 120;
+        fontBox.HorizontalAlignment = HorizontalAlignment.Left;
+        var sizeGroup = CreateSettingGroup("Text size (10–32 px)", fontBox, CreateChipWrapRow(
+            CreateBoundChip("12", () => IsDraftText(_draftOverlayFontSize, "12"), () => _draftOverlayFontSize = "12"),
+            CreateBoundChip("14", () => IsDraftText(_draftOverlayFontSize, "14"), () => _draftOverlayFontSize = "14"),
+            CreateBoundChip("16", () => IsDraftText(_draftOverlayFontSize, "16"), () => _draftOverlayFontSize = "16"),
+            CreateBoundChip("20", () => IsDraftText(_draftOverlayFontSize, "20"), () => _draftOverlayFontSize = "20")));
+
+        var opacityBox = CreateBoundEntry(() => _draftOverlayOpacity, value => _draftOverlayOpacity = value, "90", "Overlay opacity in percent");
+        opacityBox.Width = 120;
+        opacityBox.HorizontalAlignment = HorizontalAlignment.Left;
+        var opacityGroup = CreateSettingGroup("Opacity (30–100%)", opacityBox, CreateChipWrapRow(
+            CreateBoundChip("60%", () => IsDraftText(_draftOverlayOpacity, "60"), () => _draftOverlayOpacity = "60"),
+            CreateBoundChip("75%", () => IsDraftText(_draftOverlayOpacity, "75"), () => _draftOverlayOpacity = "75"),
+            CreateBoundChip("90%", () => IsDraftText(_draftOverlayOpacity, "90"), () => _draftOverlayOpacity = "90"),
+            CreateBoundChip("100%", () => IsDraftText(_draftOverlayOpacity, "100"), () => _draftOverlayOpacity = "100")));
+
+        var hotkeyBox = CreateBoundEntry(() => _draftOverlayHotkey, value => _draftOverlayHotkey = value, DefaultOverlayHotkey, "Overlay show or hide hotkey");
+        hotkeyBox.Width = 220;
+        var hotkeyRow = new StackPanel
         {
-            Width = 16,
-            Height = 16,
-            CornerRadius = new CornerRadius(8),
-            Background = new SolidColorBrush(swatchColor),
+            Orientation = Orientation.Horizontal,
+            Spacing = 8,
+            Children =
+            {
+                hotkeyBox,
+                CreateActionChip("Default", (_, _) =>
+                {
+                    _draftOverlayHotkey = DefaultOverlayHotkey;
+                    RefreshSettingsDeck();
+                }),
+            },
+        };
+        var hotkeyGroup = CreateSettingGroup(
+            "Show or hide hotkey",
+            hotkeyRow,
+            CreateMutedText("Ctrl, Alt, Shift or Win, plus a letter, digit or F1–F24.", 12));
+
+        // Size and opacity side by side: they are read together, and each is short.
+        var sizeAndOpacity = new Grid { ColumnSpacing = 24 };
+        sizeAndOpacity.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        sizeAndOpacity.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        sizeAndOpacity.Children.Add(sizeGroup);
+        sizeAndOpacity.Children.Add(opacityGroup);
+        Grid.SetColumn(opacityGroup, 1);
+
+        var placement = new StackPanel { Spacing = 18, Children = { positionGroup, sizeAndOpacity, hotkeyGroup } };
+        var looks = new StackPanel { Spacing = 18, Children = { BuildOverlayPreview(), BuildOverlayColorGroup() } };
+
+        FrameworkElement details;
+        if (wide)
+        {
+            var columns = new Grid { ColumnSpacing = 32 };
+            columns.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            columns.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            columns.Children.Add(placement);
+            columns.Children.Add(looks);
+            Grid.SetColumn(looks, 1);
+            details = columns;
+        }
+        else
+        {
+            details = new StackPanel { Spacing = 18, Children = { looks, placement } };
+        }
+
+        var body = new StackPanel
+        {
+            Spacing = 18,
+            Children =
+            {
+                new FlowPanel { Spacing = 32, RowSpacing = 14, Children = { showGroup, contentGroup } },
+                metricsGroup,
+                details,
+            },
+        };
+
+        return CreateControlEditorCard(
+            "overlay",
+            "OVERLAY",
+            () => !_draftOverlayEnabled
+                ? "Off"
+                : _draftOverlayMode switch
+                {
+                    OverlayMode.Simple => "FPS",
+                    OverlayMode.Custom => DescribeCustomMetrics(),
+                    _ => "FPS + 4 metrics",
+                },
+            () => _draftOverlayEnabled ? "Shows while a game has focus" : "FPS and usage over your games",
+            body);
+    }
+
+    /// <summary>A label above its controls, with an optional hint below.</summary>
+    private static StackPanel CreateSettingGroup(string label, FrameworkElement control, FrameworkElement? below = null)
+    {
+        var group = new StackPanel { Spacing = 8, Children = { CreateFieldLabel(label), control } };
+        if (below is not null)
+        {
+            group.Children.Add(below);
+        }
+
+        return group;
+    }
+
+    private static StackPanel CreateSettingGroup(string label, FrameworkElement control, string hint) =>
+        CreateSettingGroup(label, control, CreateMutedText(hint, 12));
+
+    /// <summary>"FPS + 2 metrics", in the same terms as "FPS + 4 metrics" for all of them.</summary>
+    private string DescribeCustomMetrics()
+    {
+        var count = _draftOverlayCustomMetrics.Count;
+        var hasFps = _draftOverlayCustomMetrics.Contains("fps", StringComparer.OrdinalIgnoreCase);
+        var others = hasFps ? count - 1 : count;
+        return (hasFps, others) switch
+        {
+            (_, 0) when !hasFps => "No metrics",
+            (true, 0) => "FPS",
+            (true, 1) => "FPS + 1 metric",
+            (true, _) => $"FPS + {others} metrics",
+            (false, 1) => "1 metric",
+            _ => $"{others} metrics",
+        };
+    }
+
+    private static bool IsDraftText(string? draft, string value) =>
+        string.Equals(draft?.Trim(), value, StringComparison.OrdinalIgnoreCase);
+
+    private void ToggleOverlayMetric(string key)
+    {
+        var selected = new HashSet<string>(_draftOverlayCustomMetrics, StringComparer.OrdinalIgnoreCase);
+        if (!selected.Remove(key))
+        {
+            selected.Add(key);
+        }
+
+        // Kept in the chips' order, which is the order the overlay draws them. Appending put
+        // them in click order, so the hint that promised this order was wrong.
+        _draftOverlayCustomMetrics = [.. OverlayMetricChoices.Select(choice => choice.Key).Where(selected.Contains)];
+    }
+
+    /// <summary>The colour being drafted, or the default while the field holds something else.</summary>
+    private Color GetDraftOverlayColor() =>
+        SwissOlly.Core.Models.OverlayConfig.NormalizeHexColor(_draftOverlayColor) is { } hex
+            ? ParseColor(hex)
+            : ParseColor(DefaultOverlayColor);
+
+    private StackPanel BuildOverlayColorGroup()
+    {
+        var current = new Ellipse
+        {
+            Width = 22,
+            Height = 22,
+            Stroke = ResolveBrush("SurfaceStrokeBrush", "#2C3035"),
+            StrokeThickness = UiMetrics.Hairline,
             VerticalAlignment = VerticalAlignment.Center,
         };
+        var currentBrush = new SolidColorBrush(GetDraftOverlayColor());
+        current.Fill = currentBrush;
+        _settingsBindings.Add(() => currentBrush.Color = GetDraftOverlayColor());
+
+        // A hex field, not WinUI's ColorPicker: its template needs control resources this build
+        // doesn't ship (TabViewScrollButtonBackground), and opening it fail-fast crashed the app.
+        var hexBox = CreateBoundEntry(() => _draftOverlayColor, value => _draftOverlayColor = value, DefaultOverlayColor, "Overlay text color as a hex value");
+        hexBox.Width = 120;
+        var currentRow = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 10,
+            Children = { current, hexBox },
+        };
+
+        FlowPanel SwatchRow((string Name, string Hex)[] colors)
+        {
+            var row = new FlowPanel { Spacing = 2, RowSpacing = 2 };
+            foreach (var (name, hex) in colors)
+            {
+                var swatch = new ColorSwatchButton(name, hex);
+                swatch.Click += (_, _) =>
+                {
+                    _draftOverlayColor = hex;
+                    RefreshSettingsDeck();
+                };
+                _settingsBindings.Add(() => swatch.IsSelected = IsDraftText(_draftOverlayColor, hex));
+                row.Children.Add(swatch);
+            }
+
+            return row;
+        }
+
+        var classic = SwatchRow(OverlayClassicColors);
+        var neon = SwatchRow(OverlayNeonColors);
+
+        // Usage readings recolour themselves past these thresholds, so a warm pick hides the
+        // warning. Said here, and louder when it applies, rather than discovered mid-game.
+        var thresholdHint = CreateMutedText(string.Empty, 12);
+        _settingsBindings.Add(() =>
+        {
+            var clashes = IsWarningLikeColor(GetDraftOverlayColor());
+            SetTextIfChanged(thresholdHint, clashes
+                ? "With a red, orange or yellow text color, the amber (over 75%) and red (over 90%) warnings won't stand out."
+                : "CPU, GPU and memory turn amber above 75% and red above 90%, like GPU in the preview.");
+            thresholdHint.Foreground = clashes
+                ? ResolveBrush("WarningBrush", "#F2BF66")
+                : ResolveBrush("TextMutedBrush", "#90959D");
+        });
+        // One Tab stop per row; the arrow keys move between colours.
+        foreach (var row in new[] { classic, neon })
+        {
+            row.TabFocusNavigation = KeyboardNavigationMode.Once;
+            row.XYFocusKeyboardNavigation = XYFocusKeyboardNavigationMode.Enabled;
+        }
+
+        return new StackPanel
+        {
+            Spacing = 8,
+            Children =
+            {
+                CreateFieldLabel("Text color"),
+                currentRow,
+                CreateFieldLabel("Classic"),
+                classic,
+                CreateFieldLabel("Neon"),
+                neon,
+                thresholdHint,
+            },
+        };
+    }
+
+    /// <summary>Red, orange or yellow: a text colour the overlay's amber and red warnings would blend into.</summary>
+    private static bool IsWarningLikeColor(Color color)
+    {
+        var (hue, saturation, _) = ThemeVisuals.ToHsl(color);
+        var degrees = hue * 360;
+        return saturation >= 0.45 && (degrees <= 65 || degrees >= 345);
+    }
+
+    /// <summary>
+    /// The overlay as it will look: the drafted metrics, colour, size, opacity and corner over a
+    /// stand-in game scene. Values are fixed samples; labels sit back at 72% like the real thing.
+    /// </summary>
+    private FrameworkElement BuildOverlayPreview()
+    {
+        Brush Vertical(params (string Hex, double Offset)[] stops)
+        {
+            var brush = new LinearGradientBrush
+            {
+                StartPoint = new Windows.Foundation.Point(0, 0),
+                EndPoint = new Windows.Foundation.Point(0, 1),
+            };
+            foreach (var (hex, offset) in stops)
+            {
+                brush.GradientStops.Add(new GradientStop { Color = ParseColor(hex), Offset = offset });
+            }
+
+            return brush;
+        }
+
+        var horizonGlow = new LinearGradientBrush
+        {
+            StartPoint = new Windows.Foundation.Point(0, 0),
+            EndPoint = new Windows.Foundation.Point(1, 0),
+        };
+        horizonGlow.GradientStops.Add(new GradientStop { Color = ParseColor("#007C93C4"), Offset = 0 });
+        horizonGlow.GradientStops.Add(new GradientStop { Color = ParseColor("#AA9FB4E0"), Offset = 0.5 });
+        horizonGlow.GradientStops.Add(new GradientStop { Color = ParseColor("#007C93C4"), Offset = 1 });
+
+        var text = new Grid { Margin = new Thickness(10), IsHitTestVisible = false };
+        text.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        text.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+        // Fixed colours, like the scene: it is a game, not part of the theme.
+        var offBadge = new Border
+        {
+            Background = BrushFactory.CreateBrush("#B0080A0C"),
+            CornerRadius = new CornerRadius(UiMetrics.SmallRadius),
+            Padding = new Thickness(8, 3, 8, 4),
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center,
+            Child = new TextBlock
+            {
+                Text = "Overlay is off",
+                FontSize = 12,
+                Foreground = BrushFactory.CreateBrush("#E8ECF4"),
+            },
+        };
+
+        var scene = new Grid
+        {
+            // A minimum, not a height: five lines at 32px need more, and a fixed height cut off
+            // the last of them.
+            MinHeight = 148,
+            Children =
+            {
+                // Sky, then ground below a soft horizon: enough of a scene to judge colours on.
+                new Border { CornerRadius = new CornerRadius(UiMetrics.ControlRadius), Background = Vertical(("#56709E", 0), ("#2C3A58", 0.6), ("#1A2234", 1)) },
+                new Border
+                {
+                    Height = 54,
+                    VerticalAlignment = VerticalAlignment.Bottom,
+                    CornerRadius = new CornerRadius(0, 0, UiMetrics.ControlRadius, UiMetrics.ControlRadius),
+                    Background = Vertical(("#1A2130", 0), ("#0C0F15", 1)),
+                },
+                new Border { Height = 1, Margin = new Thickness(0, 0, 0, 54), VerticalAlignment = VerticalAlignment.Bottom, Background = horizonGlow },
+                text,
+                offBadge,
+            },
+        };
+        AutomationProperties.SetName(scene, "Overlay preview");
+
+        string? lastSignature = null;
+        var lastValidFontPx = 14;
+        var lastValidOpacity = 0.9;
+        _settingsBindings.Add(() =>
+        {
+            List<string> keys = _draftOverlayMode switch
+            {
+                OverlayMode.Simple => ["fps"],
+                OverlayMode.Custom => _draftOverlayCustomMetrics.Count > 0 ? _draftOverlayCustomMetrics : ["fps"],
+                _ => [.. OverlayMetricChoices.Select(choice => choice.Key)],
+            };
+            var color = GetDraftOverlayColor();
+            // The overlay sizes its text in physical pixels; at 150% scaling, 14px is 9.3 DIPs.
+            var scale = _rootLayout.XamlRoot?.RasterizationScale ?? 1d;
+            if (scale <= 0)
+            {
+                scale = 1d;
+            }
+
+            // While a field holds something invalid, the preview keeps the last valid value rather
+            // than quietly falling back to the default.
+            if (TryParseDraftNumber(_draftOverlayFontSize, "px", out var px) && px is >= 10 and <= 32)
+            {
+                lastValidFontPx = px;
+            }
+
+            if (TryParseDraftNumber(_draftOverlayOpacity, "%", out var pct) && pct is >= 30 and <= 100)
+            {
+                lastValidOpacity = pct / 100d;
+            }
+
+            var fontPx = lastValidFontPx;
+            var opacity = lastValidOpacity;
+            var signature = $"{string.Join(',', keys)}|{color}|{fontPx}|{scale}|{opacity}|{_draftOverlayCorner}|{_draftOverlayEnabled}";
+            if (signature == lastSignature)
+            {
+                return;
+            }
+
+            lastSignature = signature;
+            text.HorizontalAlignment = _draftOverlayCorner is OverlayCorner.TopLeft or OverlayCorner.BottomLeft
+                ? HorizontalAlignment.Left
+                : HorizontalAlignment.Right;
+            text.VerticalAlignment = _draftOverlayCorner is OverlayCorner.TopLeft or OverlayCorner.TopRight
+                ? VerticalAlignment.Top
+                : VerticalAlignment.Bottom;
+            text.Opacity = _draftOverlayEnabled ? 1 : 0.3;
+            offBadge.Visibility = _draftOverlayEnabled ? Visibility.Collapsed : Visibility.Visible;
+            text.ColumnSpacing = 8 / scale;
+            text.RowSpacing = 4 / scale;
+
+            text.Children.Clear();
+            text.RowDefinitions.Clear();
+            var valueBrush = new SolidColorBrush(Windows.UI.Color.FromArgb((byte)(255 * opacity), color.R, color.G, color.B));
+            // The overlay's over-90% red (OverlayController.CriticalColor).
+            var criticalBrush = new SolidColorBrush(Windows.UI.Color.FromArgb((byte)(255 * opacity), 0xFF, 0x5A, 0x4F));
+            var labelBrush = new SolidColorBrush(Windows.UI.Color.FromArgb((byte)(255 * opacity * 0.72), color.R, color.G, color.B));
+            var outlineBrush = new SolidColorBrush(Windows.UI.Color.FromArgb((byte)(220 * opacity), 6, 10, 16));
+            var row = 0;
+            foreach (var key in keys)
+            {
+                var metric = Array.Find(OverlayMetricChoices, choice => string.Equals(choice.Key, key, StringComparison.OrdinalIgnoreCase));
+                if (metric.Label is null)
+                {
+                    continue;
+                }
+
+                text.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                AddPreviewText(text, metric.Label, row, 0, fontPx / scale, labelBrush, outlineBrush);
+                AddPreviewText(text, metric.Sample, row, 1, fontPx / scale, metric.Key == "gpu" ? criticalBrush : valueBrush, outlineBrush);
+                row++;
+            }
+        });
+
+        return new StackPanel { Spacing = 8, Children = { CreateFieldLabel("Preview"), scene } };
+    }
+
+    /// <summary>One overlay word: a dark copy a pixel down and right, the overlay's outline in miniature, then the text.</summary>
+    private static void AddPreviewText(Grid host, string value, int row, int column, double fontSize, Brush foreground, Brush outline)
+    {
+        foreach (var (brush, offset) in new[] { (outline, 1d), (foreground, 0d) })
+        {
+            var block = new TextBlock
+            {
+                Text = value,
+                FontFamily = new FontFamily("Segoe UI"),
+                FontWeight = FontWeights.Bold,
+                FontSize = fontSize,
+                Foreground = brush,
+                HorizontalAlignment = column == 1 ? HorizontalAlignment.Right : HorizontalAlignment.Left,
+                RenderTransform = offset == 0 ? null : new TranslateTransform { X = offset, Y = offset },
+            };
+            Grid.SetRow(block, row);
+            Grid.SetColumn(block, column);
+            host.Children.Add(block);
+        }
     }
 
     private string GetStorageSummaryText()

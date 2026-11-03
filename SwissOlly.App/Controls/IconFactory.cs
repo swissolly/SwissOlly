@@ -96,6 +96,7 @@ internal static class IconFactory
             "appearance" => "", // Color
             "retention" => "\uE81C", // History
             "storage" => "\uE8B7", // Folder
+            "window" => "\uE7E8", // PowerButton: startup and close behaviour
             "cpu" => "\uEEA1", // CPU
             "memory" => "\uEEA0", // RAM
             "disk" => "\uEDA2", // HardDrive
