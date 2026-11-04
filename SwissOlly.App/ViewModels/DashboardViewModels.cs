@@ -12,6 +12,9 @@ public sealed class MainViewModel : ObservableObject
     private readonly Dictionary<string, int> _panelOrder = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, PanelSizePreset> _panelSizePresets = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, PanelLayout> _panelLayouts = new(StringComparer.OrdinalIgnoreCase);
+    // Saved geometry and visibility for panels not on the board yet (or hidden), kept for saving.
+    private readonly Dictionary<string, PanelLayout> _parkedPanelLayouts = new(StringComparer.OrdinalIgnoreCase);
+    private Dictionary<string, bool> _savedPanelVisibility = new(StringComparer.OrdinalIgnoreCase);
     private bool _dashboardPanelsDirty = true;
     private bool _panelTogglesDirty = true;
     private bool _panelLayoutsNeedResolution;
@@ -265,7 +268,15 @@ public sealed class MainViewModel : ObservableObject
 
     public SwissOllyConfig BuildConfig()
     {
-        var visibility = PanelToggles.ToDictionary(toggle => toggle.PanelKey, toggle => toggle.IsVisible, StringComparer.OrdinalIgnoreCase);
+        // Panels this run has not met yet keep their saved entries: a save made before history
+        // loads (a sign-in launch hides to the tray and saves at once) wiped them otherwise.
+        var visibility = _savedPanelVisibility
+            .Where(pair => !_panelLookup.ContainsKey(pair.Key))
+            .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.OrdinalIgnoreCase);
+        foreach (var toggle in PanelToggles)
+        {
+            visibility[toggle.PanelKey] = toggle.IsVisible;
+        }
 
         return new SwissOllyConfig
         {
@@ -281,10 +292,7 @@ public sealed class MainViewModel : ObservableObject
             PanelVisibility = visibility,
             PanelOrder = BuildPersistedPanelOrder().ToList(),
             PanelSizes = BuildPersistedPanelSizes(),
-            PanelLayouts = _panelLayouts.ToDictionary(
-                pair => pair.Key,
-                pair => pair.Value.Clone(),
-                StringComparer.OrdinalIgnoreCase),
+            PanelLayouts = PanelBoard.ForSaving(_panelLayouts, _parkedPanelLayouts),
             Overlay = _overlayConfig,
         }.Normalize();
     }
@@ -311,6 +319,7 @@ public sealed class MainViewModel : ObservableObject
         LaunchOnStartup = normalized.LaunchOnStartup;
         MinimizeToTray = normalized.MinimizeToTray;
         HasShownTrayNotice = normalized.HasShownTrayNotice;
+        _savedPanelVisibility = new Dictionary<string, bool>(normalized.PanelVisibility, StringComparer.OrdinalIgnoreCase);
         ApplyPanelOrder(normalized.PanelOrder);
         _panelSizePresets.Clear();
         foreach (var (panelKey, size) in normalized.PanelSizes)
@@ -537,13 +546,18 @@ public sealed class MainViewModel : ObservableObject
         return true;
     }
 
-    /// <summary>Loads saved geometry. Panels without an entry are filled in at placement time.</summary>
+    /// <summary>
+    /// Loads saved geometry. Panels not on the board yet are parked until they arrive; panels
+    /// without an entry are filled in at placement time.
+    /// </summary>
     private void ApplyPanelLayouts(SwissOllyConfig normalized)
     {
         _panelLayouts.Clear();
+        _parkedPanelLayouts.Clear();
+        var onBoard = new HashSet<string>(DashboardPanels.Select(panel => panel.PanelKey), StringComparer.OrdinalIgnoreCase);
         foreach (var (key, layout) in normalized.PanelLayouts)
         {
-            _panelLayouts[key] = layout.Clone().Normalize();
+            (onBoard.Contains(key) ? _panelLayouts : _parkedPanelLayouts)[key] = layout.Clone().Normalize();
         }
 
         _panelLayoutsNeedResolution = true;
@@ -563,37 +577,14 @@ public sealed class MainViewModel : ObservableObject
             return;
         }
 
-        var missing = panelKeys.Where(k => !_panelLayouts.ContainsKey(k)).ToList();
-        if (missing.Count > 0)
+        if (PanelBoard.Reconcile(
+            _panelLayouts,
+            _parkedPanelLayouts,
+            panelKeys,
+            key => _panelSizePresets.GetValueOrDefault(key, PanelSizePreset.Standard)))
         {
-            if (_panelLayouts.Count == 0)
-            {
-                // Nothing saved: rebuild the board from the legacy preset + order model so an
-                // existing dashboard upgrades to something recognisable.
-                foreach (var placement in GridLayoutEngine.FromLegacy(
-                    panelKeys,
-                    key => _panelSizePresets.GetValueOrDefault(key, PanelSizePreset.Standard)))
-                {
-                    _panelLayouts[placement.Key] = placement.Layout;
-                }
-            }
-            else
-            {
-                // Panels added after a layout was saved take the first free slot, so they sit
-                // beside existing panels instead of stacking in a column at the bottom.
-                foreach (var key in missing)
-                {
-                    var occupied = _panelLayouts.Select(kv => new PanelPlacement(kv.Key, kv.Value)).ToList();
-                    _panelLayouts[key] = GridLayoutEngine.FindFreeSlot(occupied, 4, 6);
-                }
-            }
-        }
-
-        // Drop geometry for panels that are no longer on the board so hidden panels do not
-        // reserve empty rows.
-        foreach (var stale in _panelLayouts.Keys.Where(k => !panelKeys.Contains(k, StringComparer.OrdinalIgnoreCase)).ToList())
-        {
-            _panelLayouts.Remove(stale);
+            // Returning geometry may overlap a panel placed while it was away.
+            _panelLayoutsNeedResolution = true;
         }
 
         if (_panelLayoutsNeedResolution)
@@ -870,7 +861,7 @@ public sealed class MainViewModel : ObservableObject
 
     private IReadOnlyList<string> BuildPersistedPanelOrder()
     {
-        return _panelLookup.Values
+        var known = _panelLookup.Values
             .Where(panel => panel.IsDashboardPanel)
             .OrderBy(GetPanelOrderRank)
             .ThenBy(panel => panel.SortBucket)
@@ -879,6 +870,7 @@ public sealed class MainViewModel : ObservableObject
             .ThenBy(panel => panel.Title, StringComparer.OrdinalIgnoreCase)
             .Select(panel => panel.PanelKey)
             .ToArray();
+        return PanelBoard.MergeOrder(known, _panelOrder, _panelLookup.ContainsKey);
     }
 
     private Dictionary<string, PanelSizePreset> BuildPersistedPanelSizes()

@@ -738,9 +738,6 @@ public sealed partial class ShellWindow : Window
                 TryApplyWindowIcon();
             });
             StartupTrace.Write("OnRootLoaded scheduled background startup // polished-v19");
-#if DEBUG
-            StartUiProbe(); // TEMPORARY QA PROBE — remove with ShellWindow.Probe.cs
-#endif
         }
         catch (Exception ex)
         {
@@ -2549,7 +2546,9 @@ public sealed partial class ShellWindow : Window
     private int DetermineSummaryColumns()
     {
         var width = _rootLayout.ActualWidth > 0 ? _rootLayout.ActualWidth : 1280;
-        return width >= 1120 ? 4 : width >= 820 ? 2 : 1;
+        // Two from 600px: one column stacked the four cards about 430px tall at the 720px minimum
+        // window, pushing every chart below the fold.
+        return width >= 1120 ? 4 : width >= 600 ? 2 : 1;
     }
 
     /// <summary>History kept in memory at full resolution; longer ranges are read on demand.</summary>

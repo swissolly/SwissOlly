@@ -352,8 +352,10 @@ public sealed partial class ShellWindow
         var collectionCard = CreateControlEditorCard(
             "collection",
             "COLLECTION",
-            () => FormatScrapeInterval(GetDraftScrapeIntervalSeconds()),
-            () => string.IsNullOrWhiteSpace(_draftScrapeIntervalInput) ? "Default" : "Custom interval",
+            // An invalid entry says so; it used to show the 2-second default as if that were set.
+            () => IsScrapeDraftInvalid() ? "Not a valid interval" : FormatScrapeInterval(GetDraftScrapeIntervalSeconds()),
+            () => IsScrapeDraftInvalid() ? "Use whole seconds from 1 to 60"
+                : string.IsNullOrWhiteSpace(_draftScrapeIntervalInput) ? "Default" : "Custom interval",
             new StackPanel
             {
                 Spacing = 14,
@@ -382,8 +384,10 @@ public sealed partial class ShellWindow
                 ? FormatDuration(draftRetentionWindow)
                 : string.IsNullOrWhiteSpace(_draftRetentionInput)
                     ? FormatDuration(TimeSpan.FromHours(SwissOllyConfig.DefaultMaxRetentionHours))
-                    : GetRetentionFieldValue(_draftRetentionInput),
-            () => string.IsNullOrWhiteSpace(_draftRetentionInput) ? "Default · older history is deleted" : "Older history is deleted",
+                    : "Not a valid length",
+            () => !string.IsNullOrWhiteSpace(_draftRetentionInput) && !SwissOllyConfig.TryParseRetentionWindow(_draftRetentionInput, out _, out _)
+                ? "Use m, h or d, like 30m, 24h or 7d"
+                : string.IsNullOrWhiteSpace(_draftRetentionInput) ? "Default · older history is deleted" : "Older history is deleted",
             new StackPanel
             {
                 Spacing = 14,
@@ -502,6 +506,8 @@ public sealed partial class ShellWindow
         var chip = CreatePresetChip(text, isSelected(), (_, _) =>
         {
             select();
+            // An edit answers a rejected Apply; its message stayed up until Apply was pressed again.
+            _settingsProblem = null;
             RefreshSettingsDeck();
         });
         _settingsBindings.Add(() => chip.IsActive = isSelected());
@@ -532,6 +538,12 @@ public sealed partial class ShellWindow
         entry.AccessibleLabel = accessibleLabel;
         entry.TextChanged += (_, _) =>
         {
+            // Only a real edit clears a rejection; the deck setting the text back is not one.
+            if (!_refreshingSettingsDeck)
+            {
+                _settingsProblem = null;
+            }
+
             setDraft(entry.Text);
             RefreshSettingsDeck();
         };
@@ -577,6 +589,9 @@ public sealed partial class ShellWindow
         Grid.SetColumn(hintText, 1);
         return header;
     }
+
+    private bool IsScrapeDraftInvalid() =>
+        !string.IsNullOrWhiteSpace(_draftScrapeIntervalInput) && !TryNormalizeScrapeInput(_draftScrapeIntervalInput, out _);
 
     private bool IsDraftScrapeInterval(int seconds) =>
         string.IsNullOrWhiteSpace(_draftScrapeIntervalInput)
@@ -1277,15 +1292,19 @@ public sealed partial class ShellWindow
     private const string DefaultOverlayHotkey = "Ctrl+Shift+F11";
     private const string DefaultOverlayColor = "#66E7FF";
 
-    /// <summary>The overlay's metrics in the order it draws them.</summary>
+    /// <summary>
+    /// The overlay's metrics in the order it draws them. Samples are padded with figure spaces
+    /// exactly as OverlayController formats them, and left-aligned in one column as the renderer
+    /// draws them, so "62°C" sticks out past "23%" here as it does in a game.
+    /// </summary>
     private static readonly (string Key, string Chip, string Label, string Sample)[] OverlayMetricChoices =
     [
-        ("fps", "FPS", "FPS", "144"),
-        ("cpu", "CPU %", "CPU", "23%"),
+        ("fps", "FPS", "FPS", " 144"),
+        ("cpu", "CPU %", "CPU", " 23%"),
         // Over the 90% line on purpose: the preview shows the red a hot reading turns.
-        ("gpu", "GPU %", "GPU", "92%"),
-        ("gpu-temp", "GPU temp", "GPU Temp", "62°C"),
-        ("memory", "Memory %", "MEM", "48%"),
+        ("gpu", "GPU %", "GPU", " 92%"),
+        ("gpu-temp", "GPU temp", "GPU Temp", " 62°C"),
+        ("memory", "Memory %", "MEM", " 48%"),
     ];
 
     private static readonly (string Name, string Hex)[] OverlayClassicColors =
@@ -1348,19 +1367,19 @@ public sealed partial class ShellWindow
         fontBox.Width = 120;
         fontBox.HorizontalAlignment = HorizontalAlignment.Left;
         var sizeGroup = CreateSettingGroup("Text size (10–32 px)", fontBox, CreateChipWrapRow(
-            CreateBoundChip("12", () => IsDraftText(_draftOverlayFontSize, "12"), () => _draftOverlayFontSize = "12"),
-            CreateBoundChip("14", () => IsDraftText(_draftOverlayFontSize, "14"), () => _draftOverlayFontSize = "14"),
-            CreateBoundChip("16", () => IsDraftText(_draftOverlayFontSize, "16"), () => _draftOverlayFontSize = "16"),
-            CreateBoundChip("20", () => IsDraftText(_draftOverlayFontSize, "20"), () => _draftOverlayFontSize = "20")));
+            CreateBoundChip("12", () => IsDraftNumber(_draftOverlayFontSize, "px", 12), () => _draftOverlayFontSize = "12"),
+            CreateBoundChip("14", () => IsDraftNumber(_draftOverlayFontSize, "px", 14), () => _draftOverlayFontSize = "14"),
+            CreateBoundChip("16", () => IsDraftNumber(_draftOverlayFontSize, "px", 16), () => _draftOverlayFontSize = "16"),
+            CreateBoundChip("20", () => IsDraftNumber(_draftOverlayFontSize, "px", 20), () => _draftOverlayFontSize = "20")));
 
         var opacityBox = CreateBoundEntry(() => _draftOverlayOpacity, value => _draftOverlayOpacity = value, "90", "Overlay opacity in percent");
         opacityBox.Width = 120;
         opacityBox.HorizontalAlignment = HorizontalAlignment.Left;
         var opacityGroup = CreateSettingGroup("Opacity (30–100%)", opacityBox, CreateChipWrapRow(
-            CreateBoundChip("60%", () => IsDraftText(_draftOverlayOpacity, "60"), () => _draftOverlayOpacity = "60"),
-            CreateBoundChip("75%", () => IsDraftText(_draftOverlayOpacity, "75"), () => _draftOverlayOpacity = "75"),
-            CreateBoundChip("90%", () => IsDraftText(_draftOverlayOpacity, "90"), () => _draftOverlayOpacity = "90"),
-            CreateBoundChip("100%", () => IsDraftText(_draftOverlayOpacity, "100"), () => _draftOverlayOpacity = "100")));
+            CreateBoundChip("60%", () => IsDraftNumber(_draftOverlayOpacity, "%", 60), () => _draftOverlayOpacity = "60"),
+            CreateBoundChip("75%", () => IsDraftNumber(_draftOverlayOpacity, "%", 75), () => _draftOverlayOpacity = "75"),
+            CreateBoundChip("90%", () => IsDraftNumber(_draftOverlayOpacity, "%", 90), () => _draftOverlayOpacity = "90"),
+            CreateBoundChip("100%", () => IsDraftNumber(_draftOverlayOpacity, "%", 100), () => _draftOverlayOpacity = "100")));
 
         var hotkeyBox = CreateBoundEntry(() => _draftOverlayHotkey, value => _draftOverlayHotkey = value, DefaultOverlayHotkey, "Overlay show or hide hotkey");
         hotkeyBox.Width = 220;
@@ -1468,6 +1487,9 @@ public sealed partial class ShellWindow
         };
     }
 
+    private static bool IsDraftNumber(string? draft, string unit, int value) =>
+        TryParseDraftNumber(draft, unit, out var parsed) && parsed == value;
+
     private static bool IsDraftText(string? draft, string value) =>
         string.Equals(draft?.Trim(), value, StringComparison.OrdinalIgnoreCase);
 
@@ -1543,8 +1565,8 @@ public sealed partial class ShellWindow
         {
             var clashes = IsWarningLikeColor(GetDraftOverlayColor());
             SetTextIfChanged(thresholdHint, clashes
-                ? "With a red, orange or yellow text color, the amber (over 75%) and red (over 90%) warnings won't stand out."
-                : "CPU, GPU and memory turn amber above 75% and red above 90%, like GPU in the preview.");
+                ? "With a red, orange or yellow text color, the amber and red warnings for high usage and GPU temperature won't stand out."
+                : "CPU, GPU and memory turn amber above 75% and red above 90%, like GPU in the preview; GPU temperature does the same above 75 °C and 85 °C.");
             thresholdHint.Foreground = clashes
                 ? ResolveBrush("WarningBrush", "#F2BF66")
                 : ResolveBrush("TextMutedBrush", "#90959D");
@@ -1742,7 +1764,7 @@ public sealed partial class ShellWindow
                 FontWeight = FontWeights.Bold,
                 FontSize = fontSize,
                 Foreground = brush,
-                HorizontalAlignment = column == 1 ? HorizontalAlignment.Right : HorizontalAlignment.Left,
+                HorizontalAlignment = HorizontalAlignment.Left,
                 RenderTransform = offset == 0 ? null : new TranslateTransform { X = offset, Y = offset },
             };
             Grid.SetRow(block, row);

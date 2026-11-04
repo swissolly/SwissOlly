@@ -6,24 +6,38 @@ Record failures as a sub-bullet with what you saw.
 Test matrix unless an item says otherwise: Windows 11 x64 (primary), Windows 10 1809+ x64,
 one ARM64 device if available; 100% and 150% display scale; no game running unless stated.
 
-**Status, 2026-11-02.** Ticked items were verified on the development PC (Windows 11 x64, 100%
+**Status, 2026-11-03.** Ticked items were verified on the development PC (Windows 11 x64, 100%
 scale). Items marked *(probe)* were driven in-process by the temporary QA probe rather than with a
 real mouse and keyboard; repeat them by hand once. Unticked items still need hands-on or
-other-hardware testing; what was already covered is noted under each one.
+other-hardware testing; what was already covered is noted under each one. Upgrading from
+Vaktr 1.0.x and data migration are out of scope for this release.
 
-### Fixed in the last round (re-test these by hand first)
+### Fixed in the last two rounds (re-test these by hand first)
 
 - Crash with the process list open: assigning a hand cursor from a row's `Loaded` handler
-  fail-fasted WinUI (0xC000027B; two crash dumps). Rows no longer set a cursor, every cursor is
-  assigned once in a constructor, and rows are reused instead of rebuilt each refresh.
+  fail-fasted WinUI (0xC000027B; two crash dumps). Nothing sets a cursor from `Loaded` any more,
+  process rows set none at all, and rows are reused instead of rebuilt each refresh.
 - Crash opening the overlay colour picker: WinUI's `ColorPicker` needs control resources this
   build doesn't ship (`TabViewScrollButtonBackground`). Replaced by a hex field and 16 presets.
 - Pinning a process blanked CPU Total and Memory and read their headline as 0%. The panel's own
-  line now stays, pinned processes get distinct colours, and a legend names them.
+  line now stays, pinned processes get distinct colours, and the legend names every pin.
+- Long sessions lost the left side of long ranges after ~33 h (the point cap deleted it and
+  nothing reloaded it). Samples older than an hour now fold into minute averages in memory, the
+  same form the store keeps, so a running session and a restart show the same chart; past the
+  cap, old data coarsens instead of being deleted.
 - Settings chips rebuilt the whole page on every click (≈65 ms, dropped hover and focus). They
-  now update in place (0.2 ms). Chips that started selected no longer stay lit.
-- "Collecting since" no longer sits over the data; the "Showing …" status clears when you pick
-  a preset or reset zoom.
+  now update in place (0.2 ms), and Settings is pre-built at idle (first open 13 ms, was ~150).
+- Overlay: a corner change applied only when the next game was detected (and the hotkey used
+  the old corner); the hotkey was held even with the overlay off and auto-repeated; values
+  shifted sideways crossing 9→10 (space padding). The over-90% colour is now red, not orange.
+- Apply rewrote the Start with Windows entry from a stale flag; a hidden Apply bar was still
+  reachable with Tab; hotkeys like Ctrl+O or Shift+A were accepted.
+- **Dashboard layout lost on restart.** The first board pass at launch has only the GPU
+  temperature panel; it discarded the saved geometry of every other panel, which then got packed
+  into free slots when history created them, so an Edit layout arrangement never survived a
+  restart. Worse, a Start with Windows (`--tray`) launch saves straight away and wrote that
+  one-panel board over the saved layout, order and visibility. Saved entries for panels not on
+  the board now stay parked until the panel arrives (`PanelBoard`, with tests), and saves merge them.
 
 ---
 
@@ -45,8 +59,11 @@ other-hardware testing; what was already covered is noted under each one.
 
 - [x] **Theme sweep, now twelve themes** (Dark, Obsidian, Midnight, Nord, Violet, Synthwave,
       Forest, Ember; Light, Frost, Sandstone, Blossom): Overview, Settings, edit mode, the range
-      popover and a process popover screenshotted in each *(probe)*. Every palette passes WCAG AA
-      on every surface: text ≥ 4.5:1, focus and selection rings ≥ 3:1.
+      popover and a process popover screenshotted in each *(probe, re-run 2026-11-03 on the final
+      build)*. Contrast, checked by script against every palette: text ≥ 4.5:1 on every surface
+      (pinned-row captions now use the secondary colour; ≥ 5.4:1), primary-button text ≥ 4.9:1,
+      focus and selection rings ≥ 3:1, and chart lines ≥ 3.2:1 on light themes (darkened there;
+      they measured 1.1–2.5:1 before).
 - [ ] **Display scaling** at 100 / 125 / 150 / 200%. Only 100% checked so far.
 - [x] **Window sizes** from the 720 × 560 minimum to 2560 × 1440 *(probe)*: the board reflows,
       the theme grid goes from eight cards a row to three, chip rows wrap, and the overlay card
@@ -57,7 +74,17 @@ other-hardware testing; what was already covered is noted under each one.
       a missing GPU sensor, "History isn't being saved", "History unavailable".
 - [x] **Number and unit formatting** in en-US, en-GB and de-DE *(probe)*.
 - [x] **Charts:** dash patterns match the legend; "Collecting since" is placed left of its line
-      and hidden when there is no room, so it never covers data; gaps instead of bridging lines.
+      and hidden when there is no room, so it never covers data; gaps instead of bridging lines;
+      in-plot value labels sit on a plate above the lines instead of under them.
+- [x] **Data after a restart** *(probe, real exit and relaunch)*: all 15,088 stored points from
+      the 40 minutes before the restart came back with identical timestamps and values; the
+      42 s the app was closed shows as a gap; 5m, 15m, 1h and 24h charts match before and after.
+      A 72-minute run, so the session had folded its oldest samples into minute averages in
+      memory: after relaunch, all 1,476 minute averages and 71,324 raw samples (41 series) matched
+      exactly, nothing missing; 1h and 24h charts look the same before and after.
+- [x] **Layout after a restart**: a custom 14-panel board (mixed widths and heights) survived a
+      `--tray` launch, whose save lands before history loads, and a visible launch; the file
+      kept every cell, the order and the visibility through both, and the board drew as saved.
 - [ ] **Window chrome** in light and dark themes: caption buttons follow the palette in
       screenshots; the taskbar and tray icon need a look on a real taskbar.
 
@@ -83,12 +110,17 @@ other-hardware testing; what was already covered is noted under each one.
       across restart) and with the keyboard.
 - [ ] **Process popover with a real mouse:** hover, scroll, sort, pin and unpin while it
       refreshes; this is the path of the reported crash. Done in-process across 8 s of refreshes
-      with pins at full and minimum width, with no stalls over 24 ms.
+      with pins at full and minimum width: no stall over 22 ms on the final build. (A ThemeShadow
+      tried on the popover cost over a second of UI time per 8 s and was taken out.) Pins are by
+      process name: every "Code" row pins and unpins together, and the line is their sum.
 - [x] **Window behaviour:** close to tray vs exit, the tray menu, `--tray` start, and a second
       launch focusing the running instance. Start with Windows still needs a real reboot.
 - [ ] **In-game overlay** over a real game: appears only over a focused game, hotkey, every
-      corner and mode, colours (now 6 classic and 10 neon), live apply, no focus stealing. The
-      Settings preview shows the drafted overlay.
+      corner and mode, colours (now 6 classic and 10 neon), live apply, no focus stealing. Fixed
+      from code review but not yet seen in a game: corner changes apply live and to the hotkey;
+      the hotkey is held only while the overlay is on and doesn't auto-repeat; values no longer
+      shift sideways (figure-space padding); over 90% is red. The Settings preview draws the
+      same padding, alignment, colours and opacity as the overlay.
 
 ## 3. Accessibility
 
@@ -116,7 +148,11 @@ and under load.
 - [ ] **Network** against a known download, per adapter.
 - [x] **Process, thread and handle counts** come from the same kernel snapshot Task Manager uses.
 - [x] **History tiers:** raw for the last hour, 1-minute averages before that, wide ranges
-      averaged in SQL; restarts and sleep show as gaps (unit-tested and seen in charts).
+      averaged in SQL; restarts and sleep show as gaps (unit-tested and seen in charts). A running
+      session folds its own older samples the same way, and a test against the real SQLite store
+      shows a reload is point for point what the session held, outage included.
+- [x] **Per-process CPU** falls back to CPU time where cycle counts aren't reported (some VMs),
+      instead of reading 0% (unit-tested).
 - [ ] **Scrape interval** spacing at 1 s and 60 s over several minutes.
 - [ ] **Time handling:** time-zone change, DST, clock adjustment.
 - [ ] **Sleep and resume:** gap, resumed collection, no spike.
@@ -129,9 +165,11 @@ and under load.
 - [x] **Startup:** first sample ~1.15 s warm; history loads off the UI thread (~0.5 s).
 - [ ] **Large history:** a year of retention with a seeded database.
 - [ ] **Database growth per day** at 1 s and 2 s.
-- [x] **Interaction cost** *(probe)*: range switch 1–3 ms in the click handler with no stall
-      over 31 ms after; process popover opens in 9–13 ms; Settings 66 ms the first time and 1 ms
-      after; Settings chips 0.2 ms; picking a theme 36–56 ms.
+- [x] **Interaction cost** *(probe, Debug build)*: range switch 1–3 ms in the click handler with
+      no stall over 31 ms after; process popover opens in 10–15 ms; Settings 13 ms the first time
+      (pre-built at idle) and 1–2 ms after; Settings chips 0.2 ms; picking a theme 37–53 ms.
+      Measured in a Debug build: under the Visual Studio debugger everything is slower still,
+      so judge responsiveness with Ctrl+F5 or a Release build.
 - [ ] **Gaming impact:** FPS with the app running vs closed, overlay on and off.
 
 ## 6. Security and privacy
@@ -147,13 +185,17 @@ and under load.
 - [x] **Untrusted settings file:** bad values, wrong types and path tricks fall back safely
       (unit-tested); UNC and device storage paths are rejected.
 - [ ] **Data at rest:** ACLs on a custom folder; document in the README.
-- [ ] **Supply chain:** `dotnet list package --vulnerable`; Actions are pinned to SHAs and
-      Dependabot is configured.
+- [x] **Supply chain:** Actions are pinned to SHAs and Dependabot watches NuGet and Actions.
+      `dotnet list package --vulnerable` flagged the native SQLite that Microsoft.Data.Sqlite
+      brings in (SQLitePCLRaw 2.1.6, SQLite 3.41.2: CVE-2025-6965, High); a direct
+      `SQLitePCLRaw.bundle_e_sqlite3` 2.1.14 reference lifts it to SQLite 3.54.0, and the check is
+      now clean.
 - [ ] **Signing:** a signed installer and exe, or say "unsigned" in the release notes.
 
 ## 7. Reliability and data integrity
 
-- [ ] **Upgrade paths:** 1.0.x (Vaktr) → 1.2.0 in place, fresh install, reinstall, uninstall.
+- [ ] **Install paths:** fresh install, reinstall, uninstall. (Upgrading from Vaktr 1.0.x and
+      data migration are out of scope for 1.2.0.)
 - [ ] **Abrupt termination** during a write.
 - [x] **Storage unavailable:** a folder that disappears gives a clear status, the live view keeps
       going, and saving resumes when the folder returns (unit-tested). Disk full not tested.
@@ -169,14 +211,15 @@ and under load.
 - [x] **Installer compiles** locally (Inno Setup, 67.7 MB). Add it to CI.
 - [ ] **Dry-run release** on a throwaway tag in a fork.
 - [ ] **Checksums:** SHA-256 per installer.
-- [x] **Release notes** drafted in `docs/release-notes/v1.2.0.md`; add the new themes, the
-      Settings redesign and neon overlay colours.
+- [x] **Release notes** in `docs/release-notes/v1.2.0.md`, including the new themes, the
+      Settings redesign, neon overlay colours and the fixes above.
 - [x] **Decision:** `WindowsAppSDKSelfContained` is on for Release builds.
 
 ## 9. Website (SwissOlly.Web)
 
 - [ ] **Replace screenshots** in the default theme at 1x and 2x (show the new themes).
-- [ ] **Domain:** canonical, Open Graph and sitemap URLs still point at `vaktr.app`.
+- [ ] **Domain:** `swissolly.io`. Canonical, Open Graph, JSON-LD, sitemap and robots URLs use it
+      now; the domain still has to be added at the host and in DNS, with `vaktr.app` redirecting.
 - [ ] **Lighthouse** ≥ 90 and the link card on Discord and X.
 - [ ] **Download** links resolve to the 1.2.0 release.
 - [x] **CI:** the validate workflow fails on broken links now (it never did).
@@ -212,9 +255,16 @@ Not tasks: engineering notes carried over so they aren't re-learned.
   `TabViewScrollButtonBackground`) and `new XamlControlsResources()` all fail. `Button`,
   `ScrollViewer`, `Flyout` and `MenuFlyout` work. Test any other framework control in-process,
   opened, before using it.
-- Never set `ProtectedCursor` from `Loaded`; assign it once in the constructor via `PointerCursors`.
+- Never set `ProtectedCursor` from `Loaded`; use the shared cursors in `PointerCursors`, set in a
+  constructor (or, for a long-lived card in layout edit mode, from its pointer events).
 - Settings controls update in place through `RefreshSettingsDeck`; only a new theme or column
-  count rebuilds the page. A chip's selection is `IsActive` alone — never `IsFilled`.
+  count rebuilds the page. A chip's selection is `IsActive`; `IsFilled` means a primary button
+  (solid accent), never "selected".
+- No `ThemeShadow` on popovers: it projects onto the whole window and stalled the UI thread for
+  over a second in every eight while the process list refreshed beneath it.
+- Live buffers fold samples older than an hour into minute averages (`MetricHistory.Compact`),
+  matching the store's rollups and the startup read; keep the two windows equal
+  (`MetricPanelViewModel.RawSampleWindow`, `ShellWindow.RawHistoryWindow`).
 - **Verifying:** use `C:\Program Files\dotnet\dotnet.exe`, and kill `SwissOlly.exe` before
   building (check first that it isn't your own debug session). Capture with
   `PrintWindow(hwnd, hdc, 2)` on the `WinUIDesktopWin32WindowClass` window (popups aren't
