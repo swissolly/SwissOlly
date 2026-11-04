@@ -32,7 +32,7 @@ See how an individual process's CPU and memory use changed over time, not just r
 **Status:** Planned.
 
 ### More Colour Themes
-Additional palettes on top of the eight available today.
+Additional palettes on top of the twelve available today.
 
 **Status:** Planned.
 
@@ -42,7 +42,7 @@ Additional palettes on top of the eight available today.
 The first release under the SwissOlly name (previously Vaktr). An existing install upgrades in place and keeps its settings, history and startup entry.
 
 - **Layout editor:** drag panels on a 12-column grid and resize them from any edge or corner; Tab, arrows and Shift+arrows do the same from the keyboard
-- **Process popover:** the CPU and Memory panels list every process, services included, with Task Manager's measures (machine-wide CPU share; private working set); sort, and pin processes to the chart with the mouse or the keyboard
+- **Process popover:** the CPU and Memory panels list the processes using the most (the top 15, up to 50 as you scroll), services included, with Task Manager's measures (machine-wide CPU share; private working set); sort, and pin processes to the chart with the mouse or the keyboard
 - **Accurate counters:** CPU usage and per-core load as Task Manager reports them, the real clock speed including boost, and GPU usage that adds up every process using an engine
 - **Tray and startup:** closing keeps SwissOlly recording in the notification area (or exits, if you prefer); Start with Windows; a second launch brings the running window forward
 - **Themes:** twelve palettes, among them Obsidian (true black for OLED), Synthwave, Frost and Blossom, previewed in Settings and each checked against the WCAG AA contrast floor

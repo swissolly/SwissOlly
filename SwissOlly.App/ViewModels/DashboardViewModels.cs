@@ -622,18 +622,28 @@ public sealed class MainViewModel : ObservableObject
 
     public IReadOnlyDictionary<string, PanelLayout> PanelLayouts => _panelLayouts;
 
-    /// <summary>Snapshot for Cancel in edit mode.</summary>
+    /// <summary>Snapshot for Cancel in edit mode: the board and the parked geometry together.</summary>
     public Dictionary<string, PanelLayout> SnapshotPanelLayouts()
-        => _panelLayouts.ToDictionary(p => p.Key, p => p.Value.Clone(), StringComparer.OrdinalIgnoreCase);
+        => PanelBoard.ForSaving(_panelLayouts, _parkedPanelLayouts);
 
+    /// <summary>
+    /// Cancel in edit mode: every panel goes back to where it was when editing started, on the
+    /// board or parked. A panel that reached the board during the edit (a drive plugged in, or
+    /// history still loading) used to lose its saved cell here and take the first free slot.
+    /// </summary>
     public void RestorePanelLayouts(Dictionary<string, PanelLayout> snapshot)
     {
+        var onBoard = new HashSet<string>(DashboardPanels.Select(panel => panel.PanelKey), StringComparer.OrdinalIgnoreCase);
         _panelLayouts.Clear();
+        _parkedPanelLayouts.Clear();
         foreach (var (key, layout) in snapshot)
         {
-            _panelLayouts[key] = layout.Clone();
+            (onBoard.Contains(key) ? _panelLayouts : _parkedPanelLayouts)[key] = layout.Clone();
         }
-        _panelLayoutsNeedResolution = false;
+
+        // A returning panel's saved cell may overlap one placed while it was away; resolving
+        // leaves a board without overlaps as it is.
+        _panelLayoutsNeedResolution = true;
     }
 
     /// <summary>Applies an engine result (from a move or resize) to the stored geometry.</summary>

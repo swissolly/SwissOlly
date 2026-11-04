@@ -24,9 +24,77 @@ env:
   RELEASE_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}', inputs.version) }}
 
 jobs:
+  # Everything that can refuse a release runs first, before two installer builds are spent on it.
+  verify:
+    name: Verify release
+    runs-on: windows-latest
+    outputs:
+      number: ${{ steps.version.outputs.number }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Full history, to check the release commit is on main.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check version
+        id: version
+        shell: pwsh
+        run: |
+          # Exactly one leading v: a manual run given "v1.2.0" (the input wants 1.2.0) would
+          # otherwise tag and draft "vv1.2.0".
+          # [0-9] and \z: \d takes any Unicode digit and $ allows a trailing newline, which would
+          # pass here and then break the git tag step.
+          if ($env:RELEASE_VERSION -cmatch '^v([0-9]+\.[0-9]+\.[0-9]+)\z') {
+            $version = $Matches[1]
+          } else {
+            Write-Error "Release version '$env:RELEASE_VERSION' must look like v1.2.0 (for a manual run, type 1.2.0)."
+            exit 1
+          }
+          # One version everywhere: the tag, the installer and the app's assembly version.
+          [xml]$props = Get-Content Directory.Build.props
+          $projectVersion = "$($props.Project.PropertyGroup.Version)".Trim()
+          if ($projectVersion -ne $version) {
+            Write-Error "Directory.Build.props says $projectVersion but this release is $version. Bump <Version> first."
+            exit 1
+          }
+          "number=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Check the release commit is on main
+        shell: pwsh
+        run: |
+          git merge-base --is-ancestor $env:GITHUB_SHA origin/main
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "$env:GITHUB_SHA isn't on main. Merge the release first, then tag main."
+            exit 1
+          }
+
+      - name: Check the tag is new (manual dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        run: |
+          # The full-history checkout above fetched every tag, so this needs no credentials.
+          git rev-parse -q --verify "refs/tags/$env:RELEASE_VERSION" | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Error "Tag $env:RELEASE_VERSION already exists."
+            exit 1
+          }
+          exit 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Run tests
+        run: dotnet test SwissOlly.Tests/SwissOlly.Tests.csproj -c Release --verbosity normal
+
   build-installer:
     name: Build Installer (${{ matrix.platform }})
     runs-on: windows-latest
+    needs: verify
 
     strategy:
       matrix:
@@ -46,24 +114,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-
-      - name: Check version
-        id: version
-        shell: pwsh
-        run: |
-          $version = $env:RELEASE_VERSION.TrimStart('v')
-          if ($version -notmatch '^\d+\.\d+\.\d+$') {
-            Write-Error "Release version '$env:RELEASE_VERSION' must look like v1.2.0."
-            exit 1
-          }
-          # One version everywhere: the tag, the installer and the app's assembly version.
-          [xml]$props = Get-Content Directory.Build.props
-          $projectVersion = "$($props.Project.PropertyGroup.Version)".Trim()
-          if ($projectVersion -ne $version) {
-            Write-Error "Directory.Build.props says $projectVersion but this release is $version. Bump <Version> first."
-            exit 1
-          }
-          "number=$version" >> $env:GITHUB_OUTPUT
+        with:
+          # NuGet packages bring their own build targets; don't leave the repo token on disk for them.
+          persist-credentials: false
 
       - name: Setup .NET
         uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
@@ -74,7 +127,7 @@ jobs:
         run: dotnet restore SwissOlly.sln
 
       - name: Publish app (self-contained ${{ matrix.platform }})
-        run: dotnet publish SwissOlly.App/SwissOlly.App.csproj -c Release -p:Platform=${{ matrix.platform }} -r ${{ matrix.runtime }} --self-contained -p:Version=${{ steps.version.outputs.number }} -o publish/${{ matrix.platform }}
+        run: dotnet publish SwissOlly.App/SwissOlly.App.csproj -c Release -p:Platform=${{ matrix.platform }} -r ${{ matrix.runtime }} --self-contained -p:Version=${{ needs.verify.outputs.number }} -o publish/${{ matrix.platform }}
 
       # Signing is for SmartScreen and publisher trust: the app runs asInvoker with uiAccess
       # off, so nothing requires a signature to run. Unsigned builds still release, and the
@@ -98,13 +151,15 @@ jobs:
             Remove-Item $pfxPath -ErrorAction SilentlyContinue
           }
 
+      # Pinned: the ISCC path below is Inno Setup 6's, and a version 7 package installs elsewhere.
       - name: Install Inno Setup
-        run: choco install innosetup -y --no-progress
+        # --allow-downgrade: the runner image may already carry a newer 6.x.
+        run: choco install innosetup --version=6.7.1 --allow-downgrade -y --no-progress
 
       - name: Build installer
         shell: pwsh
         run: |
-          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DMyAppVersion=${{ steps.version.outputs.number }}" "/DMyAppArch=${{ matrix.arch_flag }}" "/DMyPublishDir=..\publish\${{ matrix.platform }}" "/DMyOutputSuffix=-${{ matrix.platform }}" installer/swissolly-setup.iss
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DMyAppVersion=${{ needs.verify.outputs.number }}" "/DMyAppArch=${{ matrix.arch_flag }}" "/DMyPublishDir=..\publish\${{ matrix.platform }}" "/DMyOutputSuffix=-${{ matrix.platform }}" installer/swissolly-setup.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Sign installer

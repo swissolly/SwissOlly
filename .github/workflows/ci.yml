@@ -84,8 +84,10 @@ jobs:
         run: dotnet publish SwissOlly.App/SwissOlly.App.csproj -c Release -p:Platform=${{ matrix.platform }} -r ${{ matrix.runtime }} --self-contained -o publish/${{ matrix.platform }}
 
       # Compile the installer on every run so a broken script shows up here, not on release day.
+      # Pinned: the ISCC path below is Inno Setup 6's, and a version 7 package installs elsewhere.
       - name: Install Inno Setup
-        run: choco install innosetup -y --no-progress
+        # --allow-downgrade: the runner image may already carry a newer 6.x.
+        run: choco install innosetup --version=6.7.1 --allow-downgrade -y --no-progress
 
       - name: Compile installer (smoke test)
         shell: pwsh

@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
+using Microsoft.UI.Dispatching;
 using Microsoft.UI.Windowing;
 using SwissOlly.App.Services;
 using SwissOlly.App.ViewModels;
@@ -52,12 +53,81 @@ public sealed partial class ShellWindow
             if (!_trayIcon.IsAdded)
             {
                 _trayIcon.Add();
+                if (!_trayIcon.IsAdded)
+                {
+                    StartupTrace.Write("Tray icon not added; retrying");
+                    RetryTrayIconUntilAdded();
+                }
             }
 
             return;
         }
 
         RemoveTrayIcon();
+    }
+
+    private DispatcherQueueTimer? _trayIconRetryTimer;
+    private int _trayIconRetriesLeft;
+
+    /// <summary>
+    /// Adding the icon can fail while Explorer is up but still busy at sign-in, and a Start with
+    /// Windows launch then sat hidden with no icon to click. TaskbarCreated only covers an
+    /// Explorer that starts later, so keep trying for a minute.
+    /// </summary>
+    private void RetryTrayIconUntilAdded()
+    {
+        _trayIconRetriesLeft = 20;
+        if (_trayIconRetryTimer is null)
+        {
+            _trayIconRetryTimer = _uiQueue.CreateTimer();
+            _trayIconRetryTimer.Interval = TimeSpan.FromSeconds(3);
+            _trayIconRetryTimer.IsRepeating = true;
+            _trayIconRetryTimer.Tick += (timer, _) =>
+            {
+                // Gone (tray turned off) or already back (TaskbarCreated).
+                if (_trayIcon is null || _trayIcon.IsAdded)
+                {
+                    timer.Stop();
+                    return;
+                }
+
+                if (--_trayIconRetriesLeft < 0)
+                {
+                    timer.Stop();
+                    ShowMinimizedWithoutTrayIcon();
+                    return;
+                }
+
+                _trayIcon.Add();
+                if (_trayIcon.IsAdded)
+                {
+                    StartupTrace.Write("Tray icon added on retry");
+                    timer.Stop();
+                }
+            };
+        }
+
+        _trayIconRetryTimer.Start();
+    }
+
+    /// <summary>
+    /// Out of retries with the window hidden: with no icon there is no way back to it, so put it
+    /// on the taskbar instead, minimized and without taking focus (a game may be in front).
+    /// </summary>
+    private void ShowMinimizedWithoutTrayIcon()
+    {
+        if (!_isHiddenToTray)
+        {
+            return;
+        }
+
+        StartupTrace.Write("Tray icon unavailable; showing the window minimized");
+        _isHiddenToTray = false;
+        // One call, so the restored window never flashes up before minimizing.
+        ShowWindow(WindowNative.GetWindowHandle(this), SwShowMinNoActive);
+
+        // Ready for when it's restored from the taskbar; nothing draws while minimized.
+        SetPanelRenderingSuspended(false);
     }
 
     private void RemoveTrayIcon()
@@ -260,6 +330,9 @@ public sealed partial class ShellWindow
         {
             _autoLaunchService.SetEnabled(enabled);
             _viewModel.LaunchOnStartup = _autoLaunchService.IsEnabled();
+            // SetEnabled can decline quietly (no executable path, or no Run key); only a change
+            // that took is announced as saved.
+            _announceSettingsSave = _viewModel.LaunchOnStartup == enabled;
             DebouncePersistLayout();
         }
         catch (Exception ex)
@@ -276,11 +349,18 @@ public sealed partial class ShellWindow
     {
         _viewModel.MinimizeToTray = enabled;
         SyncTrayIcon();
+        _announceSettingsSave = true;
         DebouncePersistLayout();
         RefreshSettingsDeck();
     }
 
     private const int SmCxSmIcon = 49;
+
+    private const int SwShowMinNoActive = 7;
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ShowWindow(nint windowHandle, int command);
 
     [DllImport("user32.dll")]
     private static extern uint GetDpiForWindow(nint windowHandle);

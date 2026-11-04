@@ -1586,15 +1586,33 @@ public sealed partial class ShellWindow : Window
         storyboard.Begin();
     }
 
+    /// <summary>
+    /// Set by a Settings choice that applies on click (theme, Start with Windows, closing): the next
+    /// save says "Saved" in the floating bar when it lands, or reports why it didn't.
+    /// </summary>
+    private bool _announceSettingsSave;
+
     private async Task PersistLayoutAsync()
     {
+        var announce = _announceSettingsSave;
+        _announceSettingsSave = false;
         try
         {
             await _configStore.SaveAsync(_viewModel.BuildConfig(), CancellationToken.None);
+            if (announce)
+            {
+                _settingsSavedAt = DateTimeOffset.Now;
+                UpdateSettingsActionState();
+            }
         }
         catch (Exception ex)
         {
             StartupTrace.WriteException("PersistLayout", ex);
+            if (announce)
+            {
+                _viewModel.SetStatus($"Couldn't save settings: {ex.Message}", StatusSeverity.Issue);
+                UpdateStatusText();
+            }
         }
     }
 

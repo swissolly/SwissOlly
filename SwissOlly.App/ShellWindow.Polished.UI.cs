@@ -636,6 +636,9 @@ public sealed partial class ShellWindow
         RefreshSettingsDeck();
         _refocusThemeCard = card.FocusState == FocusState.Keyboard ? mode : null;
         App.CurrentApp.ApplyTheme(mode);
+        // The bar says "Saved" once the save lands: with no Apply to press, a theme change looked
+        // like it might not stick.
+        _announceSettingsSave = true;
         DebouncePersistLayout();
     }
 

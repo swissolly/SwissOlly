@@ -38,6 +38,33 @@ Vaktr 1.0.x and data migration are out of scope for this release.
   restart. Worse, a Start with Windows (`--tray`) launch saves straight away and wrote that
   one-panel board over the saved layout, order and visibility. Saved entries for panels not on
   the board now stay parked until the panel arrives (`PanelBoard`, with tests), and saves merge them.
+- **In-game overlay stuck on the desktop after a game.** Leaving a game started a one-poll
+  confirmation before hiding, but the poller skipped any poll whose foreground window hadn't
+  changed, so the confirmation never came and the overlay stayed over the desktop until the next
+  game (seen over VS Code on 2026-11-03). The show/hide rules are now `OverlayVisibility` in Core,
+  with tests. Also: any app missing from a short exclusion list counted as a game, so Discord,
+  Spotify, Outlook, terminals and game launchers brought the overlay up; the list now covers the
+  common ones, plus anything in the Windows folder and any console window. New in 1.2.0, never
+  shipped.
+- **Overlay hotkey in a game** took two presses to hide it, and then the overlay stayed on the
+  desktop after the game with FPS tracking still running. One press now hides it for that game
+  and one brings it back; leaving the game ends it and stops tracking (after the same one-poll
+  grace as a shown overlay, so a glance at a toast doesn't bring it back). Pinned over the
+  desktop, it follows a game that comes to the front, so FPS is tracked and one press hides it
+  there; turning the overlay off always wins over a poll in flight. Show/hide is posted under
+  the visibility lock (a hotkey and a poll could leave the window out of step), FPS start/stop is
+  serialised, overlapping polls are skipped, and shutdown waits for a poll in flight.
+- **Game check read game memory:** it used `Process.MainModule`, which opens the foreground app
+  with memory-read access, the kind of handle anti-cheat watches for. It now asks Windows for
+  the image name with query-only access.
+- **"Saved" after an instant setting** shows once the save has landed, and a failed save says
+  so in the status line instead.
+- **Tray icon at sign-in:** if adding it fails, it's retried for a minute; after that a hidden
+  window shows minimized on the taskbar (without taking focus) so the app stays reachable.
+- Cancel in Edit layout lost the saved cell of a panel that reached the board during the edit
+  (a drive plugged in, or history still loading); the snapshot now includes parked geometry.
+- A theme or Startup and closing choice saves on click with no Apply to press, so it looked like
+  it might not stick; the floating bar now says "Saved" for a moment once the save lands.
 
 ---
 
@@ -120,7 +147,11 @@ Vaktr 1.0.x and data migration are out of scope for this release.
       from code review but not yet seen in a game: corner changes apply live and to the hotkey;
       the hotkey is held only while the overlay is on and doesn't auto-repeat; values no longer
       shift sideways (figure-space padding); over 90% is red. The Settings preview draws the
-      same padding, alignment, colours and opacity as the overlay.
+      same padding, alignment, colours and opacity as the overlay. Also check the 2026-11-04 fix:
+      quit a game (and alt-tab out of one) and the overlay leaves within about a second, and it
+      doesn't come up over Discord, Spotify, a terminal or a game launcher. One hotkey press hides
+      it in a game and one brings it back; quitting after hiding it leaves nothing on the desktop.
+      Worth one session in an anti-cheat game (Overwatch, Battlefield) to confirm nothing complains.
 
 ## 3. Accessibility
 
@@ -128,7 +159,8 @@ Vaktr 1.0.x and data migration are out of scope for this release.
       Tab stops (one per group, arrows move within) with a visible ring; needs a full hands-on pass.
 - [ ] **Narrator pass.** UI Automation found no unnamed focusable element; chips, rows, theme
       cards and swatches report Button with Invoke and "Selected". Listen to it once.
-- [ ] **High contrast:** not supported; the app keeps its own palette. Decide or document.
+- [x] **High contrast:** not supported; the app keeps its own palette. Documented in the release
+      notes (Known limitations) and the README.
 - [ ] **Reduced motion** with animation effects off.
 - [ ] **Text scaling** at 150%.
 
@@ -176,8 +208,10 @@ and under load.
 
 - [x] **No network calls:** nothing in the app's code opens a socket or HttpClient, and none
       were seen in a monitored run.
-- [ ] **Installer elevation:** replace the elevated PowerShell call with `net localgroup` by SID
-      (S-1-5-32-559) and confirm the consent wording.
+- [x] **Installer elevation:** Setup uses `net localgroup` with the group resolved from its SID
+      (S-1-5-32-559), no PowerShell. The consent wording is the "Allow exact FPS" task: "adds you
+      to the Performance Log Users group (works after you sign out and back in; removed on
+      uninstall)".
 - [ ] **Uninstall** reverses the Run key, group membership and shortcuts.
 - [x] **Least privilege:** `asInvoker`; process data comes from one kernel snapshot, so no
       process handles are opened at all.
@@ -190,7 +224,10 @@ and under load.
       brings in (SQLitePCLRaw 2.1.6, SQLite 3.41.2: CVE-2025-6965, High); a direct
       `SQLitePCLRaw.bundle_e_sqlite3` 2.1.14 reference lifts it to SQLite 3.54.0, and the check is
       now clean.
-- [ ] **Signing:** a signed installer and exe, or say "unsigned" in the release notes.
+- [x] **Signing:** shipping unsigned; the release notes say so under Known limitations, with the
+      SmartScreen steps and `SHA256SUMS.txt`, and the website's install section and FAQ explain it.
+      The workflow signs both the exe and the installer if a `CODE_SIGN_PFX` secret is added
+      (the uninstaller would also need `SignTool=` in the `.iss`).
 
 ## 7. Reliability and data integrity
 
@@ -209,19 +246,28 @@ and under load.
 - [x] Everything in §0.
 - [ ] **Tests on ARM64,** or document why x64 is enough. ARM64 Release builds warning-free.
 - [x] **Installer compiles** locally (Inno Setup, 67.7 MB). Add it to CI.
-- [ ] **Dry-run release** on a throwaway tag in a fork.
-- [ ] **Checksums:** SHA-256 per installer.
+- [ ] **Dry-run release** on a throwaway tag in a fork. `release.yml` now has a `verify` job that
+      runs first: an exact `vX.Y.Z` tag (a manual run given `v1.2.0` used to tag `vv1.2.0`), the
+      version in `Directory.Build.props`, the commit on `main`, the tag not already taken (manual
+      runs), and the tests. Inno Setup is pinned to 6.7.1 in both workflows (the ISCC path is
+      version 6's). The release is created as a **draft**: publish it with "Set as latest".
+      To dry-run: push the release commit to `main` of a private scratch repo, push `v1.2.0`,
+      and check both installers, `SHA256SUMS.txt` (two lines) and the draft's notes.
+- [x] **Checksums:** `create-release` writes `SHA256SUMS.txt` for both installers and attaches it.
 - [x] **Release notes** in `docs/release-notes/v1.2.0.md`, including the new themes, the
       Settings redesign, neon overlay colours and the fixes above.
 - [x] **Decision:** `WindowsAppSDKSelfContained` is on for Release builds.
 
 ## 9. Website (SwissOlly.Web)
 
-- [ ] **Replace screenshots** in the default theme at 1x and 2x (show the new themes).
-- [ ] **Domain:** `swissolly.io`. Canonical, Open Graph, JSON-LD, sitemap and robots URLs use it
-      now; the domain still has to be added at the host and in DNS, with `vaktr.app` redirecting.
+- [x] **Replace screenshots:** captured from the app in the Dark theme (Overview, Processes,
+      overlay settings, themes) plus a 1200 × 630 link card; the README uses them too. See
+      SwissOlly.Web's TASKS.md for the site's own list.
+- [x] **Domain:** swissolly.io is live on a Cloudflare Worker, with HTTPS enforced. vaktr.app is
+      being retired, not redirected.
 - [ ] **Lighthouse** ≥ 90 and the link card on Discord and X.
-- [ ] **Download** links resolve to the 1.2.0 release.
+- [ ] **Download** links resolve to the 1.2.0 release. Blocked: `github.com/swissolly/SwissOlly`
+      is private, so every Download and GitHub link on the site returns 404 to visitors.
 - [x] **CI:** the validate workflow fails on broken links now (it never did).
 
 ## 10. Repository hygiene

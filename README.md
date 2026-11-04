@@ -2,7 +2,7 @@
 
 Local Windows system monitor. Live and historical telemetry, stored on-disk in SQLite, rendered in WinUI 3.
 
-![SwissOlly Dashboard](docs/images/dashboard.png)
+![SwissOlly overview in the Dark theme: CPU, memory and GPU charts over the last 12 hours](docs/images/overview.png)
 
 ## Overview
 
@@ -10,7 +10,7 @@ SwissOlly samples hardware counters on a configurable interval, persists them to
 
 ## What it shows
 
-![SwissOlly Live Board](docs/images/dashboard2.png)
+![The process memory list over the Memory panel, with every Code process pinned to the chart](docs/images/processes.png)
 
 Summary gauges for CPU, GPU, memory, and drives with threshold coloring at 75% and 90%.
 
@@ -23,7 +23,7 @@ Panels for:
 | Memory | Used / available / total |
 | Disk | Read/write throughput per drive, capacity |
 | Network | Down/up per interface |
-| Processes | Per-process CPU and memory for every process, services included; sortable, pin any to the chart |
+| Processes | Per-process CPU and memory, services included; the top 15 (50 as you scroll), sortable, pin any to the chart |
 | Host activity | Process, thread and handle counts |
 
 CPU figures follow Task Manager: total CPU is `% Processor Utility`, and a process's CPU is its share of the whole machine. Process memory is the private working set, the measure in Task Manager's Memory column.
@@ -45,6 +45,8 @@ Layout:
 
 An in-game telemetry overlay that paints on top of running games. Owned by the main SwissOlly process — no second window, no taskbar entry, no Alt+Tab entry. Configure it in Settings.
 
+![Overlay settings: what it shows, position, size, opacity, hotkey and colour, with a live preview](docs/images/overlay.png)
+
 - Three modes: FPS only, all metrics (FPS + CPU + GPU + GPU temp + memory), or Custom (pick your own)
 - Corner positioning (top-left, top-right, bottom-left, bottom-right)
 - Text color from six classic and ten neon presets, or any hex value; font size, opacity, and toggle hotkey, with a live preview in Settings
@@ -59,8 +61,6 @@ Reading the per-process present rate requires membership in the built-in **Perfo
 
 ## Settings
 
-![Settings](docs/images/control-deck.png)
-
 - **Collection:** scrape interval, 1–60 seconds
 - **Retention:** 1 minute to 10 years (30m, 24h, 7d…). Lowering it asks before deleting older history.
 - **Storage:** any folder on a local drive. A different folder starts its own history; nothing is moved.
@@ -74,6 +74,8 @@ Only one copy runs at a time; opening SwissOlly again brings the running window 
 ### Themes
 
 Twelve palettes, each shown in Settings as a small preview of the app in that theme:
+
+![The theme picker: eight dark and four light themes](docs/images/themes.png)
 
 | Theme | Tone |
 |-------|------|
@@ -139,12 +141,12 @@ Background collector samples hardware counters every 2 seconds (configurable). S
 | Graph window | 15 minutes |
 | Retention | 24 hours |
 | Storage | `%LocalAppData%\SwissOlly\Data` |
-| Theme | Dark (8 available) |
+| Theme | Dark (12 available) |
 | Closing the window | Keeps running in the tray |
 
 ## Privacy
 
-No network calls, no telemetry, no update pings. SwissOlly writes only to its settings folder (`%LocalAppData%\SwissOlly`) and the storage folder. The history database holds metric values and the names of running processes, nothing else. A custom storage folder keeps the permissions of the folder it is created in, so on a shared PC pick one under your own user profile. Uninstalling keeps settings and history; delete `%LocalAppData%\SwissOlly` to remove them.
+No network calls, no telemetry, no update pings. SwissOlly writes only to its settings folder (`%LocalAppData%\SwissOlly`) and the storage folder. The history database holds metric values and the names of the panels they belong to (such as drive and network adapter names), nothing else; process lists are shown live and never saved. A custom storage folder keeps the permissions of the folder it is created in, so on a shared PC pick one under your own user profile. Uninstalling keeps settings and history; delete `%LocalAppData%\SwissOlly` to remove them.
 
 ## Roadmap
 

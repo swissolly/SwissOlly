@@ -9,8 +9,6 @@ namespace SwissOlly.Overlay;
 
 public sealed class OverlayController : IDisposable
 {
-    private enum State { Hidden, ShownByGame, ShownByHotkey, Suspended }
-
     private readonly LayeredOverlayWindow _window;
     private readonly OverlayBitmapRenderer _renderer;
     private readonly GlobalHotkeyService _hotkey;
@@ -18,11 +16,14 @@ public sealed class OverlayController : IDisposable
     private System.Threading.Timer? _pollTimer;
     private readonly AdaptiveFpsSource _fps = new();
 
-    private State _state = State.Hidden;
+    // Polled on a timer thread; the hotkey and config changes arrive on the UI thread. Lock order
+    // is visibility, then render; FPS start/stop has its own lock and never takes the others.
+    private readonly OverlayVisibility _visibility = new();
+    private readonly object _visibilityLock = new();
+    private readonly object _fpsLock = new();
+    private int _polling;
     private volatile OverlayConfig _config = new OverlayConfig().Normalize();
 
-    private IntPtr _lastForegroundHwnd;
-    private IntPtr _pendingHideHwnd = IntPtr.Zero;
     private double _lastFps = double.NaN;
     private string? _fpsError;
     private FpsAccuracy _fpsAccuracy = FpsAccuracy.Unavailable;
@@ -126,15 +127,13 @@ public sealed class OverlayController : IDisposable
         if (enabledChanged)
         {
             OverlayLog.Write($"Enabled changed → {config.Enabled}");
+            // Either way the next poll judges the foreground window afresh.
+            lock (_visibilityLock)
+                _visibility.Reset();
             if (!config.Enabled)
             {
                 StopFps();
-                TransitionTo(State.Hidden);
-            }
-            else
-            {
-                // Reset so the next poll immediately re-evaluates the current foreground window
-                _lastForegroundHwnd = IntPtr.Zero;
+                ApplyVisibility();
             }
         }
 
@@ -159,106 +158,122 @@ public sealed class OverlayController : IDisposable
 
     private void PollForeground(object? state)
     {
+        // Timer callbacks overlap when one runs long (stopping an ETW session can take seconds).
+        if (Interlocked.Exchange(ref _polling, 1) != 0) return;
         try
         {
             if (!_config.Enabled) return;
-            if (_state == State.ShownByHotkey) return;
 
             var hwnd = Win32Interop.GetForegroundWindow();
-            if (hwnd == _lastForegroundHwnd) return;
+            OverlayVisibilityChange change;
+            lock (_visibilityLock)
+                change = _visibility.OnPoll(hwnd, GameProcessClassifier.IsLikelyGame);
 
-            OverlayLog.Write($"Foreground changed → 0x{hwnd:X}");
-            _lastForegroundHwnd = hwnd;
-            OnForegroundChanged(hwnd);
+            if (change != OverlayVisibilityChange.None)
+            {
+                OverlayLog.Write($"Foreground 0x{hwnd:X} → {change}");
+                Apply(change, hwnd);
+            }
         }
         catch (Exception ex)
         {
             OverlayLog.Write($"PollForeground error: {ex.GetType().Name}: {ex.Message}");
         }
+        finally
+        {
+            Volatile.Write(ref _polling, 0);
+        }
     }
 
-    private void OnForegroundChanged(IntPtr hwnd)
+    private void Apply(OverlayVisibilityChange change, IntPtr foreground)
     {
-        if (!_config.Enabled) return;
-        if (_state == State.ShownByHotkey) return;
-
-        if (GameProcessClassifier.IsLikelyGame(hwnd))
+        switch (change)
         {
-            _pendingHideHwnd = IntPtr.Zero;
-            uint pid = GameProcessClassifier.GetProcessId(hwnd);
-            string exeName = "?";
-            try { exeName = System.Diagnostics.Process.GetProcessById((int)pid).ProcessName; } catch { }
-            OverlayLog.Write($"Game detected pid={pid} exe={exeName} — transitioning to ShownByGame");
-            StartFps(pid);
-
-            // Log game window position for debugging
-            var gameRect = new Win32Interop.RECT();
-            Win32Interop.GetWindowRect(hwnd, ref gameRect);
-            OverlayLog.Write($"Game hwnd=0x{hwnd:X} rect=[{gameRect.Left},{gameRect.Top},{gameRect.Right},{gameRect.Bottom}]");
-
-            var monitor = Win32Interop.MonitorFromWindow(hwnd, Win32Interop.MONITOR_DEFAULTTONEAREST);
-
-            // In exclusive fullscreen, GetWindowRect may report (0,0)-relative coordinates even
-            // on a secondary monitor, causing MonitorFromWindow to return the wrong monitor.
-            // Cross-check with the cursor: when a game is active, the cursor is captured to the
-            // game's display — so a mismatch means we picked the wrong monitor.
-            var cursorPt = new Win32Interop.POINT();
-            Win32Interop.GetCursorPos(ref cursorPt);
-            var cursorMonitor = Win32Interop.MonitorFromPoint(cursorPt, Win32Interop.MONITOR_DEFAULTTONEAREST);
-            if (cursorMonitor != IntPtr.Zero && cursorMonitor != monitor)
-            {
-                OverlayLog.Write($"Monitor mismatch: window → 0x{monitor:X}, cursor @ ({cursorPt.X},{cursorPt.Y}) → 0x{cursorMonitor:X}. Using cursor monitor.");
-                monitor = cursorMonitor;
-            }
-
-            var monInfo = new Win32Interop.MONITORINFO { cbSize = (uint)System.Runtime.InteropServices.Marshal.SizeOf<Win32Interop.MONITORINFO>() };
-            Win32Interop.GetMonitorInfo(monitor, ref monInfo);
-            OverlayLog.Write($"Overlay monitor rect=[{monInfo.rcMonitor.Left},{monInfo.rcMonitor.Top},{monInfo.rcMonitor.Right},{monInfo.rcMonitor.Bottom}]");
-
-            _window.Reposition(_config.Corner, monitor, hwnd);
-            TransitionTo(State.ShownByGame);
+            case OverlayVisibilityChange.ShowForGame:
+                ShowOverGame(foreground);
+                break;
+            case OverlayVisibilityChange.Hide:
+                StopFps();
+                ApplyVisibility();
+                break;
+            case OverlayVisibilityChange.Suppress:
+            case OverlayVisibilityChange.ShowForHotkey:
+                ApplyVisibility();
+                break;
         }
-        else
+    }
+
+    private void ShowOverGame(IntPtr hwnd)
+    {
+        uint pid = GameProcessClassifier.GetProcessId(hwnd);
+        string exeName = "?";
+        try
         {
-            if (_state == State.ShownByGame)
-            {
-                if (hwnd == _pendingHideHwnd)
-                {
-                    // Same non-game window seen twice in a row (~1 second) — truly left the game
-                    _pendingHideHwnd = IntPtr.Zero;
-                    StopFps();
-                    OverlayLog.Write($"No longer a game (confirmed) — hiding");
-                    TransitionTo(State.Hidden);
-                }
-                else
-                {
-                    // First non-game poll — could be a brief alt-tab; wait for next poll to confirm
-                    _pendingHideHwnd = hwnd;
-                    OverlayLog.Write($"Non-game foreground 0x{hwnd:X} — waiting for confirmation");
-                }
-            }
+            using var process = System.Diagnostics.Process.GetProcessById((int)pid);
+            exeName = process.ProcessName;
         }
+        catch { }
+        OverlayLog.Write($"Game detected pid={pid} exe={exeName} — showing");
+        StartFps(pid);
+        // Turned off, or hidden by a hotkey or another poll, while this one was starting up.
+        if (!_config.Enabled || !_visibility.IsShown)
+        {
+            StopFps();
+        }
+
+        // Log game window position for debugging
+        var gameRect = new Win32Interop.RECT();
+        Win32Interop.GetWindowRect(hwnd, ref gameRect);
+        OverlayLog.Write($"Game hwnd=0x{hwnd:X} rect=[{gameRect.Left},{gameRect.Top},{gameRect.Right},{gameRect.Bottom}]");
+
+        var monitor = Win32Interop.MonitorFromWindow(hwnd, Win32Interop.MONITOR_DEFAULTTONEAREST);
+
+        // In exclusive fullscreen, GetWindowRect may report (0,0)-relative coordinates even
+        // on a secondary monitor, causing MonitorFromWindow to return the wrong monitor.
+        // Cross-check with the cursor: when a game is active, the cursor is captured to the
+        // game's display — so a mismatch means we picked the wrong monitor.
+        var cursorPt = new Win32Interop.POINT();
+        Win32Interop.GetCursorPos(ref cursorPt);
+        var cursorMonitor = Win32Interop.MonitorFromPoint(cursorPt, Win32Interop.MONITOR_DEFAULTTONEAREST);
+        if (cursorMonitor != IntPtr.Zero && cursorMonitor != monitor)
+        {
+            OverlayLog.Write($"Monitor mismatch: window → 0x{monitor:X}, cursor @ ({cursorPt.X},{cursorPt.Y}) → 0x{cursorMonitor:X}. Using cursor monitor.");
+            monitor = cursorMonitor;
+        }
+
+        var monInfo = new Win32Interop.MONITORINFO { cbSize = (uint)System.Runtime.InteropServices.Marshal.SizeOf<Win32Interop.MONITORINFO>() };
+        Win32Interop.GetMonitorInfo(monitor, ref monInfo);
+        OverlayLog.Write($"Overlay monitor rect=[{monInfo.rcMonitor.Left},{monInfo.rcMonitor.Top},{monInfo.rcMonitor.Right},{monInfo.rcMonitor.Bottom}]");
+
+        _window.Reposition(_config.Corner, monitor, hwnd);
+        ApplyVisibility();
     }
 
     private void OnHotkeyPressed()
     {
         if (!_config.Enabled) return;
-        OverlayLog.Write($"Hotkey pressed, state={_state}");
 
-        if (_state == State.ShownByHotkey)
-            TransitionTo(State.Hidden);
-        else
-            TransitionTo(State.ShownByHotkey);
+        OverlayVisibilityChange change;
+        lock (_visibilityLock)
+            change = _visibility.OnHotkey();
+        OverlayLog.Write($"Hotkey pressed → {change}");
+        Apply(change, IntPtr.Zero);
     }
 
-    private void TransitionTo(State next)
+    private void ApplyVisibility()
     {
-        OverlayLog.Write($"TransitionTo {next}");
-        _state = next;
-        if (next == State.Hidden)
-            _window.Hide();
-        else
+        // Under the lock, so a hotkey on the UI thread and a poll on the timer thread can't post
+        // Show and Hide out of order and leave the window out of step with the state.
+        lock (_visibilityLock)
         {
+            // Off wins: a poll already past its Enabled check could otherwise show it after
+            // the overlay was turned off.
+            if (!_visibility.IsShown || !_config.Enabled)
+            {
+                _window.Hide();
+                return;
+            }
+
             // Force a fresh ULW call on every show — layered window content is lost on hide/re-show
             lock (_renderLock)
                 _renderer.Invalidate();
@@ -267,23 +282,30 @@ public sealed class OverlayController : IDisposable
         }
     }
 
+    // The FPS sources aren't thread-safe, and these are called from the poll timer and the UI thread.
     private void StartFps(uint pid)
     {
-        _lastFps = double.NaN;
-        _fpsError = null;
-        _fps.StartTracking(pid);
+        lock (_fpsLock)
+        {
+            _lastFps = double.NaN;
+            _fpsError = null;
+            _fps.StartTracking(pid);
+        }
     }
 
     private void StopFps()
     {
-        _fps.StopTracking();
-        _lastFps = double.NaN;
-        _fpsError = null;
+        lock (_fpsLock)
+        {
+            _fps.StopTracking();
+            _lastFps = double.NaN;
+            _fpsError = null;
+        }
     }
 
     private void PushRender()
     {
-        if (_state == State.Hidden) return;
+        if (!_visibility.IsShown) return;
 
         lock (_renderLock)
         {
@@ -399,7 +421,14 @@ public sealed class OverlayController : IDisposable
 
     public void Dispose()
     {
-        _pollTimer?.Dispose();
+        // Let a poll that's already running finish before the FPS source and window go.
+        if (_pollTimer is not null)
+        {
+            using var pollsDone = new ManualResetEvent(false);
+            if (_pollTimer.Dispose(pollsDone))
+                pollsDone.WaitOne(TimeSpan.FromSeconds(6));
+        }
+
         StopFps();
         _fps.Dispose();
         _hotkey.Dispose();
