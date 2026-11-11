@@ -1,0 +1,27 @@
+version: 2
+updates:
+  - package-ecosystem: nuget
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      nuget-minor-and-patch:
+        update-types: [minor, patch]
+    ignore:
+      # A Windows App SDK major changes the XAML runtime this app's custom controls rely on;
+      # take those by hand and test in the app, not through an automatic PR.
+      - dependency-name: Microsoft.WindowsAppSDK
+        update-types: [version-update:semver-major]
+      # Pinned in SwissOlly.Store to lift the native SQLite under Microsoft.Data.Sqlite 8; 3.x is
+      # a different provider line, so move to it together with Microsoft.Data.Sqlite, by hand.
+      - dependency-name: SQLitePCLRaw.bundle_e_sqlite3
+        update-types: [version-update:semver-major]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ['*']

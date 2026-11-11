@@ -7,17 +7,94 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version (e.g. 1.0.1)'
+        description: 'Version without the leading v (e.g. 1.2.0). Must match <Version> in Directory.Build.props.'
         required: true
-        default: '1.0.1'
+        default: '1.2.0'
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # A tag push releases that tag; a manual run releases the version typed in. Read through env,
+  # never interpolated into scripts, so the input can't inject shell.
+  RELEASE_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}', inputs.version) }}
 
 jobs:
+  # Everything that can refuse a release runs first, before two installer builds are spent on it.
+  verify:
+    name: Verify release
+    runs-on: windows-latest
+    outputs:
+      number: ${{ steps.version.outputs.number }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Full history, to check the release commit is on main.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check version
+        id: version
+        shell: pwsh
+        run: |
+          # Exactly one leading v: a manual run given "v1.2.0" (the input wants 1.2.0) would
+          # otherwise tag and draft "vv1.2.0".
+          # [0-9] and \z: \d takes any Unicode digit and $ allows a trailing newline, which would
+          # pass here and then break the git tag step.
+          if ($env:RELEASE_VERSION -cmatch '^v([0-9]+\.[0-9]+\.[0-9]+)\z') {
+            $version = $Matches[1]
+          } else {
+            Write-Error "Release version '$env:RELEASE_VERSION' must look like v1.2.0 (for a manual run, type 1.2.0)."
+            exit 1
+          }
+          # One version everywhere: the tag, the installer and the app's assembly version.
+          [xml]$props = Get-Content Directory.Build.props
+          $projectVersion = "$($props.Project.PropertyGroup.Version)".Trim()
+          if ($projectVersion -ne $version) {
+            Write-Error "Directory.Build.props says $projectVersion but this release is $version. Bump <Version> first."
+            exit 1
+          }
+          "number=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Check the release commit is on main
+        shell: pwsh
+        run: |
+          git merge-base --is-ancestor $env:GITHUB_SHA origin/main
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "$env:GITHUB_SHA isn't on main. Merge the release first, then tag main."
+            exit 1
+          }
+
+      - name: Check the tag is new (manual dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        run: |
+          # The full-history checkout above fetched every tag, so this needs no credentials.
+          git rev-parse -q --verify "refs/tags/$env:RELEASE_VERSION" | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Error "Tag $env:RELEASE_VERSION already exists."
+            exit 1
+          }
+          exit 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Run tests
+        run: dotnet test SwissOlly.Tests/SwissOlly.Tests.csproj -c Release --verbosity normal
+
   build-installer:
     name: Build Installer (${{ matrix.platform }})
     runs-on: windows-latest
+    needs: verify
 
     strategy:
       matrix:
@@ -31,61 +108,136 @@ jobs:
             arch_flag: arm64
 
     env:
-      # Use tag version if triggered by tag, otherwise use manual input
-      RELEASE_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}', inputs.version) }}
+      # `secrets` is not available in step conditions, so expose only whether a certificate exists.
+      HAS_SIGNING_CERT: ${{ secrets.CODE_SIGN_PFX != '' }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # NuGet packages bring their own build targets; don't leave the repo token on disk for them.
+          persist-credentials: false
 
       - name: Setup .NET
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
         with:
           dotnet-version: 8.0.x
 
       - name: Restore
-        run: dotnet restore Vaktr.sln
+        run: dotnet restore SwissOlly.sln
 
       - name: Publish app (self-contained ${{ matrix.platform }})
-        run: dotnet publish Vaktr.App/Vaktr.App.csproj -c Release -p:Platform=${{ matrix.platform }} -r ${{ matrix.runtime }} --self-contained -o publish/${{ matrix.platform }}
+        run: dotnet publish SwissOlly.App/SwissOlly.App.csproj -c Release -p:Platform=${{ matrix.platform }} -r ${{ matrix.runtime }} --self-contained -p:Version=${{ needs.verify.outputs.number }} -o publish/${{ matrix.platform }}
 
+      # Signing is for SmartScreen and publisher trust: the app runs asInvoker with uiAccess
+      # off, so nothing requires a signature to run. Unsigned builds still release, and the
+      # release notes have to say so.
+      - name: Sign executable
+        if: env.HAS_SIGNING_CERT == 'true'
+        shell: pwsh
+        env:
+          PFX_BASE64: ${{ secrets.CODE_SIGN_PFX }}
+          PFX_PASS: ${{ secrets.CODE_SIGN_PFX_PASSWORD }}
+        run: |
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object { [version]$_.Directory.Parent.Name } | Select-Object -Last 1
+          if (-not $signtool) { Write-Error 'signtool.exe not found in any installed Windows SDK.'; exit 1 }
+          $pfxPath = Join-Path $env:RUNNER_TEMP 'swissolly-sign.pfx'
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:PFX_BASE64))
+          try {
+            & $signtool.FullName sign /f $pfxPath /p $env:PFX_PASS /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 "publish/${{ matrix.platform }}/SwissOlly.exe"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally {
+            Remove-Item $pfxPath -ErrorAction SilentlyContinue
+          }
+
+      # Pinned: the ISCC path below is Inno Setup 6's, and a version 7 package installs elsewhere.
       - name: Install Inno Setup
-        run: choco install innosetup -y --no-progress
+        # --allow-downgrade: the runner image may already carry a newer 6.x.
+        run: choco install innosetup --version=6.7.1 --allow-downgrade -y --no-progress
 
       - name: Build installer
+        shell: pwsh
         run: |
-          $version = "${{ env.RELEASE_VERSION }}".TrimStart("v")
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion="$version" /DMyAppArch="${{ matrix.arch_flag }}" /DMyPublishDir="..\publish\${{ matrix.platform }}" /DMyOutputSuffix="-${{ matrix.platform }}" installer/vaktr-setup.iss
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DMyAppVersion=${{ needs.verify.outputs.number }}" "/DMyAppArch=${{ matrix.arch_flag }}" "/DMyPublishDir=..\publish\${{ matrix.platform }}" "/DMyOutputSuffix=-${{ matrix.platform }}" installer/swissolly-setup.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Sign installer
+        if: env.HAS_SIGNING_CERT == 'true'
+        shell: pwsh
+        env:
+          PFX_BASE64: ${{ secrets.CODE_SIGN_PFX }}
+          PFX_PASS: ${{ secrets.CODE_SIGN_PFX_PASSWORD }}
+        run: |
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object { [version]$_.Directory.Parent.Name } | Select-Object -Last 1
+          if (-not $signtool) { Write-Error 'signtool.exe not found in any installed Windows SDK.'; exit 1 }
+          $pfxPath = Join-Path $env:RUNNER_TEMP 'swissolly-sign.pfx'
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:PFX_BASE64))
+          try {
+            Get-ChildItem installer/Output/*.exe | ForEach-Object {
+              & $signtool.FullName sign /f $pfxPath /p $env:PFX_PASS /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $_.FullName
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+          } finally {
+            Remove-Item $pfxPath -ErrorAction SilentlyContinue
+          }
 
       - name: Upload installer
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: VaktrSetup-${{ matrix.platform }}-${{ env.RELEASE_VERSION }}
+          name: SwissOllySetup-${{ matrix.platform }}-${{ env.RELEASE_VERSION }}
           path: installer/Output/*.exe
+          if-no-files-found: error
 
   create-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
     needs: build-installer
+    permissions:
+      contents: write
 
     steps:
-      - name: Download x64 installer
-        uses: actions/download-artifact@v4
+      # Needed for the tag below and for the release notes file.
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Download installers
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          pattern: VaktrSetup-*
+          pattern: SwissOllySetup-*
           merge-multiple: true
           path: installers/
+
+      - name: Write checksums
+        working-directory: installers
+        run: |
+          sha256sum *.exe > SHA256SUMS.txt
+          cat SHA256SUMS.txt
 
       - name: Create tag (manual dispatch only)
         if: github.event_name == 'workflow_dispatch'
         run: |
-          git tag ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}', inputs.version) }}
-          git push origin ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}', inputs.version) }}
+          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_VERSION" > /dev/null; then
+            echo "Tag $RELEASE_VERSION already exists." >&2
+            exit 1
+          fi
+          git tag "$RELEASE_VERSION" "$GITHUB_SHA"
+          git push origin "refs/tags/$RELEASE_VERSION"
+
+      - name: Pick release notes
+        id: notes
+        run: |
+          notes="docs/release-notes/$RELEASE_VERSION.md"
+          if [ -f "$notes" ]; then echo "path=$notes" >> "$GITHUB_OUTPUT"; else echo "No $notes; using generated notes only."; fi
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}', inputs.version) }}
-          files: installers/*.exe
+          tag_name: ${{ env.RELEASE_VERSION }}
+          files: |
+            installers/*.exe
+            installers/SHA256SUMS.txt
+          body_path: ${{ steps.notes.outputs.path }}
           draft: true
           generate_release_notes: true

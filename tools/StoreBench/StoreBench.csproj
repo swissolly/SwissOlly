@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Seeds, measures and crash-tests the history database through SwissOlly.Store's own code.
+       Not part of SwissOlly.sln: run it by hand (see Program.cs for the commands). -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\SwissOlly.Core\SwissOlly.Core.csproj" />
+    <ProjectReference Include="..\..\SwissOlly.Store\SwissOlly.Store.csproj" />
+  </ItemGroup>
+
+</Project>
