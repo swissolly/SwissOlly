@@ -42,6 +42,11 @@ scripts/
 # Claude Code
 .claude/
 
+# Working notes, kept out of the public repository. The task list lives in the website's
+# private repository (TASKS-APP.md there).
+/CLAUDE.md
+/TASKS.md
+
 # Installer output
 installer/Output/
 

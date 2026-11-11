@@ -78,6 +78,9 @@ Name: "exactfps"; Description: "Allow exact FPS: adds you to the ""Performance L
 [Files]
 ; Include everything from the publish folder
 Source: "{#MyPublishDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; SwissOlly's license and the licenses of the libraries it ships, beside the exe.
+Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
+Source: "..\THIRD-PARTY-NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Comment: "{#MyAppDescription}"

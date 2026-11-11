@@ -28,6 +28,18 @@ internal static class EtwInterop
     // D3D9 event ID for IDirect3DDevice9::Present entry.
     internal const int EventIdD3d9PresentStart = 1;
 
+    // Microsoft-Windows-DxgKernel, the graphics kernel. Every present passes through it whatever
+    // the API, so it also covers Vulkan and OpenGL, which the two providers above never see.
+    // Present_Info is logged once per present, on the presenting process's thread. Measured
+    // 2026-11-09 from a session without elevation: the same count as DXGI's Present_Start for
+    // Overwatch (140/s) and VS Code, and as D3D9's for Visual Studio.
+    internal static Guid DxgKernelProviderGuid = new("802ec45a-1e99-4b83-9920-87c98277ba9d");
+    internal const int EventIdDxgKernelPresentInfo = 184;
+    internal const ulong DxgKernelBaseKeyword = 0x1;
+
+    private const uint EventFilterTypeEventId = 0x80000200;
+    private const uint EnableTraceParametersVersion2 = 2;
+
     internal const uint EventTraceRealTimeMode = 0x00000100;
     internal const uint WnodeFlagTracedGuid = 0x00020000;
     internal const uint ProcessTraceModeRealTime = 0x00000100;
@@ -200,6 +212,62 @@ internal static class EtwInterop
     internal static extern uint EnableTraceEx2(
         ulong traceHandle, ref Guid providerId, uint controlCode, byte level,
         ulong matchAnyKeyword, ulong matchAllKeyword, uint timeout, IntPtr enableParameters);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct EVENT_FILTER_DESCRIPTOR
+    {
+        public ulong Ptr;
+        public uint Size;
+        public uint Type;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ENABLE_TRACE_PARAMETERS
+    {
+        public uint Version;
+        public uint EnableProperty;
+        public uint ControlFlags;
+        public Guid SourceId;
+        public IntPtr EnableFilterDesc;
+        public uint FilterDescCount;
+    }
+
+    /// <summary>
+    /// Enables a provider for the listed event IDs only. The graphics kernel logs thousands of
+    /// events a second; this filter runs in the kernel, so only the wanted ones reach the session.
+    /// </summary>
+    internal static uint EnableTraceForEventIds(ulong sessionHandle, ref Guid providerId, ulong matchAnyKeyword, ReadOnlySpan<ushort> eventIds)
+    {
+        // EVENT_FILTER_EVENT_ID: BOOLEAN FilterIn, UCHAR Reserved, USHORT Count, USHORT Events[].
+        int filterSize = 4 + (2 * eventIds.Length);
+        IntPtr filter = Marshal.AllocHGlobal(filterSize);
+        IntPtr descriptor = Marshal.AllocHGlobal(Marshal.SizeOf<EVENT_FILTER_DESCRIPTOR>());
+        IntPtr parameters = Marshal.AllocHGlobal(Marshal.SizeOf<ENABLE_TRACE_PARAMETERS>());
+        try
+        {
+            Marshal.WriteByte(filter, 0, 1);
+            Marshal.WriteByte(filter, 1, 0);
+            Marshal.WriteInt16(filter, 2, (short)eventIds.Length);
+            for (int i = 0; i < eventIds.Length; i++)
+                Marshal.WriteInt16(filter, 4 + (2 * i), unchecked((short)eventIds[i]));
+
+            Marshal.StructureToPtr(
+                new EVENT_FILTER_DESCRIPTOR { Ptr = (ulong)filter, Size = (uint)filterSize, Type = EventFilterTypeEventId },
+                descriptor, false);
+            Marshal.StructureToPtr(
+                new ENABLE_TRACE_PARAMETERS { Version = EnableTraceParametersVersion2, EnableFilterDesc = descriptor, FilterDescCount = 1 },
+                parameters, false);
+
+            return EnableTraceEx2(sessionHandle, ref providerId, EventControlCodeEnableProvider,
+                TraceLevelInformation, matchAnyKeyword, 0, 0, parameters);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(parameters);
+            Marshal.FreeHGlobal(descriptor);
+            Marshal.FreeHGlobal(filter);
+        }
+    }
 
     [DllImport("advapi32.dll", CharSet = CharSet.Unicode, EntryPoint = "OpenTraceW", SetLastError = true)]
     internal static extern ulong OpenTrace(ref EVENT_TRACE_LOGFILE logfile);

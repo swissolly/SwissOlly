@@ -383,7 +383,9 @@ public sealed class WindowsMetricCollector : IMetricCollector
             {
                 try
                 {
-                    if (!drive.IsReady || drive.DriveType != DriveType.Fixed || string.IsNullOrWhiteSpace(drive.Name))
+                    // DriveType first: it's a cheap lookup, where IsReady queries the volume, and
+                    // an offline mapped drive or an optical drive can take seconds to answer.
+                    if (drive.DriveType != DriveType.Fixed || string.IsNullOrWhiteSpace(drive.Name) || !drive.IsReady)
                     {
                         continue;
                     }

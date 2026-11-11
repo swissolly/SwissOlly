@@ -171,6 +171,9 @@ public sealed partial class ShellWindow
     {
         CancelActiveLayoutGesture();
         HideGlobalRangeEditor();
+        // Hidden in the first moments after launch: panels still arriving just appear, so the
+        // window doesn't come back with cards part way through an entrance.
+        _launchEntranceOpenUntil = 0;
         _isHiddenToTray = true;
         AppWindow.Hide();
         // Nothing to draw for while hidden; collection, history and the overlay carry on.

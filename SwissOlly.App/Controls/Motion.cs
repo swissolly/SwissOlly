@@ -123,9 +123,7 @@ internal static class Motion
         {
             visual = ElementCompositionPreview.GetElementVisual(element);
             var compositor = visual.Compositor;
-            var easing = compositor.CreateCubicBezierEasingFunction(
-                new Vector2(0.16f, 1f),
-                new Vector2(0.3f, 1f));
+            var easing = CreateEntranceEasing(compositor);
 
             // Build both animations BEFORE hiding the element. The previous order set
             // Opacity = 0 first, so any throw between there and StartAnimation — or an element
@@ -168,6 +166,96 @@ internal static class Motion
         }
     }
 
+    /// <summary>A steep ease-out: most of an entrance happens in its first third, then it settles.</summary>
+    private static CompositionEasingFunction CreateEntranceEasing(Compositor compositor)
+        => compositor.CreateCubicBezierEasingFunction(new Vector2(0.16f, 1f), new Vector2(0.3f, 1f));
+
+    /// <summary>
+    /// Reveals an element from the left, as if drawn: a clip on its composition visual widens
+    /// from <paramref name="fromX"/> to the full width. Only the compositor works on it; the
+    /// element is laid out and drawn once. The clip goes when the sweep ends, and
+    /// <see cref="EndRevealFromLeft"/> takes it off early (its width is fixed, so a resize must).
+    /// Returns false when nothing was started.
+    /// </summary>
+    public static bool PlayRevealFromLeft(UIElement element, double fromX, double width, double height, TimeSpan delay, Action? completed = null)
+    {
+        if (!AnimationsEnabled || element.XamlRoot is null || width <= fromX || height <= 0)
+        {
+            return false;
+        }
+
+        Visual? visual = null;
+        try
+        {
+            visual = ElementCompositionPreview.GetElementVisual(element);
+            var compositor = visual.Compositor;
+
+            // Room past every edge but the leading one, so line caps and the latest-point glow,
+            // which can sit a few pixels outside the element, are never cut.
+            const float overhang = 12f;
+            var full = new Vector2((float)width + (2 * overhang), (float)height + (2 * overhang));
+            var start = new Vector2((float)fromX + overhang, full.Y);
+            var geometry = compositor.CreateRectangleGeometry();
+            geometry.Offset = new Vector2(-overhang, -overhang);
+            geometry.Size = start;
+            var clip = compositor.CreateGeometricClip(geometry);
+
+            // Plain ease-out cubic (EaseOutCubic as a curve), not the entrance's steeper one: that
+            // would sweep most of a line in a few frames and then creep over its newest part. A
+            // sweep is meant to be seen, and to land on "now" without a crawl.
+            var sweep = compositor.CreateVector2KeyFrameAnimation();
+            sweep.InsertKeyFrame(0f, start);
+            sweep.InsertKeyFrame(1f, full, compositor.CreateCubicBezierEasingFunction(new Vector2(1f / 3f, 1f), new Vector2(2f / 3f, 1f)));
+            sweep.Duration = TimeSpan.FromMilliseconds(MotionTokens.Emphasized);
+            sweep.DelayTime = delay;
+
+            visual.Clip = clip;
+            var batch = compositor.CreateScopedBatch(CompositionBatchTypes.Animation);
+            geometry.StartAnimation("Size", sweep);
+            batch.End();
+            var target = visual;
+            batch.Completed += (_, _) =>
+            {
+                if (ReferenceEquals(target.Clip, clip))
+                {
+                    target.Clip = null;
+                }
+
+                completed?.Invoke();
+            };
+            return true;
+        }
+        catch (Exception)
+        {
+            // Decoration only: never leave content hidden behind a half-made clip.
+            try
+            {
+                if (visual is not null)
+                {
+                    visual.Clip = null;
+                }
+            }
+            catch
+            {
+                // Nothing further to undo.
+            }
+
+            return false;
+        }
+    }
+
+    /// <summary>Ends a <see cref="PlayRevealFromLeft"/> sweep at once, showing the whole element.</summary>
+    public static void EndRevealFromLeft(UIElement element)
+    {
+        try
+        {
+            ElementCompositionPreview.GetElementVisual(element).Clip = null;
+        }
+        catch
+        {
+            // Already gone with the element.
+        }
+    }
 }
 
 /// <summary>

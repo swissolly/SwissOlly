@@ -45,12 +45,14 @@ public sealed class App : Application
         };
 #endif
 
-        // Catch exceptions from background threads (LibreHardwareMonitor, WMI)
+        // An exception nothing caught on a background thread (LibreHardwareMonitor, WMI) ends the
+        // process; this can't stop that, only record it for a bug report. It used to log
+        // COMExceptions alone, so every other crash left no trace.
         AppDomain.CurrentDomain.UnhandledException += (_, args) =>
         {
-            if (args.ExceptionObject is System.Runtime.InteropServices.COMException comEx)
+            if (args.ExceptionObject is Exception ex)
             {
-                StartupTrace.WriteException("AppDomain COMException (suppressed)", comEx);
+                StartupTrace.WriteCrash("AppDomain.UnhandledException", ex);
             }
         };
         TaskScheduler.UnobservedTaskException += (_, args) =>
@@ -120,7 +122,8 @@ public sealed class App : Application
 
     private void ApplyThemeResources(ThemeMode mode)
     {
-        var palette = ThemeCatalog.Get(mode).Palette;
+        var theme = ThemeCatalog.Get(mode);
+        var palette = theme.Palette;
 
         SetBrushResource("AppBackdropBrush", palette.AppBackdrop);
         SetBrushResource("ShellBackgroundBrush", palette.ShellBackground);
@@ -144,6 +147,8 @@ public sealed class App : Application
         SetBrushResource("WarningBrush", palette.Warning);
         SetBrushResource("CriticalBrush", palette.Critical);
         SetBrushResource("OverlayScrimBrush", palette.OverlayScrim);
+        // Text fields: white on light palettes, inset on dark ones.
+        SetBrushResource("InputBackgroundBrush", theme.IsLight ? palette.Surface : palette.SurfaceInset);
     }
 
     public Windows.UI.Color ResolveThemeColor(string key, string fallbackHex)
@@ -222,14 +227,18 @@ public sealed class App : Application
     {
         if (e.Exception is not null)
         {
-            StartupTrace.WriteException("App.UnhandledException", e.Exception);
-
             // Always handle COMExceptions — LibreHardwareMonitor and WMI can throw
             // on background threads that we can't catch locally
             if (e.Exception is System.Runtime.InteropServices.COMException)
             {
+                StartupTrace.WriteException("App.UnhandledException", e.Exception);
                 e.Handled = true;
                 StartupTrace.Write("COMException handled to preserve shell");
+            }
+            else
+            {
+                // Left unhandled, so the app is about to close.
+                StartupTrace.WriteCrash("App.UnhandledException", e.Exception);
             }
         }
     }

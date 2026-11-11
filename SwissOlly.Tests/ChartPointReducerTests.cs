@@ -90,4 +90,64 @@ public class ChartPointReducerTests
         Assert.Single(ChartPointReducer.SplitAtGaps(points, minimumGapMs: 8 * 60_000));
         Assert.Equal(2, ChartPointReducer.SplitAtGaps(points, minimumGapMs: 0).Count);
     }
+
+    [Fact]
+    public void A_Quick_Restart_Does_Not_Cut_The_Newest_Samples_Off()
+    {
+        // 15s samples; the app is closed and reopened inside one interval, so the old copy's last
+        // sample and the new copy's first are 1.5s apart. Each 15s sample after that was drawn as
+        // a lone dot until three regular intervals had passed.
+        var beforeRestart = Run(Noon, TimeSpan.FromSeconds(15), 20).ToList();
+        var reopened = beforeRestart[^1].Timestamp.AddSeconds(1.5);
+
+        for (var samplesSince = 1; samplesSince <= 5; samplesSince++)
+        {
+            var points = beforeRestart.Concat(Run(reopened, TimeSpan.FromSeconds(15), samplesSince)).ToArray();
+
+            Assert.Single(ChartPointReducer.SplitAtGaps(points, minimumGapMs: 10_000));
+        }
+    }
+
+    [Fact]
+    public void The_Newest_Sample_After_A_Real_Outage_Still_Starts_A_New_Run()
+    {
+        // One sample so far since the PC woke: nothing after it to compare with.
+        var points = Run(Noon, TimeSpan.FromSeconds(15), 20)
+            .Append(new MetricPoint(Noon.AddMinutes(30), 0))
+            .ToArray();
+
+        Assert.Equal(2, ChartPointReducer.SplitAtGaps(points, minimumGapMs: 10_000).Count);
+    }
+
+    [Fact]
+    public void A_Line_Crossing_The_Window_Edge_Is_Carried_To_The_Edge()
+    {
+        // 15s samples that drift a little late, on a 1m window ending at the newest: the fifth
+        // sample back lands 0.4s outside the window, which left the first quarter of it empty.
+        var points = Run(Noon, TimeSpan.FromSeconds(15.1), 8).ToArray();
+        var start = points[^1].Timestamp.AddMinutes(-1);
+
+        var edge = ChartPointReducer.InterpolateAtEdge(points, 4, start, minimumGapMs: 10_000);
+
+        Assert.NotNull(edge);
+        Assert.Equal(start, edge.Timestamp);
+        Assert.InRange(edge.Value, 3d, 4d);
+        Assert.Equal(3d + (0.4 / 15.1), edge.Value, 6);
+    }
+
+    [Fact]
+    public void No_Edge_Point_Across_An_Outage_Or_Without_A_Sample_Beyond()
+    {
+        var points = Run(Noon, TimeSpan.FromSeconds(15), 8)
+            .Concat(Run(Noon.AddMinutes(10), TimeSpan.FromSeconds(15), 8))
+            .ToArray();
+
+        // Index 8 starts the run after the outage: the line was never drawn across it.
+        Assert.Null(ChartPointReducer.InterpolateAtEdge(points, 8, Noon.AddMinutes(9), minimumGapMs: 10_000));
+        // Nothing before the first sample or after the last.
+        Assert.Null(ChartPointReducer.InterpolateAtEdge(points, 0, Noon.AddSeconds(-5), minimumGapMs: 10_000));
+        Assert.Null(ChartPointReducer.InterpolateAtEdge(points, points.Length, Noon.AddHours(1), minimumGapMs: 10_000));
+        // A sample exactly on the edge needs no extra point.
+        Assert.Null(ChartPointReducer.InterpolateAtEdge(points, 1, points[1].Timestamp, minimumGapMs: 10_000));
+    }
 }

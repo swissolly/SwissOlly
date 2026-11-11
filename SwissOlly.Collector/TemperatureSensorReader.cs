@@ -41,7 +41,7 @@ internal sealed class TemperatureSensorReader : IDisposable
         EnsureInitialized();
 
         var cpuTemperatures = new List<double>();
-        var gpuTemperatures = new List<double>();
+        var gpuSensors = new List<(string Gpu, string Sensor, double Celsius)>();
         var discoveredSensors = new List<string>();
 
         if (_hardwareMonitor is not null && !_initFailed)
@@ -51,7 +51,7 @@ internal sealed class TemperatureSensorReader : IDisposable
                 _hardwareMonitor.Accept(_updateVisitor);
                 foreach (var hardware in _hardwareMonitor.Hardware)
                 {
-                    CollectTemperatures(hardware, cpuTemperatures, gpuTemperatures, discoveredSensors);
+                    CollectTemperatures(hardware, cpuTemperatures, gpuSensors, discoveredSensors);
                 }
             }
             catch
@@ -68,7 +68,17 @@ internal sealed class TemperatureSensorReader : IDisposable
             discoveredSensors.Add("WMI: MSAcpi_ThermalZoneTemperature");
         }
 
-        double? gpuTemperature = gpuTemperatures.Count > 0 ? gpuTemperatures.Max() : null;
+        // Each GPU's core temperature (as Task Manager shows it), then the hottest GPU.
+        double? gpuTemperature = null;
+        foreach (var gpu in gpuSensors.GroupBy(s => s.Gpu, StringComparer.Ordinal))
+        {
+            var celsius = CounterMath.GpuTemperatureCelsius(gpu.Select(s => (s.Sensor, s.Celsius)));
+            if (celsius.HasValue)
+            {
+                gpuTemperature = Math.Max(gpuTemperature ?? celsius.Value, celsius.Value);
+            }
+        }
+
         return new TemperatureReading(cpuTemperature, gpuTemperature, discoveredSensors.ToArray());
     }
 
@@ -97,12 +107,12 @@ internal sealed class TemperatureSensorReader : IDisposable
     private static void CollectTemperatures(
         IHardware hardware,
         ICollection<double> cpuTemperatures,
-        ICollection<double> gpuTemperatures,
+        ICollection<(string Gpu, string Sensor, double Celsius)> gpuSensors,
         ICollection<string> discoveredSensors)
     {
         foreach (var subHardware in hardware.SubHardware)
         {
-            CollectTemperatures(subHardware, cpuTemperatures, gpuTemperatures, discoveredSensors);
+            CollectTemperatures(subHardware, cpuTemperatures, gpuSensors, discoveredSensors);
         }
 
         foreach (var sensor in hardware.Sensors)
@@ -119,24 +129,28 @@ internal sealed class TemperatureSensorReader : IDisposable
             }
 
             discoveredSensors.Add($"{hardware.HardwareType}: {hardware.Name} // {sensor.Name} = {value:0.#} C");
-            ResolveTemperatureBucket(hardware, sensor, cpuTemperatures, gpuTemperatures)?.Add(value);
+            switch (ResolveTemperatureBucket(hardware, sensor))
+            {
+                case TemperatureBucket.Cpu:
+                    cpuTemperatures.Add(value);
+                    break;
+                case TemperatureBucket.Gpu:
+                    gpuSensors.Add((hardware.Identifier.ToString(), sensor.Name, value));
+                    break;
+            }
         }
     }
 
-    private static ICollection<double>? ResolveTemperatureBucket(
-        IHardware hardware,
-        ISensor sensor,
-        ICollection<double> cpuTemperatures,
-        ICollection<double> gpuTemperatures)
+    private static TemperatureBucket ResolveTemperatureBucket(IHardware hardware, ISensor sensor)
     {
         if (hardware.HardwareType == HardwareType.Cpu)
         {
-            return cpuTemperatures;
+            return TemperatureBucket.Cpu;
         }
 
         if (hardware.HardwareType is HardwareType.GpuAmd or HardwareType.GpuIntel or HardwareType.GpuNvidia)
         {
-            return gpuTemperatures;
+            return TemperatureBucket.Gpu;
         }
 
         var sensorIdentity = $"{hardware.Name} {sensor.Name}".ToLowerInvariant();
@@ -147,7 +161,7 @@ internal sealed class TemperatureSensorReader : IDisposable
             sensorIdentity.Contains("hot spot", StringComparison.Ordinal) ||
             sensorIdentity.Contains("vram", StringComparison.Ordinal))
         {
-            return gpuTemperatures;
+            return TemperatureBucket.Gpu;
         }
 
         if (sensorIdentity.Contains("cpu", StringComparison.Ordinal) ||
@@ -164,10 +178,10 @@ internal sealed class TemperatureSensorReader : IDisposable
             sensorIdentity.Contains("k10", StringComparison.Ordinal) ||
             sensorIdentity.Contains("ryzen", StringComparison.Ordinal))
         {
-            return cpuTemperatures;
+            return TemperatureBucket.Cpu;
         }
 
-        return null;
+        return TemperatureBucket.None;
     }
 
     private static bool TryGetThermalZoneTemperatureCelsius(out double temperatureCelsius)
@@ -236,6 +250,13 @@ internal sealed class TemperatureSensorReader : IDisposable
         {
         }
     }
+}
+
+internal enum TemperatureBucket
+{
+    None,
+    Cpu,
+    Gpu,
 }
 
 internal sealed record TemperatureReading(

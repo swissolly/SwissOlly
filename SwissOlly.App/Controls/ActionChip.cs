@@ -214,15 +214,6 @@ public sealed class ActionChip : UserControl
         }
     }
 
-    public void RefreshThemeResources()
-    {
-        // Invalidate brush cache on theme change
-        _cachedIdleBg = null;
-        _cachedHoverBg = null;
-        _cachedAccentBg = null;
-        UpdateVisualState();
-    }
-
     private void OnPointerEntered(object sender, PointerRoutedEventArgs e)
     {
         if (!IsEnabled)
@@ -377,8 +368,6 @@ public sealed class ActionChip : UserControl
     private static readonly Brush s_noBorder = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
 
     private static Brush ResolveBrush(string key, string fallbackHex) => ThemeVisuals.ResolveBrush(key, fallbackHex);
-
-    private static Brush CreateSurfaceGradient(string startHex, string endHex) => ThemeVisuals.CreateThemeResourceGradient(startHex, endHex);
 
     private static bool IsLightPaletteActive() => ThemeVisuals.IsLightPaletteActive();
 

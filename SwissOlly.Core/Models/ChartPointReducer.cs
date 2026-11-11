@@ -91,6 +91,40 @@ public static class ChartPointReducer
     }
 
     /// <summary>
+    /// Where the line crosses a window edge: the value at <paramref name="edge"/>, on the straight
+    /// line between the samples either side of it, <paramref name="index"/> - 1 and
+    /// <paramref name="index"/>. Null when there is no sample on one side, the edge is not
+    /// strictly between the two, or the interval is an outage (nothing was drawn across it).
+    /// </summary>
+    /// <remarks>
+    /// Without it a window showed only the samples inside it, so the line began at the first of
+    /// those. With a 15s sample interval on the 1m range that left up to a quarter of the chart
+    /// empty whenever timer drift put the fifth sample just outside the window.
+    /// </remarks>
+    public static MetricPoint? InterpolateAtEdge(
+        IReadOnlyList<MetricPoint> points,
+        int index,
+        DateTimeOffset edge,
+        double minimumGapMs)
+    {
+        if (index < 1 || index >= points.Count)
+        {
+            return null;
+        }
+
+        var before = points[index - 1];
+        var after = points[index];
+        if (before.Timestamp >= edge || after.Timestamp <= edge || IsGap(points, index, minimumGapMs))
+        {
+            return null;
+        }
+
+        var spanMs = (after.Timestamp - before.Timestamp).TotalMilliseconds;
+        var ratio = (edge - before.Timestamp).TotalMilliseconds / spanMs;
+        return new MetricPoint(edge, before.Value + ((after.Value - before.Value) * ratio));
+    }
+
+    /// <summary>
     /// True when the interval ending at <paramref name="index"/> is a real outage: over 10s, over
     /// <paramref name="minimumGapMs"/>, and more than 3x the local sample spacing. The spacing is
     /// the coarser of the two sides' tightest nearby intervals, so a series that switches from
@@ -101,6 +135,11 @@ public static class ChartPointReducer
     /// One median for the whole series made every history point a gap (scattered dots). Judging
     /// gaps after downsampling against the largest neighbouring interval let two outages a few
     /// samples apart hide each other, which drew a bridging line across both.
+    ///
+    /// With samples on one side only (the newest sample, or the oldest), that side's middle
+    /// interval is used, not its tightest. Closing and reopening the app within one sample interval
+    /// leaves two samples a second or two apart; taken as the spacing, that pair made each new 15s
+    /// sample an outage, a dot cut off from its line, until three regular intervals had passed.
     /// </remarks>
     private static bool IsGap(IReadOnlyList<MetricPoint> points, int index, double minimumGapMs)
     {
@@ -111,33 +150,42 @@ public static class ChartPointReducer
             return false;
         }
 
-        var before = NeighbourIntervalMinMs(points, index, -1);
-        var after = NeighbourIntervalMinMs(points, index, +1);
-        var typicalMs = double.IsPositiveInfinity(before) ? after
-            : double.IsPositiveInfinity(after) ? before
-            : Math.Max(before, after);
+        var before = NeighbourIntervalsMs(points, index, -1);
+        var after = NeighbourIntervalsMs(points, index, +1);
+        var typicalMs = double.IsPositiveInfinity(before.Smallest) ? after.Middle
+            : double.IsPositiveInfinity(after.Smallest) ? before.Middle
+            : Math.Max(before.Smallest, after.Smallest);
         return intervalMs > typicalMs * 3d;
     }
 
     /// <summary>
-    /// Smallest positive interval among up to three beside <paramref name="index"/> in one
-    /// direction, or infinity when there are none. A run's spacing is uniform (the scrape interval,
-    /// or a minute for history), so the smallest nearby interval is that spacing.
+    /// The smallest and the middle of up to three positive intervals beside
+    /// <paramref name="index"/> in one direction (with two, the middle is the smaller), or infinity
+    /// when there are none. A run's spacing is uniform (the scrape interval, or a minute for
+    /// history), so the smallest nearby interval is normally that spacing.
     /// </summary>
-    private static double NeighbourIntervalMinMs(IReadOnlyList<MetricPoint> points, int index, int direction)
+    private static (double Smallest, double Middle) NeighbourIntervalsMs(IReadOnlyList<MetricPoint> points, int index, int direction)
     {
-        var smallest = double.PositiveInfinity;
+        Span<double> intervals = stackalloc double[3];
+        var count = 0;
         var seen = 0;
         for (var k = index + direction; seen < 3 && k >= 1 && k < points.Count; k += direction, seen++)
         {
             var intervalMs = (points[k].Timestamp - points[k - 1].Timestamp).TotalMilliseconds;
             if (intervalMs > 0d)
             {
-                smallest = Math.Min(smallest, intervalMs);
+                intervals[count++] = intervalMs;
             }
         }
 
-        return smallest;
+        if (count == 0)
+        {
+            return (double.PositiveInfinity, double.PositiveInfinity);
+        }
+
+        var found = intervals[..count];
+        found.Sort();
+        return (found[0], found[(count - 1) / 2]);
     }
 
     private static MetricPoint[] Slice(IReadOnlyList<MetricPoint> points, int start, int end)

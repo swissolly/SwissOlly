@@ -1779,13 +1779,15 @@ public sealed class MetricPanelViewModel : ObservableObject
         }
 
         var point = new MetricPoint(sample.Timestamp, sample.Value);
-        buffer.Points.Add(point);
+        // In time order even when the clock was set back, as the store keeps them.
+        MetricHistory.InsertInOrder(buffer.Points, point);
         if (point.Value > buffer.TrackedPeak)
         {
             buffer.TrackedPeak = point.Value;
         }
         _latestPointTimestampUtc = sample.Timestamp;
-        if (sample.Timestamp - buffer.LastTrimUtc >= BufferTrimInterval)
+        // Also trim when the clock went back, or trimming would wait for it to catch up.
+        if (sample.Timestamp - buffer.LastTrimUtc >= BufferTrimInterval || sample.Timestamp < buffer.LastTrimUtc)
         {
             TrimBuffers(sample.Timestamp);
         }
@@ -1864,13 +1866,13 @@ public sealed class MetricPanelViewModel : ObservableObject
                 _buffers.Add(seriesKey, buffer);
             }
 
-            // Ignore a refresh that lands on the previous point's timestamp.
-            if (buffer.Points.Count > 0 && buffer.Points[^1].Timestamp >= timestamp)
+            // Ignore a refresh that lands on a timestamp already held. In time order otherwise,
+            // as the panel's own lines are: dropping anything older than the newest point paused
+            // these lines after the clock was set back, until it caught up.
+            if (!MetricHistory.InsertInOrderIfNew(buffer.Points, new MetricPoint(timestamp, Math.Min(total, isMemoryPanel ? double.MaxValue : 100d))))
             {
                 continue;
             }
-
-            buffer.Points.Add(new MetricPoint(timestamp, Math.Min(total, isMemoryPanel ? double.MaxValue : 100d)));
 
             // Cap process series to a smaller budget (they accumulate per-process)
             const int maxProcessPoints = 2000;
@@ -2702,12 +2704,6 @@ public sealed class MetricPanelViewModel : ObservableObject
             endIndex++;
         }
 
-        var windowCount = endIndex - lo;
-        if (windowCount == 0)
-        {
-            return Array.Empty<MetricPoint>();
-        }
-
         // Deterministic min/max bucket downsampling: fixed-width buckets on absolute time (not
         // point indices), min and max kept per bucket, so a window always draws the same way
         // whenever the render happens. Gaps narrower than a bucket and a half could not show.
@@ -2715,10 +2711,29 @@ public sealed class MetricPanelViewModel : ObservableObject
         var windowMs = Math.Max(1d, (end - start).TotalMilliseconds);
         var bucketWidthMs = windowMs / bucketCount;
         var startMs = (double)start.ToUnixTimeMilliseconds();
-        var gapStarts = ChartPointReducer.FindRunStarts(points, lo, endIndex, Math.Max(10_000d, bucketWidthMs * 1.5));
+        var minimumGapMs = Math.Max(10_000d, bucketWidthMs * 1.5);
+
+        // The line runs on to the window's edges when there is a sample beyond them, so a window
+        // narrower than a few sample intervals is not left part empty.
+        var leftEdge = ChartPointReducer.InterpolateAtEdge(points, lo, start, minimumGapMs);
+        var rightEdge = ChartPointReducer.InterpolateAtEdge(points, endIndex, end, minimumGapMs);
+
+        var windowCount = endIndex - lo;
+        if (windowCount == 0)
+        {
+            // Zoomed in between two samples: the stretch of line between them.
+            return leftEdge is not null && rightEdge is not null ? [leftEdge, rightEdge] : Array.Empty<MetricPoint>();
+        }
+
+        var gapStarts = ChartPointReducer.FindRunStarts(points, lo, endIndex, minimumGapMs);
         var downsample = windowCount > pointBudget;
 
-        var sampled = new List<MetricPoint>(Math.Min(windowCount, pointBudget + 8));
+        var sampled = new List<MetricPoint>(Math.Min(windowCount, pointBudget + 8) + 2);
+        if (leftEdge is not null)
+        {
+            sampled.Add(leftEdge);
+        }
+
         var outputRunStarts = gapStarts.Count == 0 ? null : new List<int>(gapStarts.Count);
         var runFrom = lo;
         for (var run = 0; run <= gapStarts.Count; run++)
@@ -2742,6 +2757,11 @@ public sealed class MetricPanelViewModel : ObservableObject
             }
 
             runFrom = runTo;
+        }
+
+        if (rightEdge is not null)
+        {
+            sampled.Add(rightEdge);
         }
 
         if (outputRunStarts is not null)

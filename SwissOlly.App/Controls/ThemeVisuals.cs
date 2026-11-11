@@ -5,8 +5,6 @@ using Windows.UI;
 namespace SwissOlly.App.Controls;
 
 // Shared theme and brush-resolution helpers used by the shell and telemetry controls.
-// Surface gradients stay cached; theme resources define dark surfaces while light surfaces
-// retain their per-surface lift values.
 internal static class ThemeVisuals
 {
     // Theme switches recolour the palette brushes in place (App.SetBrushResource) rather than
@@ -181,136 +179,74 @@ internal static class ThemeVisuals
         };
     }
 
-    // ── Cached surface gradient (ShellWindow / TelemetryChart / TelemetryPanelCard) ──
+    // ── Brushes worked out from the palette ──
+    //
+    // A few surfaces draw a colour the palette has no brush for: a gauge face's gradient between
+    // two surfaces, the faint fade at a plot's edges. Each is created once, shared by everything
+    // that draws it, and recoloured in place by RecolorDerivedBrushes, the way App.SetBrushResource
+    // recolours the palette brushes. A theme change then never has to find those elements; it used
+    // to walk every card, chart and gauge to hand each a new brush.
 
-    private static readonly Dictionary<string, LinearGradientBrush> s_liftGradientCache = new(StringComparer.Ordinal);
-    private static bool s_lastCachedLightMode;
+    private static LinearGradientBrush? s_gaugeFaceBrush;
+    private static LinearGradientBrush? s_plotLeadingFadeBrush;
+    private static LinearGradientBrush? s_plotTrailingFadeBrush;
 
-    // CreateSurfaceLiftGradient already self-invalidates on theme change, but callers that want
-    // to force a clean slate on an explicit theme switch (e.g. before a synchronous chrome refresh
-    // pass) can call this directly.
-    public static void InvalidateGradientCache() => s_liftGradientCache.Clear();
+    /// <summary>A gauge's face: the raised surface fading into the card's.</summary>
+    public static Brush GaugeFaceBrush => s_gaugeFaceBrush ??= RecolorGaugeFace(CreateGradient(new(1, 1)));
 
-    public static Brush CreateSurfaceLiftGradient(string startHex, string endHex)
+    /// <summary>The faint plot-coloured fade over a plot's left (leading) or right edge.</summary>
+    public static Brush PlotEdgeFadeBrush(bool isLeadingEdge) => isLeadingEdge
+        ? s_plotLeadingFadeBrush ??= RecolorPlotEdgeFade(CreateGradient(new(1, 0)), isLeadingEdge: true)
+        : s_plotTrailingFadeBrush ??= RecolorPlotEdgeFade(CreateGradient(new(1, 0)), isLeadingEdge: false);
+
+    /// <summary>
+    /// Recolours every shared brush worked out from the palette or a series colour. Runs after the
+    /// palette brushes and the series colours have changed; a brush not created yet takes the new
+    /// palette when it is.
+    /// </summary>
+    public static void RecolorDerivedBrushes()
     {
-        var isLight = IsLightPaletteActive();
-
-        // Invalidate cache on theme change
-        if (isLight != s_lastCachedLightMode)
+        if (s_gaugeFaceBrush is not null)
         {
-            s_liftGradientCache.Clear();
-            s_lastCachedLightMode = isLight;
+            RecolorGaugeFace(s_gaugeFaceBrush);
         }
 
-        var cacheKey = string.Concat(startHex, "|", endHex);
-        if (s_liftGradientCache.TryGetValue(cacheKey, out var cached))
+        if (s_plotLeadingFadeBrush is not null)
         {
-            return cached;
+            RecolorPlotEdgeFade(s_plotLeadingFadeBrush, isLeadingEdge: true);
         }
 
-        var startColor = isLight
-            ? LiftToLight(startHex)
-            : ResolveColor("SurfaceElevatedBrush", "#222529");
-        var endColor = isLight
-            ? LiftToLight(endHex)
-            : ResolveColor("SurfaceBrush", "#1C1F22");
-        var brush = new LinearGradientBrush
+        if (s_plotTrailingFadeBrush is not null)
         {
-            StartPoint = new Windows.Foundation.Point(0, 0),
-            EndPoint = new Windows.Foundation.Point(1, 1),
-            GradientStops = new GradientStopCollection
-            {
-                new GradientStop { Color = startColor, Offset = 0d },
-                new GradientStop { Color = endColor, Offset = 1d },
-            },
-        };
+            RecolorPlotEdgeFade(s_plotTrailingFadeBrush, isLeadingEdge: false);
+        }
 
-        s_liftGradientCache[cacheKey] = brush;
+        IconFactory.RecolorAccentShades();
+    }
+
+    private static LinearGradientBrush CreateGradient(Windows.Foundation.Point end) => new()
+    {
+        StartPoint = new Windows.Foundation.Point(0, 0),
+        EndPoint = end,
+        GradientStops = new GradientStopCollection
+        {
+            new GradientStop { Offset = 0d },
+            new GradientStop { Offset = 1d },
+        },
+    };
+
+    private static LinearGradientBrush RecolorGaugeFace(LinearGradientBrush brush)
+    {
+        brush.GradientStops[0].Color = ResolveColor("SurfaceElevatedBrush", "#222529");
+        brush.GradientStops[1].Color = ResolveColor("SurfaceBrush", "#1C1F22");
         return brush;
     }
 
-    // Union of the three previously-separate LiftToLight tables (ShellWindow's was the superset;
-    // TelemetryChart's and TelemetryPanelCard's subsets were verified to agree on every shared key
-    // before merging — no behavior change).
-    public static Color LiftToLight(string darkHex)
+    private static LinearGradientBrush RecolorPlotEdgeFade(LinearGradientBrush brush, bool isLeadingEdge)
     {
-        return darkHex.TrimStart('#').ToUpperInvariant() switch
-        {
-            // Shell surfaces
-            "08111C" => BrushFactory.ParseColor("#F0F4F9"),
-            "0D1A29" => BrushFactory.ParseColor("#E7EEF6"),
-
-            // Card surfaces — pure white, stands out from gray-blue backdrop
-            "0E1B2C" or "0E1A2C" or "101B2D" or "101C2E" => BrushFactory.ParseColor("#FFFFFF"),
-            "13253A" or "142436" or "15273D" or "16273D" => BrushFactory.ParseColor("#F8FAFD"),
-
-            // Summary/control card surfaces
-            "0F1C2D" => BrushFactory.ParseColor("#FAFCFF"),
-            "15283F" or "14263A" => BrushFactory.ParseColor("#F0F4FA"),
-
-            // Badge tile — slightly tinted so it's visible on white cards
-            "102131" or "17304A" => BrushFactory.ParseColor("#E0EAF4"),
-
-            // Chart frame — light gray inset, clearly distinct from white card
-            "0E1A2B" or "13263B" or "0C1824" or "111F30" => BrushFactory.ParseColor("#EDF1F7"),
-
-            // Legend row idle — subtle gray
-            "101C2D" or "132438" => BrushFactory.ParseColor("#F0F4F9"),
-            // Legend row hover — noticeably darker
-            "162A3E" or "1C3350" => BrushFactory.ParseColor("#E0E8F2"),
-
-            // Range shell
-            "102031" or "15283E" => BrushFactory.ParseColor("#ECF0F6"),
-
-            // Chart plot background — light gray, not white (creates inset feel)
-            "0B1726" or "12243A" or "0A141F" or "0F1E2E" => BrushFactory.ParseColor("#EEF2F8"),
-
-            // Card hover — visible shift from white
-            "102133" or "162A40" or "122034" or "1A2C46" => BrushFactory.ParseColor("#E4ECF4"),
-
-            // Control editor cards
-            "0F1B2D" or "13243A" => BrushFactory.ParseColor("#F4F7FC"),
-
-            // Process section — gray inset
-            "0D1824" or "12202F" => BrushFactory.ParseColor("#EBF0F6"),
-
-            // Scale pill / misc
-            "101D2E" or "152840" => BrushFactory.ParseColor("#E6ECF4"),
-
-            // Tooltip
-            "15283B" or "203851" => BrushFactory.ParseColor("#FFFFFF"),
-
-            _ => BrushFactory.ParseColor("#F2F6FB"),
-        };
-    }
-
-    // ── Theme-resource-based gradient (ActionChip / InlineTextEntry / IconFactory) ──
-
-    public static Brush CreateThemeResourceGradient(string startHex, string endHex)
-    {
-        if (IsLightPaletteActive())
-        {
-            return new LinearGradientBrush
-            {
-                StartPoint = new Windows.Foundation.Point(0, 0),
-                EndPoint = new Windows.Foundation.Point(1, 1),
-                GradientStops = new GradientStopCollection
-                {
-                    new GradientStop { Color = ResolveColor("SurfaceElevatedBrush", "#F4F8FC"), Offset = 0d },
-                    new GradientStop { Color = ResolveColor("SurfaceStrongBrush", "#EDF4FB"), Offset = 1d },
-                },
-            };
-        }
-
-        return new LinearGradientBrush
-        {
-            StartPoint = new Windows.Foundation.Point(0, 0),
-            EndPoint = new Windows.Foundation.Point(1, 1),
-            GradientStops = new GradientStopCollection
-            {
-                new GradientStop { Color = ResolveColor("SurfaceElevatedBrush", "#222529"), Offset = 0d },
-                new GradientStop { Color = ResolveColor("SurfaceStrongBrush", "#292D31"), Offset = 1d },
-            },
-        };
+        var plot = ResolveColor("SurfaceInsetBrush", "#141619");
+        brush.GradientStops[0].Color = Color.FromArgb(isLeadingEdge ? (byte)40 : (byte)0, plot.R, plot.G, plot.B);
+        brush.GradientStops[1].Color = Color.FromArgb(isLeadingEdge ? (byte)0 : (byte)40, plot.R, plot.G, plot.B);
+        return brush;
     }
 }

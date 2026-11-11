@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using SwissOlly.Core.Models;
 using SwissOlly.Overlay.Rendering;
 using static SwissOlly.Overlay.Fps.EtwInterop;
 
@@ -8,6 +9,10 @@ namespace SwissOlly.Overlay.Fps;
 /// Per-process present rate, measured by counting the tracked game's own present calls on the
 /// Microsoft-Windows-DXGI and Microsoft-Windows-D3D9 ETW providers. This does not correlate
 /// presents with frames confirmed as displayed by the monitor.
+///
+/// A game that presents through Vulkan or OpenGL makes no DXGI or D3D9 calls, so the graphics
+/// kernel's own present event is counted too and used when the other two are silent
+/// (<see cref="PresentRateMeter"/>). If that provider can't be enabled, the first two still work.
 ///
 /// This is what <see cref="DwmFpsSource"/> could not do: DWM flush timing measures the
 /// compositor's cadence, which is the display refresh rate regardless of what the game is
@@ -23,12 +28,13 @@ namespace SwissOlly.Overlay.Fps;
 internal sealed class EtwPresentFpsSource : IFpsSource
 {
     private const string SessionName = "SwissOllyFpsSession";
-    private const double WindowSeconds = 1.0;
     private const int EmitIntervalMs = 500;
-    private const double StallSeconds = 2.0;
 
     private readonly object _gate = new();
-    private readonly Queue<long> _presentTicks = new();
+    private readonly string _sessionName;
+    private readonly bool _runtimeEvents;
+    private PresentRateMeter? _meter;
+    private PresentSource? _reportedSource;
 
     private ulong _sessionHandle;
     private ulong _traceHandle = InvalidProcessTraceHandle;
@@ -37,10 +43,6 @@ internal sealed class EtwPresentFpsSource : IFpsSource
     private System.Threading.Timer? _emitTimer;
     private volatile uint _trackedPid;
     private volatile bool _running;
-    private long _lastPresentTick;
-    private long _newestPresentTick;
-    private long _lastEmittedTick;
-    private bool _stallReported;
 
     // Held in a field so the GC cannot collect the thunk while ETW holds the pointer.
     private EventRecordCallback? _callback;
@@ -49,6 +51,22 @@ internal sealed class EtwPresentFpsSource : IFpsSource
     public event Action<string>? ErrorOccurred;
 
     public FpsAccuracy Accuracy => FpsAccuracy.Exact;
+
+    internal EtwPresentFpsSource()
+        : this(SessionName, runtimeEvents: true)
+    {
+    }
+
+    /// <summary>
+    /// For <c>tools/FpsProbe</c>: its own session name, so it can run beside the app (a second
+    /// session of the same name would stop the app's), and optionally without the DXGI and D3D9
+    /// providers, to see the kernel's count alone for a game that has both.
+    /// </summary>
+    internal EtwPresentFpsSource(string sessionName, bool runtimeEvents)
+    {
+        _sessionName = sessionName;
+        _runtimeEvents = runtimeEvents;
+    }
 
     /// <summary>True once a session is up and the consumer thread is running.</summary>
     internal bool IsRunning => _running;
@@ -103,14 +121,14 @@ internal sealed class EtwPresentFpsSource : IFpsSource
         _trackedPid = pid;
         _properties = AllocProperties();
 
-        uint rc = StartTrace(out _sessionHandle, SessionName, _properties);
+        uint rc = StartTrace(out _sessionHandle, _sessionName, _properties);
         if (rc == ErrorAlreadyExists)
         {
             // A previous SwissOlly process crashed without stopping its session. ETW sessions
             // outlive the process that created them, so clean up and retry once.
             OverlayLog.Write("ETW: stale session found — stopping and retrying");
-            StopStaleSession();
-            rc = StartTrace(out _sessionHandle, SessionName, _properties);
+            StopStaleSession(_sessionName);
+            rc = StartTrace(out _sessionHandle, _sessionName, _properties);
         }
 
         if (rc != ErrorSuccess)
@@ -127,23 +145,33 @@ internal sealed class EtwPresentFpsSource : IFpsSource
         // MatchAnyKeyword = 0 matches every event the provider emits. DXGI and D3D9 only emit a
         // couple of events per present, so the volume is a few hundred per second at most; the
         // callback discards everything that is not a present from the tracked PID.
-        uint e1 = EnableTraceEx2(_sessionHandle, ref DxgiProviderGuid, EventControlCodeEnableProvider,
-            TraceLevelInformation, 0, 0, 0, IntPtr.Zero);
-        uint e2 = EnableTraceEx2(_sessionHandle, ref D3d9ProviderGuid, EventControlCodeEnableProvider,
-            TraceLevelInformation, 0, 0, 0, IntPtr.Zero);
-        OverlayLog.Write($"ETW: EnableTraceEx2 dxgi={e1} d3d9={e2}");
+        const uint NotEnabled = uint.MaxValue;
+        uint e1 = NotEnabled;
+        uint e2 = NotEnabled;
+        if (_runtimeEvents)
+        {
+            e1 = EnableTraceEx2(_sessionHandle, ref DxgiProviderGuid, EventControlCodeEnableProvider,
+                TraceLevelInformation, 0, 0, 0, IntPtr.Zero);
+            e2 = EnableTraceEx2(_sessionHandle, ref D3d9ProviderGuid, EventControlCodeEnableProvider,
+                TraceLevelInformation, 0, 0, 0, IntPtr.Zero);
+        }
 
-        if (e1 != ErrorSuccess && e2 != ErrorSuccess)
+        // The kernel logs far more than presents, so it is enabled for that one event ID only.
+        uint e3 = EnableTraceForEventIds(_sessionHandle, ref DxgKernelProviderGuid, DxgKernelBaseKeyword,
+            [(ushort)EventIdDxgKernelPresentInfo]);
+        OverlayLog.Write($"ETW: EnableTraceEx2 dxgi={e1} d3d9={e2} kernel={e3}");
+
+        if (e1 != ErrorSuccess && e2 != ErrorSuccess && e3 != ErrorSuccess)
         {
             Cleanup();
-            ErrorOccurred?.Invoke($"etw-enable-failed-{e1}");
+            ErrorOccurred?.Invoke($"etw-enable-failed-{(_runtimeEvents ? e1 : e3)}");
             return;
         }
 
         _callback = OnEvent;
         var logfile = new EVENT_TRACE_LOGFILE
         {
-            LoggerName = Marshal.StringToHGlobalUni(SessionName),
+            LoggerName = Marshal.StringToHGlobalUni(_sessionName),
             ProcessTraceMode = ProcessTraceModeRealTime | ProcessTraceModeEventRecord,
             EventRecordCallback = Marshal.GetFunctionPointerForDelegate(_callback),
         };
@@ -162,10 +190,9 @@ internal sealed class EtwPresentFpsSource : IFpsSource
 
         lock (_gate)
         {
-            _presentTicks.Clear();
-            _lastPresentTick = System.Diagnostics.Stopwatch.GetTimestamp();
-            _lastEmittedTick = 0;
-            _stallReported = false;
+            _meter = new PresentRateMeter(
+                System.Diagnostics.Stopwatch.Frequency, System.Diagnostics.Stopwatch.GetTimestamp());
+            _reportedSource = null;
         }
 
         _running = true;
@@ -189,7 +216,7 @@ internal sealed class EtwPresentFpsSource : IFpsSource
         // Stop the session first so real-time delivery ends, then close the consumer handle —
         // that is what makes the blocked ProcessTrace call return.
         if (_sessionHandle != 0 && _properties != IntPtr.Zero)
-            ControlTrace(_sessionHandle, SessionName, _properties, EventTraceControlStop);
+            ControlTrace(_sessionHandle, _sessionName, _properties, EventTraceControlStop);
 
         if (_traceHandle != InvalidProcessTraceHandle)
         {
@@ -216,7 +243,7 @@ internal sealed class EtwPresentFpsSource : IFpsSource
         }
 
         lock (_gate)
-            _presentTicks.Clear();
+            _meter = null;
     }
 
     private void ConsumeLoop()
@@ -241,87 +268,67 @@ internal sealed class EtwPresentFpsSource : IFpsSource
         if (tracked == 0 || record.EventHeader.ProcessId != tracked) return;
 
         int id = record.EventHeader.EventDescriptor.Id;
-        bool isPresent =
-            (record.EventHeader.ProviderId == DxgiProviderGuid
-                && (id == EventIdDxgiPresentStart || id == EventIdDxgiPresentMpoStart))
-            || (record.EventHeader.ProviderId == D3d9ProviderGuid && id == EventIdD3d9PresentStart);
-
-        if (!isPresent) return;
+        Guid provider = record.EventHeader.ProviderId;
+        PresentSource source;
+        if ((provider == DxgiProviderGuid && (id == EventIdDxgiPresentStart || id == EventIdDxgiPresentMpoStart))
+            || (provider == D3d9ProviderGuid && id == EventIdD3d9PresentStart))
+        {
+            source = PresentSource.Runtime;
+        }
+        else if (provider == DxgKernelProviderGuid && id == EventIdDxgKernelPresentInfo)
+        {
+            source = PresentSource.Kernel;
+        }
+        else
+        {
+            return;
+        }
 
         // ClientContext = 1 on the session, so TimeStamp is a raw QPC value on the same
         // timebase as Stopwatch.GetTimestamp().
         long ts = record.EventHeader.TimeStamp;
         lock (_gate)
-        {
-            _presentTicks.Enqueue(ts);
-            // Tracked explicitly: Queue<T>.Last() is Enumerable.Last over a non-indexable
-            // collection, so it walked all ~300 entries (twice) on every emit.
-            _newestPresentTick = ts;
-            _lastPresentTick = System.Diagnostics.Stopwatch.GetTimestamp();
-        }
+            _meter?.Add(source, ts, System.Diagnostics.Stopwatch.GetTimestamp());
     }
 
     private void Emit(object? state)
     {
         if (!_running) return;
 
-        double fps;
-        var raiseStall = false;
-        try
+        PresentReading reading;
+        var sourceChanged = false;
+        lock (_gate)
         {
-            lock (_gate)
-            {
-                long freq = System.Diagnostics.Stopwatch.Frequency;
+            if (_meter is null) return;
 
-                if (System.Diagnostics.Stopwatch.GetTimestamp() - _lastPresentTick > StallSeconds * freq)
+            reading = _meter.Read(System.Diagnostics.Stopwatch.GetTimestamp());
+            if (reading.Kind == PresentReadingKind.Rate && _reportedSource != reading.Source)
+            {
+                _reportedSource = reading.Source;
+                sourceChanged = true;
+            }
+        }
+
+        // Raised outside the lock: subscribers run arbitrary code (the controller re-renders under
+        // its own lock), and any path back into _gate would deadlock the emit timer against the
+        // consumer callback.
+        switch (reading.Kind)
+        {
+            case PresentReadingKind.Stalled:
+                // Game is alive but not presenting - minimised, loading, or fully occluded.
+                ErrorOccurred?.Invoke("no-presents");
+                break;
+            case PresentReadingKind.Rate:
+                if (sourceChanged)
                 {
-                    _presentTicks.Clear();
-                    if (!_stallReported)
-                    {
-                        // Game is alive but not presenting - minimised, loading, or fully occluded.
-                        // Raised outside the lock below: subscribers run arbitrary code (the
-                        // controller re-renders under its own lock), and any path back into _gate
-                        // would deadlock the emit timer against the consumer callback.
-                        _stallReported = true;
-                        raiseStall = true;
-                    }
-                    return;
+                    OverlayLog.Write(reading.Source == PresentSource.Kernel
+                        ? "ETW: no DXGI or D3D9 presents from this process; counting kernel presents"
+                        : "ETW: counting DXGI/D3D9 presents");
                 }
 
-                _stallReported = false;
-
-                if (_presentTicks.Count < 2) return;
-
-                long cutoff = _newestPresentTick - (long)(WindowSeconds * freq);
-                while (_presentTicks.Count > 2 && _presentTicks.Peek() < cutoff)
-                    _presentTicks.Dequeue();
-
-                if (_presentTicks.Count < 2) return;
-
-                // ETW delivers real-time events in buffer-sized batches roughly once a second, which
-                // is slower than this timer. Without this guard the same window is recomputed twice
-                // and the HUD emits each reading twice in a row.
-                long newest = _newestPresentTick;
-                if (newest == _lastEmittedTick) return;
-                _lastEmittedTick = newest;
-
-                double span = (newest - _presentTicks.Peek()) / (double)freq;
-                if (span <= 0) return;
-
-                // count-1 intervals span the window between first and last present.
-                fps = (_presentTicks.Count - 1) / span;
-            }
-
+                FpsUpdated?.Invoke(Math.Round(reading.FramesPerSecond));
+                break;
         }
-        finally
-        {
-            if (raiseStall)
-            {
-                ErrorOccurred?.Invoke("no-presents");
-            }
-        }
-
-        FpsUpdated?.Invoke(Math.Round(fps));
     }
 
     private void Cleanup()
@@ -334,7 +341,7 @@ internal sealed class EtwPresentFpsSource : IFpsSource
         // _sessionHandle == 0 and returns early.
         if (_sessionHandle != 0 && _properties != IntPtr.Zero)
         {
-            ControlTrace(_sessionHandle, SessionName, _properties, EventTraceControlStop);
+            ControlTrace(_sessionHandle, _sessionName, _properties, EventTraceControlStop);
         }
 
         if (_properties != IntPtr.Zero)
@@ -350,10 +357,10 @@ internal sealed class EtwPresentFpsSource : IFpsSource
         // thunk ETW still holds; see StopTracking.
     }
 
-    private static void StopStaleSession()
+    private static void StopStaleSession(string sessionName = SessionName)
     {
         IntPtr props = AllocProperties();
-        try { ControlTrace(0, SessionName, props, EventTraceControlStop); }
+        try { ControlTrace(0, sessionName, props, EventTraceControlStop); }
         finally { Marshal.FreeHGlobal(props); }
     }
 

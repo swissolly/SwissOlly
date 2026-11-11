@@ -1,6 +1,6 @@
+using System.Runtime.CompilerServices;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
-using Microsoft.UI.Xaml.Shapes;
 using Windows.Foundation;
 using SwissOlly.App.ViewModels;
 
@@ -13,30 +13,16 @@ internal static class IconFactory
     public static FrameworkElement CreateTile(string key, Brush accentBrush, double size = 44, double iconSize = 18)
     {
         var corner = Math.Clamp(size * 0.2, 4, 8);
-        var isLight = IsLightPaletteActive();
+        var shades = GetShades(accentBrush);
 
-        if (isLight && accentBrush is SolidColorBrush lightSolid)
-        {
-            var c = lightSolid.Color;
-            var boldC = DarkenColor(c, 0.55);
-            return new Border
-            {
-                Width = size,
-                Height = size,
-                Background = new SolidColorBrush(Windows.UI.Color.FromArgb(40, boldC.R, boldC.G, boldC.B)),
-                BorderBrush = new SolidColorBrush(Windows.UI.Color.FromArgb(80, boldC.R, boldC.G, boldC.B)),
-                BorderThickness = new Thickness(1),
-                CornerRadius = new CornerRadius(corner),
-                Child = CreateIcon(key, accentBrush, iconSize),
-            };
-        }
-
+        // One structure for every palette, so a theme change only recolours it. Light palettes
+        // clear the glow; the tile used to be built without it there.
         return new Border
         {
             Width = size,
             Height = size,
-            Background = ResolveBrush("SurfaceInsetBrush", "#141619"),
-            BorderBrush = CreateOpacityBrush(accentBrush, 0.4),
+            Background = shades.TileFill,
+            BorderBrush = shades.TileStroke,
             BorderThickness = new Thickness(1),
             CornerRadius = new CornerRadius(corner),
             Child = new Grid
@@ -47,29 +33,23 @@ internal static class IconFactory
                     {
                         Margin = new Thickness(2),
                         CornerRadius = new CornerRadius(Math.Max(10, corner - 2)),
-                        Background = CreateInnerGlowBrush(accentBrush),
+                        Background = shades.Glow,
                         Opacity = 0.16,
                         IsHitTestVisible = false,
                     },
-                    CreateIcon(key, accentBrush, iconSize),
+                    CreateIcon(key, shades.Icon, iconSize),
                 },
             },
         };
     }
 
-    public static FrameworkElement CreateIcon(string key, Brush accentBrush, double size = 18)
-    {
-        var glyph = ResolveGlyph(Normalize(key));
-        var isLight = IsLightPaletteActive();
+    public static FrameworkElement CreateIcon(string key, Brush accentBrush, double size = 18) =>
+        CreateIcon(key, GetShades(accentBrush).Icon, size);
 
-        // In light mode, use a bold saturated version for strong contrast
-        var iconBrush = isLight && accentBrush is SolidColorBrush solid
-            ? new SolidColorBrush(DarkenColor(solid.Color, 0.6))
-            : accentBrush;
-
-        return new FontIcon
+    private static FontIcon CreateIcon(string key, SolidColorBrush iconBrush, double size) =>
+        new()
         {
-            Glyph = glyph,
+            Glyph = ResolveGlyph(Normalize(key)),
             FontFamily = FluentIconFont,
             FontSize = size,
             Foreground = iconBrush,
@@ -77,7 +57,6 @@ internal static class IconFactory
             VerticalAlignment = VerticalAlignment.Center,
             IsHitTestVisible = false,
         };
-    }
 
     private static Windows.UI.Color DarkenColor(Windows.UI.Color color, double factor)
     {
@@ -110,42 +89,94 @@ internal static class IconFactory
         };
     }
 
-    private static Brush CreateInnerGlowBrush(Brush accentBrush)
+    /// <summary>
+    /// The colours icons and tiles draw with, worked out from their accent brush. Shared by every
+    /// icon with that accent and recoloured in place after a theme change, so a theme switch never
+    /// has to find icons and rebuild them. An entry lives as long as its accent brush.
+    /// </summary>
+    private static readonly ConditionalWeakTable<SolidColorBrush, AccentShades> s_shades = new();
+
+    private static readonly SolidColorBrush s_fallbackAccent = BrushFactory.CreateBrush("#66E7FF");
+
+    private static AccentShades GetShades(Brush accentBrush)
     {
-        if (accentBrush is SolidColorBrush solidBrush)
+        var accent = accentBrush as SolidColorBrush ?? s_fallbackAccent;
+        if (!s_shades.TryGetValue(accent, out var shades))
         {
-            var glowBrush = new RadialGradientBrush
+            shades = new AccentShades();
+            shades.Recolor(accent.Color, IsLightPaletteActive(), ResolveColor("SurfaceInsetBrush", "#141619"));
+            s_shades.Add(accent, shades);
+        }
+
+        return shades;
+    }
+
+    /// <summary>After a theme change, once the accent brushes hold their new colours.</summary>
+    public static void RecolorAccentShades()
+    {
+        var isLight = IsLightPaletteActive();
+        var inset = ResolveColor("SurfaceInsetBrush", "#141619");
+        foreach (var (accent, shades) in s_shades)
+        {
+            shades.Recolor(accent.Color, isLight, inset);
+        }
+    }
+
+    private sealed class AccentShades
+    {
+        private static readonly Windows.UI.Color GlowEdge = BrushFactory.ParseColor("#001018");
+        private readonly GradientStop _glowCore = new() { Offset = 0d };
+        private readonly GradientStop _glowMid = new() { Offset = 0.32d };
+        private readonly GradientStop _glowEdge = new() { Offset = 1d };
+
+        public AccentShades()
+        {
+            Glow = new RadialGradientBrush
             {
                 Center = new Point(0.5, 0.36),
                 GradientOrigin = new Point(0.5, 0.36),
                 RadiusX = 0.92,
                 RadiusY = 0.92,
             };
-
-            glowBrush.GradientStops.Add(new GradientStop { Color = solidBrush.Color, Offset = 0d });
-            glowBrush.GradientStops.Add(new GradientStop { Color = solidBrush.Color, Offset = 0.32d });
-            glowBrush.GradientStops.Add(new GradientStop { Color = BrushFactory.ParseColor("#001018"), Offset = 1d });
-            return glowBrush;
+            Glow.GradientStops.Add(_glowCore);
+            Glow.GradientStops.Add(_glowMid);
+            Glow.GradientStops.Add(_glowEdge);
         }
 
-        return ResolveBrush("SurfaceInsetBrush", "#141619");
+        public SolidColorBrush Icon { get; } = new();
+
+        public SolidColorBrush TileFill { get; } = new();
+
+        public SolidColorBrush TileStroke { get; } = new();
+
+        public RadialGradientBrush Glow { get; }
+
+        public void Recolor(Windows.UI.Color accent, bool isLight, Windows.UI.Color inset)
+        {
+            if (isLight)
+            {
+                // Bold, darker shades of the accent for strong contrast on light surfaces.
+                var bold = DarkenColor(accent, 0.55);
+                Icon.Color = DarkenColor(accent, 0.6);
+                TileFill.Color = Windows.UI.Color.FromArgb(40, bold.R, bold.G, bold.B);
+                TileStroke.Color = Windows.UI.Color.FromArgb(80, bold.R, bold.G, bold.B);
+                TileStroke.Opacity = 1;
+                _glowCore.Color = _glowMid.Color = _glowEdge.Color = Windows.UI.Color.FromArgb(0, accent.R, accent.G, accent.B);
+                return;
+            }
+
+            Icon.Color = accent;
+            TileFill.Color = inset;
+            TileStroke.Color = accent;
+            TileStroke.Opacity = 0.4;
+            _glowCore.Color = _glowMid.Color = accent;
+            _glowEdge.Color = GlowEdge;
+        }
     }
 
     private static bool IsLightPaletteActive() => ThemeVisuals.IsLightPaletteActive();
 
     private static Windows.UI.Color ResolveColor(string key, string fallbackHex) => ThemeVisuals.ResolveColor(key, fallbackHex);
-
-    private static Brush ResolveBrush(string key, string fallbackHex) => ThemeVisuals.ResolveBrush(key, fallbackHex);
-
-    private static Brush CreateOpacityBrush(Brush brush, double opacity)
-    {
-        if (brush is SolidColorBrush solidBrush)
-        {
-            return new SolidColorBrush(solidBrush.Color) { Opacity = opacity };
-        }
-
-        return new SolidColorBrush(BrushFactory.ParseColor("#66E7FF")) { Opacity = opacity };
-    }
 
     private static string Normalize(string? key)
     {

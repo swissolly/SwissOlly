@@ -268,7 +268,7 @@ public sealed partial class ShellWindow
             },
         };
 
-        var surface = new Border
+        return new Border
         {
             Background = BrushFactory.CreateBrush("#00FFFFFF"),
             BorderThickness = new Thickness(0),
@@ -276,18 +276,16 @@ public sealed partial class ShellWindow
             Padding = new Thickness(0),
             Child = root,
         };
-
-        _controlsSurfaceRef = surface;
-        return surface;
     }
 
     private FrameworkElement BuildThemePicker()
     {
         // Dark themes, then light, each a grid of previews. Both grids get the same width, so they
         // pick the same column count and the light cards line up under the dark ones.
-        _themeCards.Clear();
         var groups = new StackPanel { Spacing = 8 };
-        foreach (var (title, isLight) in new[] { ("Dark", false), ("Light", true) })
+        // "Dark themes", not "Dark": that sat right under the card's headline, which says "Dark"
+        // too whenever that theme is the one in use.
+        foreach (var (title, isLight) in new[] { ("Dark themes", false), ("Light themes", true) })
         {
             var cards = new UniformWrapPanel
             {
@@ -304,7 +302,6 @@ public sealed partial class ShellWindow
             {
                 var card = new ThemePreviewCard(theme);
                 card.Click += OnThemeCardClick;
-                _themeCards[theme.Mode] = card;
                 _settingsBindings.Add(() => card.IsSelected = _draftThemeMode == theme.Mode);
                 cards.Children.Add(card);
             }
@@ -323,13 +320,11 @@ public sealed partial class ShellWindow
 
     /// <summary>Updates for the Settings controls on screen, registered as the page is built.</summary>
     private readonly List<Action> _settingsBindings = [];
-    private readonly Dictionary<ThemeMode, ThemePreviewCard> _themeCards = [];
     private bool _refreshingSettingsDeck;
-    private ThemeMode? _refocusThemeCard;
 
     /// <summary>
-    /// Builds the Settings page. Only a new theme or a new column count rebuilds it; every other
-    /// change goes through <see cref="RefreshSettingsDeck"/>.
+    /// Builds the Settings page. Only a new column count rebuilds it; every other change goes
+    /// through <see cref="RefreshSettingsDeck"/>, and a theme recolours it in place.
     /// </summary>
     private void RenderEditableControlDeck()
     {
@@ -466,7 +461,6 @@ public sealed partial class ShellWindow
         };
 
         RefreshSettingsDeck();
-        RestoreThemeCardFocus();
         StartupTrace.Write("RenderEditableControlDeck // complete");
     }
 
@@ -603,24 +597,6 @@ public sealed partial class ShellWindow
             ? hours == SwissOllyConfig.DefaultMaxRetentionHours
             : MainViewModel.TryParseRetentionInput(_draftRetentionInput, out var parsed, out _) && parsed == hours;
 
-    /// <summary>
-    /// A theme rebuilds this page in the new palette. A keyboard user's focus moves to the same
-    /// theme's new card instead of dropping back to the window.
-    /// </summary>
-    private void RestoreThemeCardFocus()
-    {
-        if (_refocusThemeCard is not { } mode)
-        {
-            return;
-        }
-
-        _refocusThemeCard = null;
-        if (_themeCards.TryGetValue(mode, out var card))
-        {
-            _ = _uiQueue.TryEnqueue(DispatcherQueuePriority.Low, () => card.Focus(FocusState.Keyboard));
-        }
-    }
-
     private void OnThemeCardClick(object? sender, EventArgs e)
     {
         if (sender is not ThemePreviewCard card || card.Theme.Mode == _draftThemeMode)
@@ -634,7 +610,7 @@ public sealed partial class ShellWindow
         _draftThemeMode = mode;
         _viewModel.SelectedTheme = mode;
         RefreshSettingsDeck();
-        _refocusThemeCard = card.FocusState == FocusState.Keyboard ? mode : null;
+        // Recolours this page in place, so the card keeps keyboard focus and hover.
         App.CurrentApp.ApplyTheme(mode);
         // The bar says "Saved" once the save lands: with no Apply to press, a theme change looked
         // like it might not stick.
@@ -645,7 +621,7 @@ public sealed partial class ShellWindow
     private UIElement BuildSummarySurface()
     {
         StartupTrace.Write("BuildSummarySurface // quiet-strip");
-        var surface = new Border
+        return new Border
         {
             Background = ResolveBrush("SurfaceBrush", "#1C1F22"),
             BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#2C3035"),
@@ -654,8 +630,6 @@ public sealed partial class ShellWindow
             Padding = new Thickness(3),
             Child = _summaryHost,
         };
-        _summarySurfaceRef = surface;
-        return surface;
     }
 
     private static void AddCardToGrid(Grid grid, int row, int column, FrameworkElement element, int columnSpan = 1)
@@ -669,83 +643,6 @@ public sealed partial class ShellWindow
         Grid.SetRow(element, row);
         Grid.SetColumn(element, column);
         Grid.SetColumnSpan(element, columnSpan);
-    }
-
-    private Border CreateSettingFieldCard(string title, string value, string caption, bool isActive, EventHandler onClick)
-    {
-        var token = new Border
-        {
-            Width = 40,
-            Height = 40,
-            CornerRadius = new CornerRadius(8),
-            BorderBrush = ResolveBrush(isActive ? "AccentStrongBrush" : "SurfaceStrokeBrush", isActive ? "#B7F7FF" : "#27425E"),
-            BorderThickness = new Thickness(1),
-            Background = ResolveBrush("SurfaceInsetBrush", "#141619"),
-            Child = new TextBlock
-            {
-                Text = title.Length >= 3 ? title[..3].ToUpperInvariant() : title.ToUpperInvariant(),
-                FontFamily = new FontFamily("Bahnschrift"),
-                FontSize = 12,
-                FontWeight = FontWeights.SemiBold,
-                Foreground = ResolveBrush(isActive ? "AccentStrongBrush" : "AccentBrush", isActive ? "#B7F7FF" : "#66E7FF"),
-                HorizontalAlignment = HorizontalAlignment.Center,
-                VerticalAlignment = VerticalAlignment.Center,
-            },
-        };
-
-        var topGrid = new Grid();
-        topGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        topGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        topGrid.Children.Add(token);
-        var titleStack = new StackPanel
-        {
-            Margin = new Thickness(12, 0, 0, 0),
-            Spacing = 6,
-            Children =
-            {
-                CreateLabelText(title, 11),
-                CreatePrimaryText(value, 17, true),
-            },
-        };
-        topGrid.Children.Add(titleStack);
-        Grid.SetColumn(titleStack, 1);
-
-        var border = new Border
-        {
-            Background = ResolveBrush(isActive ? "SurfaceStrongBrush" : "SurfaceElevatedBrush", isActive ? "#292D31" : "#222529"),
-            BorderBrush = ResolveBrush(isActive ? "AccentStrongBrush" : "SurfaceStrokeBrush", isActive ? "#B7F7FF" : "#27425E"),
-            BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(8),
-            Padding = new Thickness(16),
-            Child = new StackPanel
-            {
-                Spacing = 12,
-                Children =
-                {
-                    topGrid,
-                    CreateSecondaryText(caption, 12),
-                },
-            },
-        };
-
-        border.PointerEntered += (_, _) =>
-        {
-            if (!isActive)
-            {
-                border.Background = ResolveBrush("SurfaceStrongBrush", "#292D31");
-                border.BorderBrush = ResolveBrush("AccentHaloBrush", "#1B68DAFF");
-            }
-        };
-        border.PointerExited += (_, _) =>
-        {
-            if (!isActive)
-            {
-                border.Background = ResolveBrush("SurfaceElevatedBrush", "#222529");
-                border.BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E");
-            }
-        };
-        border.Tapped += (_, _) => onClick(border, EventArgs.Empty);
-        return border;
     }
 
     /// <summary>A row of chips that wraps onto a second line in a narrow card instead of clipping.</summary>
@@ -925,20 +822,6 @@ public sealed partial class ShellWindow
             },
         };
 
-    private static Border CreateSectionHeader(string eyebrow, string text) =>
-        new()
-        {
-            Child = new StackPanel
-            {
-                Spacing = 3,
-                Children =
-                {
-                    CreatePrimaryText(eyebrow, 16, true),
-                    CreateSecondaryText(text, 12.5),
-                },
-            },
-        };
-
     private StackPanel BuildBoardSectionBand()
     {
         var grid = new Grid
@@ -997,26 +880,6 @@ public sealed partial class ShellWindow
             Children =
             {
                 grid,
-            },
-        };
-    }
-
-    private static Grid CreateSectionBand(string title, string subtitle)
-    {
-        return new Grid
-        {
-            Margin = new Thickness(0, 2, 0, 0),
-            Children =
-            {
-                new StackPanel
-                {
-                    Spacing = 3,
-                    Children =
-                    {
-                        CreatePrimaryText(title, 17, true),
-                        CreateSecondaryText(subtitle, 12.5),
-                    },
-                },
             },
         };
     }
@@ -1081,100 +944,6 @@ public sealed partial class ShellWindow
             Child = contentStack,
         };
     }
-
-    private static Border CreateTopStatusPill(UIElement content) =>
-        new()
-        {
-            Background = ResolveBrush("PanelOverlayBrush", "#091321"),
-            BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#2A4662"),
-            BorderThickness = new Thickness(UiMetrics.Hairline),
-            CornerRadius = new CornerRadius(8),
-            Padding = new Thickness(16, 10, 16, 10),
-            Child = new Grid
-            {
-                Children =
-                {
-                    content,
-                },
-            },
-        };
-
-    private static Border CreateMiniBrandMark()
-    {
-        var host = new Border
-        {
-            Width = 36,
-            Height = 36,
-            CornerRadius = new CornerRadius(12),
-            Background = ResolveBrush("SurfaceInsetBrush", "#091321"),
-            BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#315274"),
-            BorderThickness = new Thickness(UiMetrics.Hairline),
-        };
-
-        var imagePath = System.IO.Path.Combine(AppContext.BaseDirectory, "Assets", "swissolly-256.png");
-        if (!File.Exists(imagePath))
-        {
-            host.Child = new Grid
-            {
-                Children =
-                {
-                    new TextBlock
-                    {
-                        Text = "S",
-                        FontFamily = new FontFamily("Segoe UI Variable Display"),
-                        FontSize = 15,
-                        FontWeight = FontWeights.SemiBold,
-                        Foreground = ResolveBrush("AccentBrush", "#66E7FF"),
-                        HorizontalAlignment = HorizontalAlignment.Center,
-                        VerticalAlignment = VerticalAlignment.Center,
-                    },
-                },
-            };
-            return host;
-        }
-
-        host.Padding = new Thickness(5);
-        host.Child = new Grid
-        {
-            Children =
-            {
-                new Border
-                {
-                    Margin = new Thickness(4),
-                    CornerRadius = new CornerRadius(9),
-                    Background = ResolveBrush("AppBackdropBrush", "#061018"),
-                    BorderBrush = ResolveBrush("AccentSoftBrush", "#163B60"),
-                    BorderThickness = new Thickness(1),
-                },
-                new Microsoft.UI.Xaml.Controls.Image
-                {
-                    Stretch = Stretch.Uniform,
-                    Source = new Microsoft.UI.Xaml.Media.Imaging.BitmapImage { UriSource = new Uri(imagePath) },
-                    Margin = new Thickness(7),
-                },
-            },
-        };
-        return host;
-    }
-
-    private static Border CreateInfoPanel(string title, string value) =>
-        new()
-        {
-            Background = ResolveBrush("SurfaceInsetBrush", "#091321"),
-            BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E"),
-            BorderThickness = new Thickness(UiMetrics.Hairline),
-            CornerRadius = new CornerRadius(8),
-            Padding = new Thickness(14, 12, 14, 12),
-            Child = new StackPanel
-            {
-                Spacing = 4,
-                Children =
-                {
-                    CreateMutedText(title, 11),
-                    CreatePrimaryText(value, 13, true),
-                },
-            },
-        };
 
     private static TextBlock CreatePrimaryText(string text, double fontSize, bool semiBold) =>
         new()
@@ -1300,14 +1069,14 @@ public sealed partial class ShellWindow
     /// exactly as OverlayController formats them, and left-aligned in one column as the renderer
     /// draws them, so "62°C" sticks out past "23%" here as it does in a game.
     /// </summary>
-    private static readonly (string Key, string Chip, string Label, string Sample)[] OverlayMetricChoices =
+    private static readonly (string Key, string Chip, string Label, string Name, string Sample)[] OverlayMetricChoices =
     [
-        ("fps", "FPS", "FPS", " 144"),
-        ("cpu", "CPU %", "CPU", " 23%"),
+        ("fps", "FPS", "FPS", "FPS"," 144"),
+        ("cpu", "CPU %", "CPU", "CPU"," 23%"),
         // Over the 90% line on purpose: the preview shows the red a hot reading turns.
-        ("gpu", "GPU %", "GPU", " 92%"),
-        ("gpu-temp", "GPU temp", "GPU Temp", " 62°C"),
-        ("memory", "Memory %", "MEM", " 48%"),
+        ("gpu", "GPU %", "GPU", "GPU"," 92%"),
+        ("gpu-temp", "GPU temp", "GPU Temp", "GPU temperature"," 62°C"),
+        ("memory", "Memory %", "MEM", "memory"," 48%"),
     ];
 
     private static readonly (string Name, string Hex)[] OverlayClassicColors =
@@ -1446,14 +1215,7 @@ public sealed partial class ShellWindow
         return CreateControlEditorCard(
             "overlay",
             "OVERLAY",
-            () => !_draftOverlayEnabled
-                ? "Off"
-                : _draftOverlayMode switch
-                {
-                    OverlayMode.Simple => "FPS",
-                    OverlayMode.Custom => DescribeCustomMetrics(),
-                    _ => "FPS + 4 metrics",
-                },
+            () => _draftOverlayEnabled ? DescribeOverlayReadings() : "Off",
             () => _draftOverlayEnabled ? "Shows while a game has focus" : "FPS and usage over your games",
             body);
     }
@@ -1473,21 +1235,30 @@ public sealed partial class ShellWindow
     private static StackPanel CreateSettingGroup(string label, FrameworkElement control, string hint) =>
         CreateSettingGroup(label, control, CreateMutedText(hint, 12));
 
-    /// <summary>"FPS + 2 metrics", in the same terms as "FPS + 4 metrics" for all of them.</summary>
-    private string DescribeCustomMetrics()
+    /// <summary>
+    /// What the overlay shows, named in the order it draws them: "FPS", "FPS and GPU temperature",
+    /// "FPS, CPU, GPU, GPU temperature and memory". It used to count them ("FPS + 4 metrics"),
+    /// which made the reader work out which four.
+    /// </summary>
+    private string DescribeOverlayReadings()
     {
-        var count = _draftOverlayCustomMetrics.Count;
-        var hasFps = _draftOverlayCustomMetrics.Contains("fps", StringComparer.OrdinalIgnoreCase);
-        var others = hasFps ? count - 1 : count;
-        return (hasFps, others) switch
+        IReadOnlyCollection<string> keys = _draftOverlayMode switch
         {
-            (_, 0) when !hasFps => "No metrics",
-            (true, 0) => "FPS",
-            (true, 1) => "FPS + 1 metric",
-            (true, _) => $"FPS + {others} metrics",
-            (false, 1) => "1 metric",
-            _ => $"{others} metrics",
+            OverlayMode.Simple => ["fps"],
+            OverlayMode.Custom => _draftOverlayCustomMetrics,
+            _ => [.. OverlayMetricChoices.Select(choice => choice.Key)],
         };
+        var names = OverlayMetricChoices
+            .Where(choice => keys.Contains(choice.Key, StringComparer.OrdinalIgnoreCase))
+            .Select(choice => choice.Name)
+            .ToList();
+        var text = names.Count switch
+        {
+            0 => "Nothing selected",
+            1 => names[0],
+            _ => $"{string.Join(", ", names.Take(names.Count - 1))} and {names[^1]}",
+        };
+        return char.ToUpperInvariant(text[0]) + text[1..];
     }
 
     private static bool IsDraftNumber(string? draft, string unit, int value) =>
@@ -1569,7 +1340,7 @@ public sealed partial class ShellWindow
             var clashes = IsWarningLikeColor(GetDraftOverlayColor());
             SetTextIfChanged(thresholdHint, clashes
                 ? "With a red, orange or yellow text color, the amber and red warnings for high usage and GPU temperature won't stand out."
-                : "CPU, GPU and memory turn amber above 75% and red above 90%, like GPU in the preview; GPU temperature does the same above 75 °C and 85 °C.");
+                : "Usage turns amber above 75% and red above 90%, as GPU does in the preview. GPU temperature does the same above 75 °C and 85 °C.");
             thresholdHint.Foreground = clashes
                 ? ResolveBrush("WarningBrush", "#F2BF66")
                 : ResolveBrush("TextMutedBrush", "#90959D");
@@ -1776,18 +1547,6 @@ public sealed partial class ShellWindow
         }
     }
 
-    private string GetStorageSummaryText()
-    {
-        return string.IsNullOrWhiteSpace(_viewModel.StorageDirectory)
-            ? "%LocalAppData%\\SwissOlly\\Data"
-            : _viewModel.StorageDirectory.Trim();
-    }
-
-    private string GetStorageFieldTitle()
-    {
-        return GetStorageFieldTitle(_viewModel.StorageDirectory);
-    }
-
     private static string GetStorageFieldTitle(string? storageDirectory)
     {
         return string.IsNullOrWhiteSpace(storageDirectory)
@@ -1795,54 +1554,6 @@ public sealed partial class ShellWindow
             : "Custom folder";
     }
 
-    private string GetRetentionFieldCaption()
-    {
-        if (string.IsNullOrWhiteSpace(_viewModel.RetentionHoursInput))
-        {
-            return "Type 30m, 24h, or 7d";
-        }
-
-        return _viewModel.HasValidRetentionInput
-            ? "Custom retention active"
-            : "Use m, h, or d only";
-    }
-
-    private string GetRetentionFieldValue()
-    {
-        return GetRetentionFieldValue(_viewModel.RetentionHoursInput);
-    }
-
-    private string GetRetentionFieldValue(string? retentionInput)
-    {
-        if (string.IsNullOrWhiteSpace(retentionInput))
-        {
-            return MainViewModel.FormatRetentionInput(SwissOllyConfig.DefaultMaxRetentionHours);
-        }
-
-        return MainViewModel.TryParseRetentionInput(retentionInput, out _, out var normalizedText)
-            ? normalizedText
-            : retentionInput.Trim();
-    }
-
     private static string FormatScrapeInterval(int seconds) =>
         seconds == 1 ? "1 second" : $"{seconds} seconds";
-
-    private static string FormatRetention(int hours)
-    {
-        if (hours % 24 == 0)
-        {
-            var days = hours / 24;
-            return days == 1 ? "1 day" : $"{days} days";
-        }
-
-        return hours == 1 ? "1 hour" : $"{hours} hours";
-    }
-
-    private string GetBehaviorSummaryText()
-    {
-        var startup = _viewModel.LaunchOnStartup ? "Auto-start" : "Manual start";
-        var tray = _viewModel.MinimizeToTray ? "Close to tray" : "Close to exit";
-        return $"{startup} · {tray}";
-    }
-
 }

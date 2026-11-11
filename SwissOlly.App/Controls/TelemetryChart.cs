@@ -372,6 +372,13 @@ public sealed class TelemetryChart : UserControl
             Rect = new Windows.Foundation.Rect(0, 0, Math.Max(0d, e.NewSize.Width), Math.Max(0d, e.NewSize.Height)),
         };
 
+        // A launch sweep's clip has the old width; finish it rather than cut off the new edge.
+        if (_drawInSweeping)
+        {
+            _drawInSweeping = false;
+            Motion.EndRevealFromLeft(_dataCanvas);
+        }
+
         // Skip if rendering is suspended (window resize) — the redraw will
         // happen when rendering resumes via the deferred refresh path.
         if (_renderingSuspended)
@@ -383,6 +390,60 @@ public sealed class TelemetryChart : UserControl
         // being resized the deferred redraw trailed the card's edge by a frame, so the plot
         // visibly lagged the frame around it. Retained rendering makes this cheap enough.
         Redraw();
+    }
+
+    // ---- Launch draw-in ------------------------------------------------------------------------
+    //
+    // Part of the launch entrance (ShellWindow.PlayLaunchEntrance): the first line this chart
+    // draws from history sweeps in from the left instead of appearing whole. It is a clip on the
+    // data layer run by the compositor, so the line is drawn once and nothing is laid out again.
+    // Grid, axis labels and the "Loading history" placeholder are not part of it.
+
+    private long _drawInStartsAt;
+    private long _drawInOpenUntil;
+    private bool _drawInSweeping;
+
+    /// <summary>
+    /// The next data this chart draws sweeps in, if it is a line and arrives before
+    /// <paramref name="openUntil"/> (Environment.TickCount64). The sweep starts no earlier than
+    /// <paramref name="delay"/> from now, in step with the card's own entrance.
+    /// </summary>
+    public void ArmLaunchDrawIn(TimeSpan delay, long openUntil)
+    {
+        _drawInStartsAt = Environment.TickCount64 + (long)delay.TotalMilliseconds;
+        _drawInOpenUntil = openUntil;
+    }
+
+    /// <summary>
+    /// Called once Redraw has drawn data. Only the first data counts: a live sample that got here
+    /// before history is a lone dot, and sweeping history in over it would hide it for a moment.
+    /// The sweep starts at the first drawn point, <paramref name="firstLineX"/>, not the plot's
+    /// left edge: when history starts part way across, the "Collecting since" caption left of it
+    /// is whole from the first frame (swept, it showed cut mid-word) and no time goes on empty plot.
+    /// </summary>
+    private void ConsumeLaunchDrawIn(bool drewLine, double firstLineX)
+    {
+        if (_drawInOpenUntil == 0)
+        {
+            return;
+        }
+
+        var now = Environment.TickCount64;
+        var open = now < _drawInOpenUntil;
+        _drawInOpenUntil = 0;
+        if (!drewLine || !open)
+        {
+            return;
+        }
+
+        var delay = TimeSpan.FromMilliseconds(Math.Max(0, _drawInStartsAt - now));
+        _drawInSweeping = Motion.PlayRevealFromLeft(
+            _dataCanvas,
+            Math.Clamp(firstLineX, LeftPadding, Math.Max(LeftPadding, ActualWidth - 1)),
+            ActualWidth,
+            ActualHeight,
+            delay,
+            () => _drawInSweeping = false);
     }
 
     private bool _renderingSuspended;
@@ -397,22 +458,6 @@ public sealed class TelemetryChart : UserControl
             _lastRenderedSeries = null;
             ScheduleRedraw();
         }
-    }
-
-    public void RefreshThemeResources()
-    {
-        RefreshPlotSurfaceThemeResources();
-        _hoverLine.Stroke = ResolveBrush("AccentStrongBrush", "#B7F7FF");
-        _hoverTooltip.Background = ResolveBrush("SurfaceElevatedBrush", "#222529");
-        _hoverTooltip.BorderBrush = ResolveBrush("AccentSoftBrush", "#163B60");
-        _selectionRectangle.Fill = ResolveBrush("AccentHaloBrush", "#2B8FE6C4");
-        _hoverTooltipText.Foreground = ResolveBrush("TextPrimaryBrush", "#F2F8FF");
-        _emptyStateText.Foreground = ResolveBrush("TextMutedBrush", "#7D9AB6");
-        _emptyStateText.Text = string.IsNullOrWhiteSpace(EmptyStateText) ? "Waiting for samples" : EmptyStateText;
-        HideHover();
-        // Force immediate redraw — don't defer, theme swap should feel instant
-        _lastRenderedSeries = null;
-        Redraw();
     }
 
     private void ScheduleRedraw(DispatcherQueuePriority priority = DispatcherQueuePriority.Low)
@@ -612,6 +657,8 @@ public sealed class TelemetryChart : UserControl
 
         var visualIndex = 0;
         var soloIndex = 0;
+        var drewLine = false;
+        var firstLineX = double.MaxValue;
         var runs = new List<IReadOnlyList<Windows.Foundation.Point>>();
         var seriesIndex = -1;
         foreach (var item in series)
@@ -658,12 +705,14 @@ public sealed class TelemetryChart : UserControl
                 else if (projected.Count > 1)
                 {
                     runs.Add(projected);
+                    firstLineX = Math.Min(firstLineX, projected[0].X);
                 }
             }
 
             var visual = SeriesVisualAt(visualIndex++);
             if (runs.Count > 0)
             {
+                drewLine = true;
                 if (drawFilledArea)
                 {
                     SetFigures(visual.FillGeometry, runs, plotBottom, closed: true);
@@ -716,6 +765,7 @@ public sealed class TelemetryChart : UserControl
         HideSeriesVisuals(visualIndex);
         HideFrom(_soloDots, soloIndex);
         _hasRenderedFrame = true;
+        ConsumeLaunchDrawIn(drewLine, firstLineX);
     }
 
     private Line? _collectionStartLine;
@@ -984,8 +1034,8 @@ public sealed class TelemetryChart : UserControl
         _plotFrame.Stroke = null;
         _plotFrame.Fill = ResolveBrush("SurfaceInsetBrush", "#091321");
         _plotTint.Fill = ResolveBrush("AccentSoftBrush", "#10394D");
-        _leftEdgeFade.Fill = CreateEdgeFadeBrush(isLeadingEdge: true);
-        _rightEdgeFade.Fill = CreateEdgeFadeBrush(isLeadingEdge: false);
+        _leftEdgeFade.Fill = ThemeVisuals.PlotEdgeFadeBrush(isLeadingEdge: true);
+        _rightEdgeFade.Fill = ThemeVisuals.PlotEdgeFadeBrush(isLeadingEdge: false);
     }
 
     private void DrawGrid(double width, double height, DateTimeOffset start, DateTimeOffset end, double maxValue, bool includeLabels = true)
@@ -1478,30 +1528,6 @@ public sealed class TelemetryChart : UserControl
 
 
     private static Brush ResolveBrush(string key, string fallbackHex) => ThemeVisuals.ResolveBrush(key, fallbackHex);
-
-    private static Brush CreateEdgeFadeBrush(bool isLeadingEdge)
-    {
-        var plotBackground = ThemeVisuals.ResolveColor("SurfaceInsetBrush", "#141619");
-
-        return new LinearGradientBrush
-        {
-            StartPoint = new Windows.Foundation.Point(0, 0),
-            EndPoint = new Windows.Foundation.Point(1, 0),
-            GradientStops = new GradientStopCollection
-            {
-                new GradientStop
-                {
-                    Color = Color.FromArgb(isLeadingEdge ? (byte)40 : (byte)0, plotBackground.R, plotBackground.G, plotBackground.B),
-                    Offset = 0,
-                },
-                new GradientStop
-                {
-                    Color = Color.FromArgb(isLeadingEdge ? (byte)0 : (byte)40, plotBackground.R, plotBackground.G, plotBackground.B),
-                    Offset = 1,
-                },
-            },
-        };
-    }
 
     private static bool IsLightPaletteActive() => ThemeVisuals.IsLightPaletteActive();
 

@@ -863,6 +863,11 @@ public sealed class TelemetryPanelCard : UserControl
             if (lifted && _liftCaster is not null)
             {
                 _liftCaster.IsVisible = true;
+                // In the current palette: a composition brush is a copy, not the palette brush.
+                if (_liftCaster.Brush is Microsoft.UI.Composition.CompositionColorBrush casterBrush)
+                {
+                    casterBrush.Color = ResolveColor("SurfaceBrush", "#1C1F22");
+                }
             }
 
             var animation = compositor.CreateScalarKeyFrameAnimation();
@@ -1501,6 +1506,9 @@ public sealed class TelemetryPanelCard : UserControl
         }
     }
 
+    /// <summary>Launch entrance: the chart's first line from history draws in from the left.</summary>
+    public void ArmLaunchDrawIn(TimeSpan delay, long openUntil) => _chart.ArmLaunchDrawIn(delay, openUntil);
+
     /// <summary>Optimizes the panel for window resize — collapses heavy elements and flattens corners.</summary>
     public void SetResizeMode(bool resizing)
     {
@@ -1528,105 +1536,6 @@ public sealed class TelemetryPanelCard : UserControl
                string.Equals(propertyName, nameof(MetricPanelViewModel.SecondaryValue), StringComparison.Ordinal) ||
                string.Equals(propertyName, nameof(MetricPanelViewModel.FooterText), StringComparison.Ordinal) ||
                string.Equals(propertyName, nameof(MetricPanelViewModel.ScaleLabel), StringComparison.Ordinal);
-    }
-
-    public void RefreshThemeResources()
-    {
-        // Use theme resource brushes where possible — they update in-place when theme changes.
-        // Only use CreateSurfaceGradient for elements that need distinct gradients.
-        var strokeBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E");
-        var mutedBrush = ResolveBrush("TextMutedBrush", "#7D9AB6");
-        var cardBg = ResolveBrush("SurfaceBrush", "#1C1F22");
-
-        _cardBorder.Background = cardBg;
-        // Constant 1px. Every thickness change is a layout pass, and 0.9 here vs 1 elsewhere
-        // shifted the card's content by a fraction of a pixel on each theme change.
-        _cardBorder.BorderThickness = new Thickness(1);
-        _cardBorder.BorderBrush = ResolveEditBorderBrush();
-        if (_liftCaster is not null)
-        {
-            _liftCaster.Brush = _liftCaster.Compositor.CreateColorBrush(ResolveColor("SurfaceBrush", "#1C1F22"));
-        }
-
-        foreach (var (grip, edge) in _handleVisuals)
-        {
-            if (IsCorner(edge))
-            {
-                grip.BorderBrush = ResolveBrush("AccentStrongBrush", "#9FEFFF");
-            }
-            else
-            {
-                grip.Background = ResolveBrush("AccentStrongBrush", "#9FEFFF");
-            }
-        }
-
-        _cardBorder.Opacity = 1.0;
-        _cardBorder.Translation = new System.Numerics.Vector3(0f, 0f, 0f);
-        _rangeShell.Background = BrushFactory.CreateBrush("#00FFFFFF");
-        // Both are intentionally borderless — re-applying a stroke here would restore the boxes.
-        _scalePill.Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
-        _chartFrame.Background = BrushFactory.CreateBrush("#00FFFFFF");
-        _processSection.Background = BrushFactory.CreateBrush("#00FFFFFF");
-        _legendDivider.Background = strokeBrush;
-        _legendScroller.Background = null;
-        _processScroller.Background = null;
-        _processLabelText.Foreground = mutedBrush;
-        _activityLabelText.Foreground = mutedBrush;
-        _valueLabelText.Foreground = mutedBrush;
-
-        _badgeBorder.Background = ResolveBrush("SurfaceInsetBrush", "#091321");
-
-        _processToggleButton.RefreshThemeResources();
-        _sortHighestButton.RefreshThemeResources();
-        _sortLowestButton.RefreshThemeResources();
-        _sortNameButton.RefreshThemeResources();
-
-        var secondaryBrush = ResolveBrush("TextSecondaryBrush", "#B7CCE1");
-        var primaryBrush = ResolveBrush("TextPrimaryBrush", "#F2F8FF");
-        foreach (var rowParts in _legendRows.Values)
-        {
-            // Legend rows are deliberately borderless and transparent at rest; re-applying a
-            // background here on theme change would put the boxes back.
-            rowParts.InnerBorder.Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
-            rowParts.NameText.Foreground = secondaryBrush;
-            rowParts.ValueText.Foreground = primaryBrush;
-        }
-
-        foreach (var slot in _processRowSlots)
-        {
-            slot.NameText.Foreground = primaryBrush;
-            slot.ValueText.Foreground = primaryBrush;
-            slot.CaptionText.Foreground = slot.IsPinned ? ResolveBrush("TextSecondaryBrush", "#C4C8CE") : mutedBrush;
-            if (!slot.IsHovered)
-            {
-                slot.RowBorder.Background = ProcessRowRestBrush(slot.IsPinned);
-            }
-        }
-
-        _processEmptyText.Foreground = mutedBrush;
-
-        if (Panel is { } panel)
-        {
-            // Rebuilt, not skipped as unchanged: on a light palette the icon holds a darkened copy
-            // of the accent, which went stale when switching back to a dark one.
-            _lastBadgeAccentBrush = null;
-            UpdateBadgeIcon(panel);
-            ApplyPalette(panel);
-            // Re-apply sort button states so active highlights use the new theme colors.
-            RefreshProcessSortButtons(panel);
-        }
-        else
-        {
-            _footerText.Foreground = ResolveBrush("TextMutedBrush", "#7D9AB6");
-            _scaleText.Foreground = ResolveBrush("TextSecondaryBrush", "#B7CCE1");
-            _titleText.Foreground = ResolveBrush("TextPrimaryBrush", "#F2F8FF");
-            _currentValueText.Foreground = ResolveBrush("TextPrimaryBrush", "#F2F8FF");
-            _secondaryValueText.Foreground = ResolveBrush("TextSecondaryBrush", "#B7CCE1");
-            _processSectionTitleText.Foreground = ResolveBrush("TextSecondaryBrush", "#B7CCE1");
-        }
-
-        _chart.RefreshThemeResources();
-        _gauge.RefreshThemeResources();
     }
 
     private void RefreshLegend(MetricPanelViewModel panel)
@@ -1884,6 +1793,15 @@ public sealed class TelemetryPanelCard : UserControl
         _processToggleButton.Visibility = supportsProcesses ? Visibility.Visible : Visibility.Collapsed;
         _processToggleButton.IsActive = _processSectionExpanded;
         if (!supportsProcesses && _processSectionExpanded)
+        {
+            _processFlyout.Hide();
+        }
+    }
+
+    /// <summary>Closes the process list if it is open: the board is going out of view.</summary>
+    public void CloseProcessList()
+    {
+        if (_processSectionExpanded)
         {
             _processFlyout.Hide();
         }

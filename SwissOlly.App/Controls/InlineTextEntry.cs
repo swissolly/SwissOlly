@@ -47,10 +47,6 @@ public sealed class InlineTextEntry : UserControl
     private string _placeholderText = string.Empty;
     private int _caretIndex;
     private int _anchorIndex;
-    private Brush? _cachedIdleBg;
-    private Brush? _cachedHoverBg;
-    private Brush? _cachedFocusBg;
-    private bool _brushCacheIsLight;
 
     public InlineTextEntry()
     {
@@ -188,14 +184,6 @@ public sealed class InlineTextEntry : UserControl
     private int SelectionStart => Math.Min(_caretIndex, _anchorIndex);
 
     private int SelectionLength => Math.Abs(_caretIndex - _anchorIndex);
-
-    public void RefreshThemeResources()
-    {
-        _cachedIdleBg = null;
-        _cachedHoverBg = null;
-        _cachedFocusBg = null;
-        UpdateVisualState();
-    }
 
     protected override AutomationPeer OnCreateAutomationPeer() => new InlineTextEntryAutomationPeer(this);
 
@@ -591,26 +579,13 @@ public sealed class InlineTextEntry : UserControl
     private void UpdateVisualState()
     {
         var isLight = IsLightPaletteActive();
-        if (_cachedIdleBg is null || _brushCacheIsLight != isLight)
-        {
-            _brushCacheIsLight = isLight;
-            if (isLight)
-            {
-                _cachedIdleBg = ResolveBrush("SurfaceBrush", "#FFFFFF");
-                _cachedHoverBg = ResolveBrush("SurfaceElevatedBrush", "#F4F7FB");
-                _cachedFocusBg = ResolveBrush("SurfaceStrongBrush", "#E8EEF5");
-            }
-            else
-            {
-                _cachedIdleBg = ResolveBrush("SurfaceInsetBrush", "#141619");
-                _cachedHoverBg = ResolveBrush("SurfaceElevatedBrush", "#222529");
-                _cachedFocusBg = ResolveBrush("SurfaceStrongBrush", "#292D31");
-            }
-        }
-
+        // Palette brushes only, so a theme change recolours the field without touching it. The
+        // idle fill is white on light palettes and inset on dark ones.
         _surface.Background = _isFocused
-            ? _cachedFocusBg
-            : _isHovered ? _cachedHoverBg : _cachedIdleBg;
+            ? ResolveBrush("SurfaceStrongBrush", "#292D31")
+            : _isHovered
+                ? ResolveBrush("SurfaceElevatedBrush", "#222529")
+                : ResolveBrush("InputBackgroundBrush", "#141619");
         // Constant thickness: varying it on hover/focus invalidates layout and nudges the text.
         // Focus is signalled by the accent brush and glow instead.
         _surface.BorderBrush = ResolveBrush(_isFocused ? "AccentStrongBrush" : "SurfaceStrokeBrush",

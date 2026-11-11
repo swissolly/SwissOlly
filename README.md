@@ -2,7 +2,7 @@
 
 Local Windows system monitor. Live and historical telemetry, stored on-disk in SQLite, rendered in WinUI 3.
 
-![SwissOlly overview in the Dark theme: CPU, memory and GPU charts over the last 12 hours](docs/images/overview.png)
+![SwissOlly overview in the Dark theme: CPU, memory and GPU charts over the last 24 hours](docs/images/overview.png)
 
 ## Overview
 
@@ -146,12 +146,18 @@ Background collector samples hardware counters every 2 seconds (configurable). S
 
 ## Privacy
 
-No network calls, no telemetry, no update pings. SwissOlly writes only to its settings folder (`%LocalAppData%\SwissOlly`) and the storage folder. The history database holds metric values and the names of the panels they belong to (such as drive and network adapter names), nothing else; process lists are shown live and never saved. A custom storage folder keeps the permissions of the folder it is created in, so on a shared PC pick one under your own user profile. Uninstalling keeps settings and history; delete `%LocalAppData%\SwissOlly` to remove them.
+No network calls, no telemetry, no update pings. SwissOlly writes only to its settings folder (`%LocalAppData%\SwissOlly`) and the storage folder. The history database holds metric values and the names of the panels they belong to (such as drive and network adapter names), nothing else; process lists are shown live and never saved. A custom storage folder keeps the permissions of the folder it is created in, so on a shared PC pick one under your own user profile. The settings folder also holds two local logs: `startup-trace.log` (the last launch) and `crash.log` (errors that closed the app). Uninstalling keeps settings and history; delete `%LocalAppData%\SwissOlly` to remove them.
 
 ## Roadmap
 
 See [ROADMAP.md](ROADMAP.md).
 
+## Support
+
+SwissOlly is free and stays free. If it's useful to you, you can [sponsor it on GitHub](https://github.com/sponsors/swissolly).
+
 ## License
 
-GNU AGPL-3.0. See [LICENSE](LICENSE).
+GNU AGPL-3.0. See [LICENSE](LICENSE). The libraries SwissOlly ships, and their licenses, are
+listed in [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt); the installer puts both files
+beside the app.

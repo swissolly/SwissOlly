@@ -9,8 +9,22 @@ public sealed class SqliteMetricStore : IMetricStore
     private static readonly TimeSpan RawResolutionWindow = TimeSpan.FromHours(6);
     private static readonly TimeSpan MaintenanceInterval = TimeSpan.FromMinutes(15);
     private const long MinuteBucketMilliseconds = 60_000;
+    private const long IncrementalAutoVacuum = 2;
+
+    /// <summary>Largest live database a prune will rewrite to turn on auto_vacuum (see ChooseReclaimAsync).</summary>
+    private const long MaxConvertingVacuumBytes = 256L * 1024 * 1024;
+
+    /// <summary>Most raw samples one maintenance step rolls up: half an hour (about 37,000 rows at 2 s).</summary>
+    private const long RawStepMilliseconds = 30 * MinuteBucketMilliseconds;
+
+    /// <summary>Most expired rollups one maintenance step deletes: six hours (about 15,000 rows).</summary>
+    private const long RollupStepMilliseconds = 6 * 60 * MinuteBucketMilliseconds;
+
+    /// <summary>Pages one reclaim step gives back: 8 MB.</summary>
+    private const int VacuumStepPages = 2048;
 
     private readonly SemaphoreSlim _gate = new(1, 1);
+    private readonly TimeProvider _time;
     private string? _connectionString;
     private SwissOllyConfig? _config;
     private SqliteConnection? _writeConnection;
@@ -23,8 +37,22 @@ public sealed class SqliteMetricStore : IMetricStore
     private SqliteParameter? _unitParameter;
     private SqliteParameter? _timestampMsParameter;
     private SqliteParameter? _valueParameter;
-    private DateTimeOffset _nextMaintenanceUtc = DateTimeOffset.MinValue;
+    private long _lastMaintenanceTimestamp;
     private int _disposeStarted;
+
+    public SqliteMetricStore()
+        : this(TimeProvider.System)
+    {
+    }
+
+    /// <param name="time">
+    /// The wall clock behind retention and rollup cutoffs, and the monotonic clock that schedules
+    /// maintenance. Tests and tools pass their own to simulate time passing or the clock changing.
+    /// </param>
+    public SqliteMetricStore(TimeProvider time)
+    {
+        _time = time ?? throw new ArgumentNullException(nameof(time));
+    }
 
     public async Task InitializeAsync(SwissOllyConfig config, CancellationToken cancellationToken)
     {
@@ -68,8 +96,13 @@ public sealed class SqliteMetricStore : IMetricStore
             _insertCommand is not null)
         {
             _config = config;
-            _nextMaintenanceUtc = DateTimeOffset.UtcNow.Add(MaintenanceInterval);
+            _lastMaintenanceTimestamp = _time.GetTimestamp();
             return;
+        }
+
+        if (_connectionString is not null)
+        {
+            ReleasePooledConnections(_connectionString);
         }
 
         _connectionString = nextConnectionString;
@@ -87,13 +120,19 @@ public sealed class SqliteMetricStore : IMetricStore
         _writeConnection = new SqliteConnection(_connectionString);
         await _writeConnection.OpenAsync(cancellationToken).ConfigureAwait(false);
 
-        var command = _writeConnection.CreateCommand();
+        await using var command = _writeConnection.CreateCommand();
+        // auto_vacuum first: switching journal_mode to WAL writes the header of a new database,
+        // after which its vacuum mode can no longer change, so every database created with the
+        // old order had none and the incremental_vacuum in maintenance never freed anything.
+        // journal_size_limit: the WAL file otherwise stays as big as the largest transaction
+        // since launch (a big prune or vacuum); normal running keeps it under 10 MB.
         command.CommandText =
             """
+            PRAGMA auto_vacuum = INCREMENTAL;
             PRAGMA journal_mode = WAL;
+            PRAGMA journal_size_limit = 16777216;
             PRAGMA synchronous = NORMAL;
             PRAGMA temp_store = MEMORY;
-            PRAGMA auto_vacuum = INCREMENTAL;
 
             CREATE TABLE IF NOT EXISTS metric_samples (
                 panel_key TEXT NOT NULL,
@@ -189,7 +228,7 @@ public sealed class SqliteMetricStore : IMetricStore
         _valueParameter.ParameterName = "$value";
         _insertCommand.Parameters.Add(_valueParameter);
 
-        _nextMaintenanceUtc = DateTimeOffset.UtcNow.Add(MaintenanceInterval);
+        _lastMaintenanceTimestamp = _time.GetTimestamp();
     }
 
     public async Task AppendSnapshotAsync(MetricSnapshot snapshot, CancellationToken cancellationToken)
@@ -240,7 +279,7 @@ public sealed class SqliteMetricStore : IMetricStore
                 {
                     command.Transaction = null;
                 }
-                await MaybeMaintainAsync(connection, snapshot.Timestamp, cancellationToken).ConfigureAwait(false);
+                await MaybeMaintainAsync(connection, cancellationToken).ConfigureAwait(false);
             }
             catch (Exception ex) when (ex is SqliteException or IOException or UnauthorizedAccessException)
             {
@@ -288,10 +327,11 @@ public sealed class SqliteMetricStore : IMetricStore
         await using var connection = new SqliteConnection(connectionString);
         await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
 
-        var command = connection.CreateCommand();
+        await using var command = connection.CreateCommand();
         var fromMs = fromUtc.ToUnixTimeMilliseconds();
-        var rawBoundaryMs = DateTimeOffset.UtcNow.Subtract(RawResolutionWindow).ToUnixTimeMilliseconds();
-        var loadedWindow = DateTimeOffset.UtcNow - fromUtc;
+        var now = _time.GetUtcNow();
+        var rawBoundaryMs = now.Subtract(RawResolutionWindow).ToUnixTimeMilliseconds();
+        var loadedWindow = now - fromUtc;
 
         // For wide ranges (>24h), skip the raw-samples window entirely — the chart
         // downsamples to ~180 points regardless, so second-resolution raw samples
@@ -404,7 +444,7 @@ public sealed class SqliteMetricStore : IMetricStore
             command.Parameters.AddWithValue("$rawBoundary", rawBoundaryMs);
         }
 
-        return await ReadHistoryAsync(command, cancellationToken).ConfigureAwait(false);
+        return await ReadHistoryAsync(command, 0, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<IReadOnlyList<MetricSeriesHistory>> LoadHistoryAsync(
@@ -420,44 +460,39 @@ public sealed class SqliteMetricStore : IMetricStore
 
         // Minute rollups and raw samples never cover the same time (compaction moves samples
         // into rollups and deletes them in one transaction), so the two tables simply stack.
-        // Averaging in SQL keeps a year to a couple of thousand points per series instead of
-        // half a million rows marshalled into memory.
-        const string Stored =
+        // Rows come in time order straight off the two timestamp indexes and are averaged into
+        // buckets here as they go by. A GROUP BY in SQL sorted every row first, spilling to a
+        // temp file: on a year of history, 30 days took 25 s that way and 8 s this way, and the
+        // startup read took about half as long.
+        await using var command = connection.CreateCommand();
+        command.CommandText =
             """
-            SELECT panel_key, panel_title, series_key, series_name, category, unit, timestamp_ms, value
-            FROM metric_rollups_1m
-            WHERE timestamp_ms >= $fromTimestamp AND timestamp_ms < $toTimestamp
-            UNION ALL
-            SELECT panel_key, panel_title, series_key, series_name, category, unit, timestamp_ms, value
-            FROM metric_samples
-            WHERE timestamp_ms >= $fromTimestamp AND timestamp_ms < $toTimestamp
+            SELECT * FROM (
+                SELECT panel_key, panel_title, series_key, series_name, category, unit, timestamp_ms, value
+                FROM metric_rollups_1m
+                WHERE timestamp_ms >= $fromTimestamp AND timestamp_ms < $toTimestamp
+                UNION ALL
+                SELECT panel_key, panel_title, series_key, series_name, category, unit, timestamp_ms, value
+                FROM metric_samples
+                WHERE timestamp_ms >= $fromTimestamp AND timestamp_ms < $toTimestamp)
+            ORDER BY timestamp_ms;
             """;
-
-        var command = connection.CreateCommand();
-        var bucketMs = (long)Math.Max(0d, bucket.TotalMilliseconds);
-        command.CommandText = bucketMs > 0
-            ? $"""
-              SELECT panel_key, MAX(panel_title), series_key, MAX(series_name), MAX(category), MAX(unit),
-                     (timestamp_ms / $bucketMs) * $bucketMs AS bucket_ms, AVG(value)
-              FROM ({Stored})
-              GROUP BY panel_key, series_key, bucket_ms
-              ORDER BY panel_key, series_key, bucket_ms;
-              """
-            : $"""
-              SELECT * FROM ({Stored})
-              ORDER BY panel_key, series_key, timestamp_ms;
-              """;
         command.Parameters.AddWithValue("$fromTimestamp", fromUtc.ToUnixTimeMilliseconds());
         command.Parameters.AddWithValue("$toTimestamp", toUtc.ToUnixTimeMilliseconds());
-        if (bucketMs > 0)
-        {
-            command.Parameters.AddWithValue("$bucketMs", bucketMs);
-        }
 
-        return await ReadHistoryAsync(command, cancellationToken).ConfigureAwait(false);
+        var bucketMs = (long)Math.Max(0d, bucket.TotalMilliseconds);
+        return await ReadHistoryAsync(command, bucketMs, cancellationToken).ConfigureAwait(false);
     }
 
-    private static async Task<IReadOnlyList<MetricSeriesHistory>> ReadHistoryAsync(SqliteCommand command, CancellationToken cancellationToken)
+    /// <summary>
+    /// Groups rows into panels and series, averaging each series into
+    /// <paramref name="bucketMs"/>-wide buckets (timestamped at the bucket's start) or keeping
+    /// every row when it is zero. Each series' rows must arrive in time order.
+    /// </summary>
+    private static async Task<IReadOnlyList<MetricSeriesHistory>> ReadHistoryAsync(
+        SqliteCommand command,
+        long bucketMs,
+        CancellationToken cancellationToken)
     {
         var panelMap = new Dictionary<string, PanelAccumulator>(StringComparer.OrdinalIgnoreCase);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
@@ -474,36 +509,99 @@ public sealed class SqliteMetricStore : IMetricStore
                 panelMap.Add(panelKey, panel);
             }
 
-            var point = new MetricPoint(
-                DateTimeOffset.FromUnixTimeMilliseconds(reader.GetInt64(6)),
-                reader.GetDouble(7));
-
-            panel.AddPoint(reader.GetString(2), reader.GetString(3), point);
+            panel.GetSeries(reader.GetString(2), reader).Add(reader.GetInt64(6), reader.GetDouble(7), bucketMs);
         }
 
+        // Panels by title, then key; series by key: the order the reads always returned.
         return panelMap.Values
-            .Select(panel => panel.ToHistory())
             .OrderBy(panel => panel.PanelTitle, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(panel => panel.PanelKey, StringComparer.Ordinal)
+            .Select(panel => panel.ToHistory())
             .ToArray();
     }
 
+    /// <summary>
+    /// Brings the database in line with <paramref name="config"/>'s retention now (at launch and
+    /// after a retention change), then gives the space back if at least half the file is free.
+    /// Works in bounded steps and lets the collector's writes in between them. In one transaction,
+    /// dropping 30 days from a year of history held the store for 36 s and catching up after a
+    /// night off for over 5 s, both past the collector's 5 s write timeout, so those samples were
+    /// lost; in steps, no write waited more than about a second.
+    /// </summary>
     public async Task PruneAsync(SwissOllyConfig config, CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
         _ = EnsureInitialized();
+        config = config.Normalize();
+        var now = _time.GetUtcNow();
+        var more = true;
+        while (more)
+        {
+            more = await OnWriteConnectionAsync(
+                async connection =>
+                {
+                    _config = config;
+                    var due = await CompactAndPruneStepAsync(connection, config, now, cancellationToken).ConfigureAwait(false);
+                    _lastMaintenanceTimestamp = _time.GetTimestamp();
+                    return due;
+                },
+                cancellationToken).ConfigureAwait(false);
+        }
+
+        switch (await OnWriteConnectionAsync(connection => ChooseReclaimAsync(connection, cancellationToken), cancellationToken).ConfigureAwait(false))
+        {
+            case Reclaim.Incremental:
+                while (await OnWriteConnectionAsync(
+                    async connection =>
+                    {
+                        await ExecuteAsync(connection, $"PRAGMA incremental_vacuum({VacuumStepPages}); PRAGMA wal_checkpoint(PASSIVE);", cancellationToken).ConfigureAwait(false);
+                        return await ScalarAsync(connection, "PRAGMA freelist_count;", cancellationToken).ConfigureAwait(false) > 0;
+                    },
+                    cancellationToken).ConfigureAwait(false))
+                {
+                }
+
+                break;
+            case Reclaim.Convert:
+                await OnWriteConnectionAsync(
+                    async connection =>
+                    {
+                        try
+                        {
+                            await ExecuteAsync(connection, "PRAGMA auto_vacuum = INCREMENTAL; VACUUM; PRAGMA wal_checkpoint(PASSIVE);", cancellationToken).ConfigureAwait(false);
+                        }
+                        catch (SqliteException)
+                        {
+                            // Best effort (a VACUUM needs room for a copy): the free pages still get reused.
+                        }
+
+                        return true;
+                    },
+                    cancellationToken).ConfigureAwait(false);
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Runs <paramref name="work"/> on the write connection, holding the store meanwhile. Once
+    /// the store is being disposed it runs nothing and returns the default, ending a prune.
+    /// </summary>
+    private async Task<T?> OnWriteConnectionAsync<T>(Func<SqliteConnection, Task<T>> work, CancellationToken cancellationToken)
+    {
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            ThrowIfDisposed();
-            _config = config.Normalize();
+            if (Volatile.Read(ref _disposeStarted) != 0)
+            {
+                return default;
+            }
+
             if (_writeConnection is null || _insertCommand is null)
             {
                 await OpenWriteConnectionAsync(cancellationToken).ConfigureAwait(false);
             }
 
-            var connection = EnsureWriteConnectionInitialized();
-            await CompactAndPruneAsync(connection, _config, DateTimeOffset.UtcNow, cancellationToken).ConfigureAwait(false);
-            _nextMaintenanceUtc = DateTimeOffset.UtcNow.Add(MaintenanceInterval);
+            return await work(EnsureWriteConnectionInitialized()).ConfigureAwait(false);
         }
         finally
         {
@@ -548,18 +646,31 @@ public sealed class SqliteMetricStore : IMetricStore
     private SqliteCommand EnsureInsertCommandInitialized() =>
         _insertCommand ?? throw new InvalidOperationException("The SQLite insert command has not been initialized.");
 
-    private async Task MaybeMaintainAsync(SqliteConnection connection, DateTimeOffset timestamp, CancellationToken cancellationToken)
+    /// <summary>
+    /// Rolls up and prunes every <see cref="MaintenanceInterval"/> of elapsed time. Scheduled on
+    /// the monotonic clock: on the wall clock, setting the time back an hour (or a day) stopped
+    /// rollups and pruning for that long while raw samples piled up.
+    /// </summary>
+    private async Task MaybeMaintainAsync(SqliteConnection connection, CancellationToken cancellationToken)
     {
-        if (_config is null || timestamp < _nextMaintenanceUtc)
+        if (_config is null || _time.GetElapsedTime(_lastMaintenanceTimestamp) < MaintenanceInterval)
         {
             return;
         }
 
-        await CompactAndPruneAsync(connection, _config, timestamp, cancellationToken).ConfigureAwait(false);
-        _nextMaintenanceUtc = timestamp.Add(MaintenanceInterval);
+        // With more due than one step does (the clock jumped ahead, say), the next writes carry
+        // on, a step each, rather than this one holding the store until it is all done.
+        if (!await CompactAndPruneStepAsync(connection, _config, _time.GetUtcNow(), cancellationToken).ConfigureAwait(false))
+        {
+            _lastMaintenanceTimestamp = _time.GetTimestamp();
+        }
     }
 
-    private static async Task CompactAndPruneAsync(
+    /// <summary>
+    /// One step of rolling up and pruning, in one transaction, from the oldest rows: at most an
+    /// hour of raw samples and a day of expired rollups. Returns true while more is due.
+    /// </summary>
+    private static async Task<bool> CompactAndPruneStepAsync(
         SqliteConnection connection,
         SwissOllyConfig config,
         DateTimeOffset now,
@@ -570,17 +681,25 @@ public sealed class SqliteMetricStore : IMetricStore
         var rawCutoffMs = now.Subtract(RawResolutionWindow).ToUnixTimeMilliseconds();
         rawCutoffMs = rawCutoffMs / MinuteBucketMilliseconds * MinuteBucketMilliseconds;
 
+        // Raw samples are rolled up to the raw cutoff, or, with retention shorter than the raw
+        // window, dropped at the retention cutoff. Steps end on whole minutes, so a minute is
+        // always rolled up whole.
+        var rollUp = retentionWindow > RawResolutionWindow;
+        var rawDueBeforeMs = rollUp ? rawCutoffMs : retentionCutoffMs;
+        var rawStepEndMs = await StepEndAsync(connection, "metric_samples", rawDueBeforeMs, RawStepMilliseconds, cancellationToken).ConfigureAwait(false);
+        var rollupStepEndMs = await StepEndAsync(connection, "metric_rollups_1m", retentionCutoffMs, RollupStepMilliseconds, cancellationToken).ConfigureAwait(false);
+
         await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
 
-        // Only compact raw samples into rollups if retention extends beyond the raw window.
-        // If retention is shorter than the raw window, we skip compaction and just delete everything older.
-        if (retentionWindow > RawResolutionWindow)
+        if (rollUp)
         {
-            var compactCommand = connection.CreateCommand();
+            await using var compactCommand = connection.CreateCommand();
             compactCommand.Transaction = transaction;
+            // A minute already rolled up only gets more raw samples after the clock was set back
+            // past the raw window; average the two instead of letting the newer one overwrite it.
             compactCommand.CommandText =
                 """
-                INSERT OR REPLACE INTO metric_rollups_1m (
+                INSERT INTO metric_rollups_1m (
                     panel_key,
                     panel_title,
                     series_key,
@@ -609,37 +728,104 @@ public sealed class SqliteMetricStore : IMetricStore
                     series_name,
                     category,
                     unit,
-                    (timestamp_ms / $bucketMs);
+                    (timestamp_ms / $bucketMs)
+                ON CONFLICT (panel_key, series_key, timestamp_ms)
+                    DO UPDATE SET value = (metric_rollups_1m.value + excluded.value) / 2;
                 """;
             compactCommand.Parameters.AddWithValue("$retentionCutoff", retentionCutoffMs);
-            compactCommand.Parameters.AddWithValue("$rawCutoff", rawCutoffMs);
+            compactCommand.Parameters.AddWithValue("$rawCutoff", rawStepEndMs);
             compactCommand.Parameters.AddWithValue("$bucketMs", MinuteBucketMilliseconds);
             await compactCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        // Delete raw samples: if retention < raw window, honor the retention cutoff directly
-        var deleteRawCommand = connection.CreateCommand();
+        await using var deleteRawCommand = connection.CreateCommand();
         deleteRawCommand.Transaction = transaction;
         deleteRawCommand.CommandText = "DELETE FROM metric_samples WHERE timestamp_ms < $cutoff;";
-        deleteRawCommand.Parameters.AddWithValue("$cutoff", retentionWindow > RawResolutionWindow ? rawCutoffMs : retentionCutoffMs);
+        deleteRawCommand.Parameters.AddWithValue("$cutoff", rawStepEndMs);
         await deleteRawCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
 
-        // Delete rollup data older than retention
-        var deleteRollupCommand = connection.CreateCommand();
+        await using var deleteRollupCommand = connection.CreateCommand();
         deleteRollupCommand.Transaction = transaction;
         deleteRollupCommand.CommandText = "DELETE FROM metric_rollups_1m WHERE timestamp_ms < $cutoff;";
-        deleteRollupCommand.Parameters.AddWithValue("$cutoff", retentionCutoffMs);
+        deleteRollupCommand.Parameters.AddWithValue("$cutoff", rollupStepEndMs);
         await deleteRollupCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
 
-        var maintenanceCommand = connection.CreateCommand();
-        maintenanceCommand.CommandText =
-            """
-            PRAGMA optimize;
-            PRAGMA wal_checkpoint(PASSIVE);
-            PRAGMA incremental_vacuum(512);
-            """;
-        await maintenanceCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        var more = rawStepEndMs < rawDueBeforeMs || rollupStepEndMs < retentionCutoffMs;
+        if (!more)
+        {
+            // Once the last step is done (the WAL checkpoints itself in between). Vacuum before
+            // the checkpoint, so the file shrinks now rather than at the next one.
+            await ExecuteAsync(connection, "PRAGMA optimize; PRAGMA incremental_vacuum(512); PRAGMA wal_checkpoint(PASSIVE);", cancellationToken).ConfigureAwait(false);
+        }
+
+        return more;
+    }
+
+    /// <summary>
+    /// Where a step through <paramref name="table"/> ends: <paramref name="stepMs"/> past the
+    /// minute of its oldest row, or <paramref name="dueBeforeMs"/> if that comes first.
+    /// </summary>
+    private static async Task<long> StepEndAsync(
+        SqliteConnection connection,
+        string table,
+        long dueBeforeMs,
+        long stepMs,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"SELECT MIN(timestamp_ms) FROM {table};";
+        return await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is long oldestMs
+            ? Math.Min(dueBeforeMs, (oldestMs / MinuteBucketMilliseconds * MinuteBucketMilliseconds) + stepMs)
+            : dueBeforeMs;
+    }
+
+    private enum Reclaim
+    {
+        None,
+        Incremental,
+        Convert,
+    }
+
+    /// <summary>
+    /// Whether to give the space of deleted history back to the disk: only when at least half
+    /// the file is free (retention was lowered, or the app was closed for longer than the
+    /// retention). The 15-minute maintenance returns at most 2 MB a time, so lowering retention
+    /// from a year to a day would take weeks to show. Smaller amounts, such as the raw samples a
+    /// launch after a night off rolls up, stay in the file for the next hours of samples to reuse.
+    /// </summary>
+    private static async Task<Reclaim> ChooseReclaimAsync(SqliteConnection connection, CancellationToken cancellationToken)
+    {
+        var freePages = await ScalarAsync(connection, "PRAGMA freelist_count;", cancellationToken).ConfigureAwait(false);
+        var pages = await ScalarAsync(connection, "PRAGMA page_count;", cancellationToken).ConfigureAwait(false);
+        if (freePages == 0 || freePages * 2 < pages)
+        {
+            return Reclaim.None;
+        }
+
+        if (await ScalarAsync(connection, "PRAGMA auto_vacuum;", cancellationToken).ConfigureAwait(false) == IncrementalAutoVacuum)
+        {
+            return Reclaim.Incremental;
+        }
+
+        // Created before auto_vacuum was set first, so it can't shrink in place. Convert it once
+        // with a VACUUM, when what is left is small enough to rewrite in a second or two.
+        var pageSize = await ScalarAsync(connection, "PRAGMA page_size;", cancellationToken).ConfigureAwait(false);
+        return (pages - freePages) * pageSize <= MaxConvertingVacuumBytes ? Reclaim.Convert : Reclaim.None;
+    }
+
+    private static async Task<long> ScalarAsync(SqliteConnection connection, string sql, CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false), System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    private static async Task ExecuteAsync(SqliteConnection connection, string sql, CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private async ValueTask DisposeCoreAsync()
@@ -656,7 +842,7 @@ public sealed class SqliteMetricStore : IMetricStore
             // file is self-contained and safe for the next launch
             try
             {
-                var checkpoint = _writeConnection.CreateCommand();
+                await using var checkpoint = _writeConnection.CreateCommand();
                 checkpoint.CommandText = "PRAGMA wal_checkpoint(TRUNCATE);";
                 await checkpoint.ExecuteNonQueryAsync().ConfigureAwait(false);
             }
@@ -668,6 +854,20 @@ public sealed class SqliteMetricStore : IMetricStore
             await _writeConnection.DisposeAsync().ConfigureAwait(false);
             _writeConnection = null;
         }
+
+        if (_connectionString is not null)
+        {
+            ReleasePooledConnections(_connectionString);
+        }
+    }
+
+    // Reads open pooled connections, and the pool keeps idle ones (and so the database file) open
+    // after they close. Release them when the store moves to another folder or is disposed, so
+    // the old file isn't held until the app exits.
+    private static void ReleasePooledConnections(string connectionString)
+    {
+        using var connection = new SqliteConnection(connectionString);
+        SqliteConnection.ClearPool(connection);
     }
 
     private sealed class PanelAccumulator
@@ -690,15 +890,16 @@ public sealed class SqliteMetricStore : IMetricStore
 
         public MetricUnit Unit { get; }
 
-        public void AddPoint(string seriesKey, string seriesName, MetricPoint point)
+        /// <summary>The series for this row, its name read from the row only the first time.</summary>
+        public SeriesAccumulator GetSeries(string seriesKey, SqliteDataReader row)
         {
             if (!_series.TryGetValue(seriesKey, out var series))
             {
-                series = new SeriesAccumulator(seriesKey, seriesName);
+                series = new SeriesAccumulator(seriesKey, row.GetString(3));
                 _series.Add(seriesKey, series);
             }
 
-            series.Points.Add(point);
+            return series;
         }
 
         public MetricSeriesHistory ToHistory() =>
@@ -708,12 +909,18 @@ public sealed class SqliteMetricStore : IMetricStore
                 Category,
                 Unit,
                 _series.Values
-                    .Select(series => new MetricSeriesHistoryItem(series.SeriesKey, series.SeriesName, series.Points.ToArray()))
+                    .OrderBy(series => series.SeriesKey, StringComparer.Ordinal)
+                    .Select(series => new MetricSeriesHistoryItem(series.SeriesKey, series.SeriesName, series.Finish()))
                     .ToArray());
     }
 
     private sealed class SeriesAccumulator
     {
+        private readonly List<MetricPoint> _points = [];
+        private long _bucketStartMs;
+        private double _bucketSum;
+        private int _bucketCount;
+
         public SeriesAccumulator(string seriesKey, string seriesName)
         {
             SeriesKey = seriesKey;
@@ -724,6 +931,46 @@ public sealed class SqliteMetricStore : IMetricStore
 
         public string SeriesName { get; }
 
-        public List<MetricPoint> Points { get; } = [];
+        /// <summary>
+        /// Adds a row, or folds it into the running average of its bucket when
+        /// <paramref name="bucketMs"/> is set. Integer division, as SQLite's, so buckets start
+        /// where the rollups' minutes and the old GROUP BY's buckets did.
+        /// </summary>
+        public void Add(long timestampMs, double value, long bucketMs)
+        {
+            if (bucketMs <= 0)
+            {
+                _points.Add(new MetricPoint(DateTimeOffset.FromUnixTimeMilliseconds(timestampMs), value));
+                return;
+            }
+
+            var bucketStartMs = timestampMs / bucketMs * bucketMs;
+            if (_bucketCount > 0 && bucketStartMs != _bucketStartMs)
+            {
+                FlushBucket();
+            }
+
+            _bucketStartMs = bucketStartMs;
+            _bucketSum += value;
+            _bucketCount++;
+        }
+
+        public MetricPoint[] Finish()
+        {
+            FlushBucket();
+            return [.. _points];
+        }
+
+        private void FlushBucket()
+        {
+            if (_bucketCount == 0)
+            {
+                return;
+            }
+
+            _points.Add(new MetricPoint(DateTimeOffset.FromUnixTimeMilliseconds(_bucketStartMs), _bucketSum / _bucketCount));
+            _bucketSum = 0;
+            _bucketCount = 0;
+        }
     }
 }

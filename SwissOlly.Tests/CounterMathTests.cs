@@ -44,6 +44,22 @@ public sealed class CounterMathTests
         Assert.Null(CounterMath.BusiestGpuEnginePercent(new Dictionary<string, double> { ["_Total"] = 3 }, new Dictionary<string, double>()));
     }
 
+    [Fact]
+    public void Gpu_Temperature_Is_The_Core_Sensor_Not_The_Hot_Spot()
+    {
+        // LibreHardwareMonitor's sensors on an RTX 4070 Super at idle; Task Manager showed 44.3 C.
+        var sensors = new[] { ("GPU Core", 44d), ("GPU Hot Spot", 54.7d), ("GPU Memory Junction", 48d) };
+
+        Assert.Equal(44, CounterMath.GpuTemperatureCelsius(sensors));
+    }
+
+    [Fact]
+    public void Gpu_Temperature_Falls_Back_To_The_Hottest_Sensor_Without_A_Core_Reading()
+    {
+        Assert.Equal(61, CounterMath.GpuTemperatureCelsius([("GPU Hot Spot", 61d), ("GPU Memory", 52d)]));
+        Assert.Null(CounterMath.GpuTemperatureCelsius([]));
+    }
+
     [Theory]
     [InlineData("pid_4321_luid_0x1_phys_0_eng_0_engtype_3D", "luid_0x1_phys_0_eng_0_engtype_3D")]
     [InlineData("luid_0x1_phys_0_eng_0_engtype_3D", "luid_0x1_phys_0_eng_0_engtype_3D")]

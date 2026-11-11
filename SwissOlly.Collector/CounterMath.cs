@@ -58,6 +58,30 @@ public static class CounterMath
     }
 
     /// <summary>
+    /// One GPU's temperature as Task Manager shows it: the core sensor. LibreHardwareMonitor also
+    /// reports the hot spot and the memory junction, which run hotter; taking the hottest sensor
+    /// read 10.4 °C above Task Manager (and nvidia-smi) on an RTX 4070 Super. A GPU without a
+    /// core sensor falls back to its hottest one.
+    /// </summary>
+    /// <returns>The temperature in °C, or null when the GPU reported none.</returns>
+    public static double? GpuTemperatureCelsius(IEnumerable<(string Sensor, double Celsius)> sensors)
+    {
+        double? core = null;
+        double? hottest = null;
+        foreach (var (sensor, celsius) in sensors)
+        {
+            if (sensor.Equals("GPU Core", StringComparison.OrdinalIgnoreCase))
+            {
+                core = Math.Max(core ?? celsius, celsius);
+            }
+
+            hottest = Math.Max(hottest ?? celsius, celsius);
+        }
+
+        return core ?? hottest;
+    }
+
+    /// <summary>
     /// Current clock as Task Manager's "Speed": the nominal frequency scaled by
     /// <c>% Processor Performance</c>. <c>Processor Frequency</c> alone reports the base clock and
     /// never shows boost.

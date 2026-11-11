@@ -67,6 +67,57 @@ public static class MetricHistory
         return (end - start) - compacted.Count;
     }
 
+    /// <summary>
+    /// Adds a live sample in time order: at the end, as samples normally arrive, or after every
+    /// point at or before its time when the system clock has been set back. Compact and the
+    /// chart's range searches assume time order; appending blindly after a clock change left an
+    /// earlier sample after later ones. The store keeps both stretches in the same order.
+    /// </summary>
+    public static void InsertInOrder(List<MetricPoint> points, MetricPoint point)
+    {
+        if (points.Count == 0 || points[^1].Timestamp <= point.Timestamp)
+        {
+            points.Add(point);
+            return;
+        }
+
+        var lo = 0;
+        var hi = points.Count;
+        while (lo < hi)
+        {
+            var mid = lo + ((hi - lo) >> 1);
+            if (points[mid].Timestamp <= point.Timestamp)
+            {
+                lo = mid + 1;
+            }
+            else
+            {
+                hi = mid;
+            }
+        }
+
+        points.Insert(lo, point);
+    }
+
+    /// <summary>
+    /// <see cref="InsertInOrder"/>, unless the list already holds a point at that timestamp: for
+    /// sources that can report the same sample twice. Returns whether the point went in.
+    /// </summary>
+    public static bool InsertInOrderIfNew(List<MetricPoint> points, MetricPoint point)
+    {
+        // Newest first: in the usual case the first point looked at decides it.
+        for (var index = points.Count - 1; index >= 0 && points[index].Timestamp >= point.Timestamp; index--)
+        {
+            if (points[index].Timestamp == point.Timestamp)
+            {
+                return false;
+            }
+        }
+
+        InsertInOrder(points, point);
+        return true;
+    }
+
     private static int LowerBound(List<MetricPoint> points, DateTimeOffset timestamp)
     {
         var lo = 0;

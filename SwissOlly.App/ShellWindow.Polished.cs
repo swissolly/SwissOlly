@@ -58,8 +58,6 @@ public sealed partial class ShellWindow : Window
     private readonly ScrollViewer _scrollHost;
     private Border? _loadingOverlay;
     private readonly Border _controlsBodyHost;
-    private Border? _controlsSurfaceRef;
-    private Border? _summarySurfaceRef;
     private readonly Grid _brandHost;
     private readonly Grid _summaryHost;
     private readonly Grid _dashboardGrid;
@@ -286,75 +284,49 @@ public sealed partial class ShellWindow : Window
 
     public void ApplyInitialTheme(ThemeMode mode)
     {
-        var requestedTheme = IsLightTheme(mode) ? ElementTheme.Light : ElementTheme.Dark;
-        if (_rootLayout.RequestedTheme != requestedTheme)
-        {
-            _rootLayout.RequestedTheme = requestedTheme;
-        }
-
+        ApplyRequestedTheme(mode);
         RefreshWindowChrome();
     }
 
     public void ApplyTheme(ThemeMode mode)
     {
-        ApplyInitialTheme(mode);
+        ApplyRequestedTheme(mode);
         _draftThemeMode = mode;
         RefreshThemeVisuals();
+        // The caption buttons follow on a later turn, keeping their cost out of the click: setting
+        // the title bar colours took 12-20 ms per theme change in a Release build. They are drawn
+        // outside XAML, so they never changed in step with the page anyway.
+        _ = _uiQueue.TryEnqueue(DispatcherQueuePriority.Low, RefreshWindowChrome);
     }
 
-    public void PreviewTheme(ThemeMode mode)
+    public void PreviewTheme(ThemeMode mode) => ApplyTheme(mode);
+
+    private void ApplyRequestedTheme(ThemeMode mode)
     {
-        ApplyInitialTheme(mode);
-        _draftThemeMode = mode;
-        RefreshThemeVisuals();
+        var requestedTheme = IsLightTheme(mode) ? ElementTheme.Light : ElementTheme.Dark;
+        if (_rootLayout.RequestedTheme != requestedTheme)
+        {
+            _rootLayout.RequestedTheme = requestedTheme;
+        }
     }
 
+    /// <summary>
+    /// The rest of a theme change. App.ApplyThemeResources has already recoloured the palette
+    /// brushes in place, and both pages draw only with those or with shared brushes worked out
+    /// from them, so this recolours the worked-out ones and stops: no page is rebuilt and no card,
+    /// chart or chip is visited, and the hidden page is as current as the visible one. Walking
+    /// every card and rebuilding Settings was most of what a theme click cost.
+    /// </summary>
     private void RefreshThemeVisuals()
     {
-        ThemeVisuals.InvalidateGradientCache();
-
-        // All brush updates run synchronously so the user never sees a half-themed state.
-        // Chart redraws are already deferred inside each card's RefreshThemeResources.
+        // Series first: icon shades are worked out from the accents it recolours.
         _viewModel.RefreshSeriesColors();
-        RefreshWindowChrome();
-        RefreshShellSurfaceThemeResources();
-        RefreshSummaryCardThemeResources();
-        RefreshGlobalRangeControls();
-        UpdateStatusText();
-
-        foreach (var chip in new[]
-        {
-            _globalRangeButton, _globalOneMinuteButton, _globalFiveMinuteButton,
-            _globalFifteenMinuteButton, _globalThirtyMinuteButton, _globalOneHourButton,
-            _globalTwelveHourButton, _globalTwentyFourHourButton, _globalTwoDayButton,
-            _globalFiveDayButton, _globalSevenDayButton, _globalThirtyDayButton,
-            _globalNinetyDayButton, _globalOneYearButton, _globalResetZoomButton,
-            _overviewNavigationButton, _settingsNavigationButton,
-        })
-        {
-            chip.RefreshThemeResources();
-        }
-
-        _settingsApplyChip?.RefreshThemeResources();
-        _settingsRevertChip?.RefreshThemeResources();
-
-        // Panel cards — update brushes only, chart redraws are deferred inside each card
-        foreach (var card in _panelCards.Values)
-        {
-            card.RefreshThemeResources();
-        }
-
-        // Rebuild control deck on next frame — it's less critical than panel visuals
-        // and rebuilding synchronously during theme switches causes visible jank.
-        _ = _uiQueue.TryEnqueue(DispatcherQueuePriority.Normal, () =>
-        {
-            if (_settingsViewBuilt)
-            {
-                RenderEditableControlDeck();
-            }
-
-        });
+        ThemeVisuals.RecolorDerivedBrushes();
     }
+
+    // As tall as the label and number beside it, with a stroke that still reads at a glance.
+    private const double SummaryRingDiameter = 44;
+    private const double SummaryRingThickness = 5;
 
     private void BuildSummaryCards()
     {
@@ -398,33 +370,15 @@ public sealed partial class ShellWindow : Window
             var captionText = CreateSecondaryText(string.Empty, 12);
             captionText.SetBinding(TextBlock.TextProperty, new Binding { Path = new PropertyPath(nameof(SummaryCardViewModel.Caption)) });
 
-            // Mini utilization bar — thin horizontal bar below the value
-            var gaugeTrack = new Border
-            {
-                Height = 3,
-                CornerRadius = new CornerRadius(2),
-                Background = ResolveBrush("SurfaceStrokeBrush", "#27425E"),
-                Opacity = 0.38,
-                Margin = new Thickness(0, 7, 0, 6),
-            };
-            // The fill spans the track and is scaled, not resized: setting Width every sample was a
-            // layout pass per meter per scrape, and the bar jumped. A scale is composition-only and
-            // animates, so the meter glides from one reading to the next.
-            var gaugeScale = new ScaleTransform { ScaleX = Math.Clamp(card.Utilization / 100d, 0d, 1d), ScaleY = 1d };
-            var gaugeFill = new Border
-            {
-                Height = 3,
-                CornerRadius = new CornerRadius(2),
-                HorizontalAlignment = HorizontalAlignment.Stretch,
-                Background = card.AccentBrush,
-                Margin = new Thickness(0, 7, 0, 6),
-                RenderTransform = gaugeScale,
-                RenderTransformOrigin = new Windows.Foundation.Point(0, 0.5),
-            };
-            var gaugeHost = new Grid
-            {
-                Children = { gaugeTrack, gaugeFill },
-            };
+            // A ring gauge beside the number, where a thin line used to run under it.
+            // The ring only moves the end of an arc, so a new reading costs no layout pass.
+            var meter = new RingMeter(
+                SummaryRingDiameter,
+                SummaryRingThickness,
+                ResolveBrush("SurfaceStrokeBrush", "#27425E"),
+                ResolveSummaryUtilizationBrush(card.Utilization, card.AccentBrush),
+                card.Utilization);
+            meter.Element.VerticalAlignment = VerticalAlignment.Center;
 
             card.PropertyChanged += (_, args) =>
             {
@@ -435,8 +389,8 @@ public sealed partial class ShellWindow : Window
                 }
 
                 var util = card.Utilization;
-                AnimateMeter(gaugeScale, Math.Clamp(util / 100d, 0d, 1d));
-                gaugeFill.Background = ResolveSummaryUtilizationBrush(util, card.AccentBrush);
+                meter.ValueBrush = ResolveSummaryUtilizationBrush(util, card.AccentBrush);
+                meter.AnimateTo(util);
             };
 
             var titleRow = new StackPanel
@@ -451,7 +405,7 @@ public sealed partial class ShellWindow : Window
                 },
             };
 
-            var details = new StackPanel
+            var heading = new StackPanel
             {
                 Spacing = 2,
                 VerticalAlignment = VerticalAlignment.Center,
@@ -459,7 +413,24 @@ public sealed partial class ShellWindow : Window
                 {
                     titleRow,
                     valueText,
-                    gaugeHost,
+                },
+            };
+            var reading = new Grid { ColumnSpacing = 12 };
+            reading.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            reading.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            reading.Children.Add(meter.Element);
+            reading.Children.Add(heading);
+            Grid.SetColumn(heading, 1);
+
+            // The caption keeps the cell's full width under the ring and number: beside the ring
+            // it would wrap in a four-column strip on a narrow window.
+            var details = new StackPanel
+            {
+                Spacing = 6,
+                VerticalAlignment = VerticalAlignment.Center,
+                Children =
+                {
+                    reading,
                     captionText,
                 },
             };
@@ -477,7 +448,7 @@ public sealed partial class ShellWindow : Window
                 Child = details,
             };
             _summaryHost.Children.Add(summaryCard);
-            _summaryCardVisuals.Add(new SummaryCardVisual(summaryCard, titleText, valueText, captionText, badgeHost, gaugeTrack, gaugeFill, card));
+            _summaryCardVisuals.Add(new SummaryCardVisual(summaryCard, titleText, valueText, captionText, badgeHost, meter, card));
             var index = _summaryHost.Children.Count - 1;
             while (_summaryHost.RowDefinitions.Count <= index / summaryColumns)
             {
@@ -529,28 +500,6 @@ public sealed partial class ShellWindow : Window
         }
     }
 
-    private void RefreshSummaryCardThemeResources()
-    {
-        if (!_summaryCardsBound)
-        {
-            return;
-        }
-
-        for (var i = 0; i < _summaryCardVisuals.Count; i++)
-        {
-            var visual = _summaryCardVisuals[i];
-            visual.Surface.Background = BrushFactory.CreateBrush("#00FFFFFF");
-            visual.Surface.BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E");
-            visual.TitleText.Foreground = ResolveBrush("TextMutedBrush", "#7D9AB6");
-            visual.ValueText.Foreground = ResolveBrush("TextPrimaryBrush", "#F2F8FF");
-            visual.CaptionText.Foreground = ResolveBrush("TextSecondaryBrush", "#B7CCE1");
-            visual.GaugeTrack.Background = ResolveBrush("SurfaceStrokeBrush", "#27425E");
-            visual.GaugeFill.Background = ResolveSummaryUtilizationBrush(visual.ViewModel.Utilization, visual.ViewModel.AccentBrush);
-            visual.BadgeHost.Background = visual.ViewModel.AccentBrush;
-            visual.BadgeHost.BorderBrush = visual.ViewModel.AccentBrush;
-        }
-    }
-
     private Brush ResolveSummaryUtilizationBrush(double utilization, Brush accentBrush)
     {
         if (utilization > 90)
@@ -564,10 +513,6 @@ public sealed partial class ShellWindow : Window
         }
 
         return accentBrush;
-    }
-
-    private void RefreshPanelToggles()
-    {
     }
 
     private void RefreshDashboardPanels()
@@ -591,6 +536,7 @@ public sealed partial class ShellWindow : Window
             _reflowSprings.Remove(staleKey);
         }
 
+        List<TelemetryPanelCard>? arrivals = null;
         foreach (var panel in panels)
         {
             if (!_panelCards.TryGetValue(panel.PanelKey, out var card))
@@ -604,6 +550,7 @@ public sealed partial class ShellWindow : Window
                 card.LayoutNudgeRequested += OnCardLayoutNudgeRequested;
                 card.SetLayoutEditMode(_isLayoutEditMode);
                 _panelCards.Add(panel.PanelKey, card);
+                (arrivals ??= []).Add(card);
             }
             else
             {
@@ -653,6 +600,13 @@ public sealed partial class ShellWindow : Window
         if (_dropPlaceholder is not null)
         {
             EnsureDropPlaceholder();
+        }
+
+        // Panels reaching the board in the first moments (from history, or the first sample)
+        // join the launch entrance as their own small wave; later arrivals just appear.
+        if (arrivals is not null && IsLaunchEntranceOpen)
+        {
+            PlayCardEntrances(arrivals, 0);
         }
     }
 
@@ -715,8 +669,6 @@ public sealed partial class ShellWindow : Window
             UpdateHeaderStatusWidth();
             ApplyMinimumWindowSize();
 
-            _ = _uiQueue.TryEnqueue(DispatcherQueuePriority.Low, PlayLaunchEntrance);
-
             var config = _viewModel.BuildConfig();
             StartupTrace.Write("OnRootLoaded resumed after first paint // polished-v19");
 
@@ -737,6 +689,11 @@ public sealed partial class ShellWindow : Window
             {
                 TryApplyWindowIcon();
             });
+
+            // In this turn, before the board's first frame, so nothing is drawn whole and then
+            // hidden for its entrance (a Low-priority turn, as it was, can come after a frame).
+            // Last in the handler, so the work above is done before the animations start.
+            PlayLaunchEntrance();
             StartupTrace.Write("OnRootLoaded scheduled background startup // polished-v19");
         }
         catch (Exception ex)
@@ -748,6 +705,29 @@ public sealed partial class ShellWindow : Window
         }
     }
 
+    /// <summary>How long after the first frame a panel reaching the board still joins the entrance.</summary>
+    private const int LaunchEntranceOpenMs = 1500;
+    private const int LaunchSectionStaggerMs = 20;
+    private const int LaunchCardStaggerMs = 14;
+    private const int LaunchCardStaggerSteps = 5;
+
+    /// <summary>When the launch entrance stops taking arrivals (Environment.TickCount64); 0 when it's over.</summary>
+    private long _launchEntranceOpenUntil;
+
+    private bool IsLaunchEntranceOpen => _launchEntranceOpenUntil != 0 && Environment.TickCount64 < _launchEntranceOpenUntil;
+
+    /// <summary>
+    /// The launch entrance, once per launch: the header, the summary strip and the panels fade
+    /// and rise a few pixels into place with a slight stagger, and charts draw their history in
+    /// from the left. It runs on the compositor (Motion.PlayEntrance and PlayRevealFromLeft) and
+    /// nothing waits for it, so it holds up neither the window nor the first sample.
+    ///
+    /// The board fills in waves: a baseline panel now, most of the rest when history loads (about
+    /// half a second later), a few more with the first live sample. So for a short while, panels
+    /// that arrive join in (RefreshDashboardPanels); after that they just appear. Skipped with
+    /// Windows' animation effects off, and for a --tray launch, whose window is hidden: nobody
+    /// would see it, and coming back from the tray never replays it.
+    /// </summary>
     private void PlayLaunchEntrance()
     {
         if (_launchIntroPlayed)
@@ -756,38 +736,43 @@ public sealed partial class ShellWindow : Window
         }
 
         _launchIntroPlayed = true;
-        if (!Motion.AnimationsEnabled)
+        if (!Motion.AnimationsEnabled || (Program.StartedInTray && _viewModel.MinimizeToTray))
         {
             return;
         }
 
+        _launchEntranceOpenUntil = Environment.TickCount64 + LaunchEntranceOpenMs;
         if (_appHeader is not null)
         {
             Motion.PlayEntrance(_appHeader);
         }
 
-        // Stagger is tight on purpose. The previous schedule ran the last panel out to ~292ms
-        // before it even began a 260ms animation, so launch took over half a second to settle.
-        // Capping the cascade at 10 panels keeps a 14-panel dashboard from trailing off.
-        var sectionDelay = 25;
+        // The summary strip and the board's title band, a beat apart, then the panels.
+        var delay = 0;
         foreach (var child in _overviewView.Children)
         {
             if (!ReferenceEquals(child, _dashboardGrid))
             {
-                Motion.PlayEntrance(child, TimeSpan.FromMilliseconds(sectionDelay));
-                sectionDelay += 35;
+                delay += LaunchSectionStaggerMs;
+                Motion.PlayEntrance(child, TimeSpan.FromMilliseconds(delay));
             }
         }
 
-        var panelIndex = 0;
-        foreach (var panel in _viewModel.DashboardPanels)
+        PlayCardEntrances(_panelCards.Values, delay + LaunchSectionStaggerMs);
+    }
+
+    /// <summary>
+    /// Cards rise in reading order, top row first, each arming its chart to draw in. The stagger
+    /// is capped so a whole board still settles in about 300 ms instead of trailing down the page.
+    /// </summary>
+    private void PlayCardEntrances(IEnumerable<TelemetryPanelCard> cards, int firstDelayMs)
+    {
+        var rank = 0;
+        foreach (var card in cards.OrderBy(Grid.GetRow).ThenBy(Grid.GetColumn))
         {
-            if (_panelCards.TryGetValue(panel.PanelKey, out var card))
-            {
-                var delay = 70 + Math.Min(panelIndex, 10) * 16;
-                Motion.PlayEntrance(card, TimeSpan.FromMilliseconds(delay));
-                panelIndex++;
-            }
+            var delay = TimeSpan.FromMilliseconds(firstDelayMs + (Math.Min(rank++, LaunchCardStaggerSteps) * LaunchCardStaggerMs));
+            Motion.PlayEntrance(card, delay);
+            card.ArmLaunchDrawIn(delay, _launchEntranceOpenUntil);
         }
     }
 
@@ -981,6 +966,8 @@ public sealed partial class ShellWindow : Window
             return;
         }
 
+        // Every colour again on activation, as before; only a theme change skips unchanged ones.
+        _appliedTitleBarColors = null;
         RefreshWindowChrome();
 
         if (_windowIconApplied)
@@ -1529,27 +1516,6 @@ public sealed partial class ShellWindow : Window
         }
     }
 
-    private static void AnimateMeter(ScaleTransform scale, double fraction)
-    {
-        if (!Motion.AnimationsEnabled)
-        {
-            scale.ScaleX = fraction;
-            return;
-        }
-
-        var animation = new DoubleAnimation
-        {
-            To = fraction,
-            Duration = new Duration(TimeSpan.FromMilliseconds(MotionTokens.Emphasized)),
-            EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
-        };
-        Storyboard.SetTarget(animation, scale);
-        Storyboard.SetTargetProperty(animation, "ScaleX");
-        var storyboard = new Storyboard();
-        storyboard.Children.Add(animation);
-        storyboard.Begin();
-    }
-
     private void DismissLoadingOverlay()
     {
         if (_loadingOverlay is null)
@@ -1565,10 +1531,19 @@ public sealed partial class ShellWindow : Window
         // sat over the window swallowing every click - the app looked ready but was dead.
         overlay.IsHitTestVisible = false;
 
+        if (!Motion.AnimationsEnabled)
+        {
+            RemoveLoadingOverlay(overlay);
+            return;
+        }
+
+        // Quick: the launch entrance plays underneath (PlayLaunchEntrance), and the 300 ms fade
+        // this used to be covered most of it. The overlay is the backdrop colour, so to the eye
+        // only the "Starting SwissOlly" text and dots fade.
         var fadeOut = new DoubleAnimation
         {
             To = 0,
-            Duration = new Duration(TimeSpan.FromMilliseconds(300)),
+            Duration = new Duration(TimeSpan.FromMilliseconds(MotionTokens.Quick)),
             EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
         };
 
@@ -1576,14 +1551,27 @@ public sealed partial class ShellWindow : Window
         storyboard.Children.Add(fadeOut);
         Storyboard.SetTarget(fadeOut, overlay);
         Storyboard.SetTargetProperty(fadeOut, "Opacity");
-        storyboard.Completed += (_, _) =>
-        {
-            if (overlay.Parent is Grid parentGrid)
-            {
-                parentGrid.Children.Remove(overlay);
-            }
-        };
+        storyboard.Completed += (_, _) => RemoveLoadingOverlay(overlay);
         storyboard.Begin();
+    }
+
+    /// <summary>
+    /// Takes the loading overlay off the window. Collapsed first, so it is gone even if it can't
+    /// be taken out of its panel: it sits over the header row, and with Windows' animation
+    /// effects off it used to stay there for good, hiding the logo and the Overview/Settings
+    /// switch (seen in startup frames, 2026-11-09).
+    /// </summary>
+    private void RemoveLoadingOverlay(Border overlay)
+    {
+        overlay.Visibility = Visibility.Collapsed;
+        if (overlay.Parent is Panel parent)
+        {
+            parent.Children.Remove(overlay);
+        }
+        else
+        {
+            _rootLayout?.Children.Remove(overlay);
+        }
     }
 
     /// <summary>
@@ -1741,6 +1729,22 @@ public sealed partial class ShellWindow : Window
         if (_settingsViewActive == settings)
         {
             return;
+        }
+
+        // A click on Settings closes the board's open lists by itself (they are light-dismiss), but
+        // Ctrl+2 and a screen reader's Invoke don't click: the process list stayed open over
+        // Settings, still updating.
+        if (settings)
+        {
+            if (_globalRangeEditorVisible)
+            {
+                HideGlobalRangeEditor();
+            }
+
+            foreach (var card in _panelCards.Values)
+            {
+                card.CloseProcessList();
+            }
         }
 
         // Each view keeps its own scroll position: coming back to the board should land where
@@ -2278,11 +2282,6 @@ public sealed partial class ShellWindow : Window
             ? seconds
             : SwissOllyConfig.DefaultScrapeIntervalSeconds;
 
-    private int GetDraftRetentionHours() =>
-        MainViewModel.TryParseRetentionInput(_draftRetentionInput, out var hours, out _)
-            ? hours
-            : SwissOllyConfig.DefaultMaxRetentionHours;
-
     private void SetScrapeInterval(int seconds)
     {
         _draftScrapeIntervalInput = seconds == SwissOllyConfig.DefaultScrapeIntervalSeconds
@@ -2524,40 +2523,6 @@ public sealed partial class ShellWindow : Window
         catch (Exception ex)
         {
             StartupTrace.WriteException("TryLoadBrandImage", ex);
-        }
-    }
-
-    private void RenderSummaryPlaceholders()
-    {
-        _summaryCardsBound = false;
-        _summaryHost.Children.Clear();
-        _summaryHost.RowDefinitions.Clear();
-        _summaryHost.ColumnDefinitions.Clear();
-        var summaryColumns = DetermineSummaryColumns();
-        _lastSummaryColumnCount = summaryColumns;
-        for (var column = 0; column < summaryColumns; column++)
-        {
-            _summaryHost.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        }
-
-        var placeholders = new[]
-        {
-            CreatePlaceholderCard("CPU", "Waiting for first sample"),
-            CreatePlaceholderCard("Memory", "Loading local history"),
-            CreatePlaceholderCard("Disk", "Preparing local boards"),
-            CreatePlaceholderCard("Network", "Warming link metrics"),
-        };
-
-        for (var index = 0; index < placeholders.Length; index++)
-        {
-            while (_summaryHost.RowDefinitions.Count <= index / summaryColumns)
-            {
-                _summaryHost.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            }
-
-            _summaryHost.Children.Add(placeholders[index]);
-            Grid.SetColumn(placeholders[index], index % summaryColumns);
-            Grid.SetRow(placeholders[index], index / summaryColumns);
         }
     }
 
@@ -2809,59 +2774,55 @@ public sealed partial class ShellWindow : Window
         _globalResetZoomButton.Opacity = 1d;
     }
 
+    private (Color Foreground, Color Inactive, Color Hover, Color Pressed)? _appliedTitleBarColors;
+
+    /// <summary>
+    /// The caption buttons in the palette's colours. A title bar is a window, not XAML, so these
+    /// are copies and are set again on each theme change; colours already applied are skipped.
+    /// </summary>
     private void RefreshWindowChrome()
     {
         try
         {
-            if (_shellBorderRef is not null)
-            {
-                _shellBorderRef.Background = BrushFactory.CreateBrush("#00FFFFFF");
-                _shellBorderRef.BorderBrush = BrushFactory.CreateBrush("#00FFFFFF");
-            }
-
             var titleBar = AppWindow.TitleBar;
             if (titleBar is null)
             {
                 return;
             }
 
-            var transparent = Color.FromArgb(0, 0, 0, 0);
-            var foreground = App.CurrentApp.ResolveThemeColor("TextSecondaryBrush", _rootLayout.RequestedTheme == ElementTheme.Light ? "#4A6078" : "#C6D7EA");
-            var hoverBackground = App.CurrentApp.ResolveThemeColor("SurfaceElevatedBrush", _rootLayout.RequestedTheme == ElementTheme.Light ? "#F4F8FC" : "#112033");
-            var pressedBackground = App.CurrentApp.ResolveThemeColor("SurfaceStrongBrush", _rootLayout.RequestedTheme == ElementTheme.Light ? "#EDF4FB" : "#18314A");
-            var inactiveForeground = App.CurrentApp.ResolveThemeColor("TextMutedBrush", _rootLayout.RequestedTheme == ElementTheme.Light ? "#6F8399" : "#8098B2");
+            var isLight = _rootLayout.RequestedTheme == ElementTheme.Light;
+            var colors = (
+                Foreground: App.CurrentApp.ResolveThemeColor("TextSecondaryBrush", isLight ? "#4A6078" : "#C6D7EA"),
+                Inactive: App.CurrentApp.ResolveThemeColor("TextMutedBrush", isLight ? "#6F8399" : "#8098B2"),
+                Hover: App.CurrentApp.ResolveThemeColor("SurfaceElevatedBrush", isLight ? "#F4F8FC" : "#112033"),
+                Pressed: App.CurrentApp.ResolveThemeColor("SurfaceStrongBrush", isLight ? "#EDF4FB" : "#18314A"));
+            if (_appliedTitleBarColors == colors)
+            {
+                return;
+            }
 
-            titleBar.BackgroundColor = transparent;
-            titleBar.ForegroundColor = foreground;
-            titleBar.InactiveBackgroundColor = transparent;
-            titleBar.InactiveForegroundColor = inactiveForeground;
-            titleBar.ButtonBackgroundColor = transparent;
-            titleBar.ButtonForegroundColor = foreground;
-            titleBar.ButtonInactiveBackgroundColor = transparent;
-            titleBar.ButtonInactiveForegroundColor = inactiveForeground;
-            titleBar.ButtonHoverBackgroundColor = hoverBackground;
-            titleBar.ButtonHoverForegroundColor = foreground;
-            titleBar.ButtonPressedBackgroundColor = pressedBackground;
-            titleBar.ButtonPressedForegroundColor = foreground;
+            if (_appliedTitleBarColors is null)
+            {
+                var transparent = Color.FromArgb(0, 0, 0, 0);
+                titleBar.BackgroundColor = transparent;
+                titleBar.InactiveBackgroundColor = transparent;
+                titleBar.ButtonBackgroundColor = transparent;
+                titleBar.ButtonInactiveBackgroundColor = transparent;
+            }
+
+            titleBar.ForegroundColor = colors.Foreground;
+            titleBar.InactiveForegroundColor = colors.Inactive;
+            titleBar.ButtonForegroundColor = colors.Foreground;
+            titleBar.ButtonInactiveForegroundColor = colors.Inactive;
+            titleBar.ButtonHoverBackgroundColor = colors.Hover;
+            titleBar.ButtonHoverForegroundColor = colors.Foreground;
+            titleBar.ButtonPressedBackgroundColor = colors.Pressed;
+            titleBar.ButtonPressedForegroundColor = colors.Foreground;
+            _appliedTitleBarColors = colors;
         }
         catch (Exception ex)
         {
             StartupTrace.WriteException("RefreshWindowChrome", ex);
-        }
-    }
-
-    private void RefreshShellSurfaceThemeResources()
-    {
-        if (_summarySurfaceRef is not null)
-        {
-            _summarySurfaceRef.Background = ResolveBrush("SurfaceBrush", "#1C1F22");
-            _summarySurfaceRef.BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#2C3035");
-        }
-
-        if (_controlsSurfaceRef is not null)
-        {
-            _controlsSurfaceRef.Background = BrushFactory.CreateBrush("#00FFFFFF");
-            _controlsSurfaceRef.BorderBrush = BrushFactory.CreateBrush("#00FFFFFF");
         }
     }
 
@@ -3136,8 +3097,7 @@ internal sealed record SummaryCardVisual(
     TextBlock ValueText,
     TextBlock CaptionText,
     Border BadgeHost,
-    Border GaugeTrack,
-    Border GaugeFill,
+    RingMeter Meter,
     SummaryCardViewModel ViewModel);
 
 internal static class HotkeyInterop

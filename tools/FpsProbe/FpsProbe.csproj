@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Shows which processes present frames, and through which Windows events, to find out why
+       the overlay reads no FPS in a game. Compiles the overlay's own ETW code.
+       Not part of SwissOlly.sln: run it by hand (see README.md). -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\..\SwissOlly.Overlay\Fps\EtwInterop.cs" Link="EtwInterop.cs" />
+    <Compile Include="..\..\SwissOlly.Overlay\Fps\EtwPresentFpsSource.cs" Link="EtwPresentFpsSource.cs" />
+    <Compile Include="..\..\SwissOlly.Overlay\Fps\IFpsSource.cs" Link="IFpsSource.cs" />
+    <Compile Include="..\..\SwissOlly.Overlay\Rendering\OverlayLog.cs" Link="OverlayLog.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\SwissOlly.Core\SwissOlly.Core.csproj" />
+  </ItemGroup>
+
+</Project>

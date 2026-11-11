@@ -80,9 +80,6 @@ internal static class Win32Interop
         IntPtr hWndParent, IntPtr hMenu, IntPtr hInstance, IntPtr lpParam);
 
     [DllImport("user32.dll", SetLastError = true)]
-    internal static extern bool DestroyWindow(IntPtr hWnd);
-
-    [DllImport("user32.dll", SetLastError = true)]
     internal static extern bool UpdateLayeredWindow(
         IntPtr hwnd, IntPtr hdcDst, ref POINT pptDst, ref SIZE psize,
         IntPtr hdcSrc, ref POINT pptSrc, uint crKey, ref BLENDFUNCTION pblend, uint dwFlags);
@@ -96,9 +93,6 @@ internal static class Win32Interop
 
     [DllImport("user32.dll")]
     internal static extern IntPtr MonitorFromWindow(IntPtr hWnd, uint dwFlags);
-
-    [DllImport("user32.dll")]
-    internal static extern IntPtr MonitorFromRect(ref RECT lprc, uint dwFlags);
 
     [DllImport("user32.dll")]
     internal static extern IntPtr MonitorFromPoint(POINT pt, uint dwFlags);
@@ -134,34 +128,10 @@ internal static class Win32Interop
     internal static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
 
     [DllImport("user32.dll")]
-    internal static extern bool PostThreadMessage(uint idThread, uint msg, IntPtr wParam, IntPtr lParam);
-
-    [DllImport("user32.dll")]
     internal static extern IntPtr GetForegroundWindow();
 
     [DllImport("user32.dll")]
     internal static extern bool GetWindowRect(IntPtr hWnd, ref RECT lpRect);
-
-    [DllImport("user32.dll")]
-    internal static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
-    internal const uint GW_HWNDPREV = 3;  // window above us in z-order
-
-    [DllImport("user32.dll")]
-    internal static extern bool IsWindowVisible(IntPtr hWnd);
-
-    [DllImport("user32.dll", CharSet = CharSet.Auto)]
-    internal static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder lpClassName, int nMaxCount);
-
-    [DllImport("user32.dll", CharSet = CharSet.Auto)]
-    internal static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount);
-
-    [DllImport("user32.dll")]
-    internal static extern int GetWindowLong(IntPtr hWnd, int nIndex);
-    internal const int GWL_EXSTYLE = -20;
-
-    [DllImport("dwmapi.dll")]
-    internal static extern int DwmGetWindowAttribute(IntPtr hwnd, uint dwAttribute, out uint pvAttribute, uint cbAttribute);
-    internal const uint DWMWA_CLOAKED = 14;
 
     [DllImport("kernel32.dll")]
     internal static extern IntPtr GetModuleHandle(string? lpModuleName);

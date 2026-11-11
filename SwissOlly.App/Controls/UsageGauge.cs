@@ -42,7 +42,6 @@ public sealed class UsageGauge : UserControl
     private string? _lastRenderedCaption;
     private double _lastRenderedWidth = -1;
     private double _lastRenderedHeight = -1;
-    private bool _themeDirty;
 
     // Retained arc visuals. The value arc is re-shaped up to 60x/second while animating, so it
     // mutates its existing ArcSegment rather than allocating a new Path/PathGeometry/PathFigure/
@@ -68,7 +67,7 @@ public sealed class UsageGauge : UserControl
             CornerRadius = new CornerRadius(8),
             BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E"),
             BorderThickness = new Thickness(UiMetrics.Hairline),
-            Background = CreateThemedGradient(),
+            Background = ThemeVisuals.GaugeFaceBrush,
         };
         _innerBorder = new Border
         {
@@ -159,31 +158,6 @@ public sealed class UsageGauge : UserControl
         gauge.ScheduleRedraw();
     }
 
-    public void RefreshThemeResources()
-    {
-        _frameBorder.BorderBrush = ResolveBrush("SurfaceStrokeBrush", "#27425E");
-        _frameBorder.Background = CreateThemedGradient();
-        _innerBorder.BorderBrush = ResolveBrush("SurfaceGridBrush", "#35587A");
-        _valueText.Foreground = ResolveBrush("TextPrimaryBrush", "#F2F8FF");
-        _captionText.Foreground = ResolveBrush("TextMutedBrush", "#7D9AB6");
-        _themeDirty = true; // theme-resource lookups (e.g. SurfaceStrokeBrush) live inside Redraw()
-        Redraw();
-    }
-
-    private static LinearGradientBrush CreateThemedGradient()
-    {
-        return new LinearGradientBrush
-        {
-            StartPoint = new Windows.Foundation.Point(0, 0),
-            EndPoint = new Windows.Foundation.Point(1, 1),
-            GradientStops = new GradientStopCollection
-            {
-                new GradientStop { Color = ThemeVisuals.ResolveColor("SurfaceElevatedBrush", "#222529"), Offset = 0d },
-                new GradientStop { Color = ThemeVisuals.ResolveColor("SurfaceBrush", "#1C1F22"), Offset = 1d },
-            },
-        };
-    }
-
     private bool _renderingSuspended;
 
     private void OnGaugeSizeChanged(object sender, SizeChangedEventArgs e)
@@ -254,11 +228,10 @@ public sealed class UsageGauge : UserControl
         var accentBrush = AccentBrush;
         var caption = Caption;
 
-        var geometryDirty = _themeDirty
-            || _trackPath is null
+        var geometryDirty = _trackPath is null
             || Math.Abs(width - _lastRenderedWidth) >= 0.5
             || Math.Abs(height - _lastRenderedHeight) >= 0.5;
-        var brushDirty = _themeDirty || !ReferenceEquals(accentBrush, _lastRenderedAccentBrush);
+        var brushDirty = !ReferenceEquals(accentBrush, _lastRenderedAccentBrush);
         var captionDirty = !string.Equals(caption, _lastRenderedCaption, StringComparison.Ordinal);
 
         if (!geometryDirty
@@ -290,10 +263,9 @@ public sealed class UsageGauge : UserControl
         _lastRenderedCaption = caption;
         _lastRenderedWidth = width;
         _lastRenderedHeight = height;
-        _themeDirty = false;
     }
 
-    // Creates the two arcs once per size/theme change. The track arc is fully static afterwards;
+    // Creates the two arcs once per size change. The track arc is fully static afterwards;
     // the value arc keeps references to the figure and segment so ApplyValueVisual can re-shape
     // it without touching the visual tree.
     private void BuildArcs(double width, double height)
