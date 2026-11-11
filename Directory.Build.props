@@ -1,0 +1,8 @@
+<Project>
+  <PropertyGroup>
+    <!-- The one version number. release.yml refuses to publish a tag that doesn't match it. -->
+    <Version>1.2.0</Version>
+    <Company>SwissOlly</Company>
+    <Copyright>© 2026 SwissOlly. Licensed under the GNU AGPL-3.0.</Copyright>
+  </PropertyGroup>
+</Project>

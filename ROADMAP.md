@@ -1,62 +1,51 @@
-# Vaktr Roadmap
+# SwissOlly roadmap
 
-## Current Version: v1
+SwissOlly is a hobby project, so this is a direction, not a schedule. Nothing here has a date,
+and plans change.
 
-## Planned
+## Where it's going
 
-### CPU Temperature Monitoring
-CPU temperature sensors on AMD and Intel require kernel-level access (PCI config space / MSR registers) that Windows restricts to signed kernel drivers. Every monitoring app that shows CPU temps (HWiNFO, Core Temp, MSI Afterburner) ships a signed driver for this.
+- **More of the hardware.** CPU temperature is the main gap: the panel exists, but reading the
+  sensor needs a kernel driver that SwissOlly doesn't ship yet.
+- **Telling you when something is wrong.** Notifications when a reading crosses a limit you set.
+- **Getting your data out.** Export of history, and an optional way for other tools to read it.
+  Off by default, and never leaving the PC unless you send it somewhere.
+- **A longer memory for processes.** History for individual processes, not only the ones pinned
+  to a chart.
 
-LibreHardwareMonitor supports CPU temps through the [PawnIO](https://pawnio.eu/) kernel driver. The plan is to bundle PawnIO into the Vaktr installer so CPU temperatures work out of the box with no extra setup.
+Ideas and bug reports are welcome as [issues](https://github.com/swissolly/SwissOlly/issues/new/choose).
 
-**Status:** GPU temps work today. CPU temp panel exists in the UI — just needs the driver bundled.
+## 1.2.0 (current)
 
-### Panel Resizing
-Allow users to resize panels between standard (1x1), wide (2x1), and tall (1x2) sizes. Panel sizes would persist across sessions just like panel positions do today.
+The first release under the SwissOlly name (previously Vaktr). The full notes are in
+[docs/release-notes/v1.2.0.md](docs/release-notes/v1.2.0.md).
 
-**Status:** Architecture designed, implementation deferred to a future release.
+**New**
 
-### Notifications & Alerts
-Toast notifications when metrics cross configurable thresholds — e.g., CPU > 90%, memory > 85%, drive > 95% full. Gives you passive monitoring without keeping the window open.
+- Arrange the board: drag and resize panels on a grid, with the mouse or the keyboard.
+- A process list on the CPU and Memory panels, with pinning to the chart.
+- Keeps recording from the tray when the window is closed, and can start with Windows.
+- Twelve themes, eight dark and four light.
+- An in-game overlay for FPS, CPU, GPU, GPU temperature and memory, with no injection into
+  the game.
 
-**Status:** Planned.
+**Better**
 
-### Data Export
-Export historical metric data as CSV or JSON for analysis in external tools. Useful for post-incident investigation, capacity planning, or just curiosity.
+- CPU, GPU, memory and process numbers are measured the way Task Manager measures them.
+- Charts leave gaps where there is no history, look the same after a restart, and load long
+  ranges faster.
+- A full disk or an unplugged drive stops history, not the live board.
+- Screen reader names and keyboard access for every control.
 
-**Status:** Planned.
+**Known limitations**
 
-### Prometheus Metrics Endpoint
-Expose Vaktr's collected metrics via a local HTTP endpoint in Prometheus exposition format. This lets advanced users scrape Vaktr from a Prometheus instance for long-term storage, alerting, or multi-machine dashboards — bridging the gap between Vaktr's simplicity and Prometheus/Grafana's power.
+- The installers are not code-signed, so Windows SmartScreen may warn on first run.
+- The overlay works over borderless and windowed games, not exclusive fullscreen, and looks dim
+  in HDR games.
+- Exact FPS needs one sign-out after installing, and trails live by about a second.
+- Windows contrast themes aren't followed.
 
-**Status:** Planned.
+## Earlier
 
-### In-Game Overlay
-A compact, always-on-top mini overlay that shows selected metrics (CPU, GPU, RAM, temps, FPS) while gaming — similar to the Nvidia/RTSS overlay experience but powered by Vaktr's existing data pipeline.
-
-The approach: a transparent, borderless WinUI window with configurable position, opacity, size, and metric selection. No process injection, no driver hooks, no anti-cheat conflicts. Works in borderless/windowed game modes (the standard for most modern games). Users can toggle it on/off, choose which metrics to display, and position it anywhere on screen.
-
-This avoids the complexity and anti-cheat risk of DirectX/Vulkan injection while staying true to Vaktr's zero-config, zero-dependency philosophy. The existing `CollectorService` and `MetricSnapshot` pipeline feeds the overlay directly — no new data collection needed.
-
-**Status:** Planned for v1.1.0+. Depends on v1.0.1 performance work to ensure the data pipeline is lightweight enough for in-game use.
-
-## Shipped
-
-### v1 — Polished Local Telemetry Dashboard
-- Live time-series panels for CPU, GPU, memory, disk, network, system activity
-- At-a-glance summary cards with live utilization gauges and color-coded thresholds
-- GPU temperature monitoring (AMD and Nvidia, no driver needed)
-- Per-process CPU and memory breakdown with chart toggle for top processes
-- Drag-and-drop panel reordering with direct swap and position persistence
-- Chart zoom (click-drag selection and preset ranges from 1m to 30d)
-- SQLite persistence with rolling retention and 1-minute rollups
-- Dark and light themes with instant switching
-- Configurable scrape interval (1–60s), retention (30m–90d), and storage path
-- Loading screen with animated startup sequence
-- Responsive 1/2/3 column layout with hysteresis breakpoints
-- WCAG AA compliant contrast ratios in both themes
-- Keyboard accessible controls
-- Instant shutdown with background cleanup
-- CI/CD pipeline with automated installer builds via Inno Setup
-- Basic telemetry collection and chart rendering
-- SQLite storage with retention
+**1.0** (as Vaktr): live and historical charts for CPU, GPU, memory, disk and network, kept in a
+local database, with zoom, retention settings, and dark and light themes.

@@ -1,0 +1,62 @@
+name: Bug report
+description: Something in SwissOlly doesn't work as it should.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. The version and your Windows build make most reports quick to reproduce.
+  - type: input
+    id: version
+    attributes:
+      label: SwissOlly version
+      description: Settings and Apps → Installed apps lists it, or the installer's file name (SwissOllySetup-1.2.0-x64.exe).
+      placeholder: "1.2.0"
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version and build
+      description: Press Win+R and run `winver`.
+      placeholder: "Windows 11 24H2, build 26100.2314"
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Where is the problem?
+      options:
+        - Charts and history
+        - Processes
+        - In-game overlay
+        - Layout (Edit layout)
+        - Settings
+        - Tray, startup or closing
+        - Installer or uninstaller
+        - Something else
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+      description: Steps to reproduce help most. Screenshots are welcome.
+    validations:
+      required: true
+  - type: input
+    id: game
+    attributes:
+      label: Game and display mode (overlay problems only)
+      description: The game, its display mode (borderless, windowed or exclusive fullscreen), and whether HDR is on.
+      placeholder: "Battlefield 6, borderless, HDR off"
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs (optional)
+      description: |
+        If SwissOlly closed on its own: `%LocalAppData%\SwissOlly\crash.log` has the error.
+        `%LocalAppData%\SwissOlly\startup-trace.log` describes the last launch.
+        For overlay problems: set a user environment variable `SWISSOLLY_OVERLAY_LOG=1`, restart SwissOlly, reproduce, then attach `%TEMP%\swissolly-overlay.log`.
+        Logs hold your hardware, adapter and process names; skim them before posting.
+      render: text
