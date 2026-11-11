@@ -1,6 +1,6 @@
 # SwissOlly
 
-Local Windows system monitor. Live and historical telemetry, stored on-disk in SQLite, rendered in WinUI 3.
+Local Windows system monitor. Live and historical telemetry, stored on-disk in SQLite, rendered in WinUI 3. swissolly.io
 
 ![SwissOlly overview in the Dark theme: CPU, memory and GPU charts over the last 24 hours](docs/images/overview.png)
 
