@@ -95,6 +95,13 @@ jobs:
     name: Build Installer (${{ matrix.platform }})
     runs-on: windows-latest
     needs: verify
+    # The Azure federated credential trusts this environment only, so restrict the environment
+    # to main and v* tags in the repo settings. Pull requests never reach this job.
+    environment: release
+    permissions:
+      contents: read
+      # Lets azure/login swap GitHub's OIDC token for an Azure one: no signing secret is stored.
+      id-token: write
 
     strategy:
       matrix:
@@ -108,8 +115,14 @@ jobs:
             arch_flag: arm64
 
     env:
-      # `secrets` is not available in step conditions, so expose only whether a certificate exists.
-      HAS_SIGNING_CERT: ${{ secrets.CODE_SIGN_PFX != '' }}
+      # Signing turns on when the repository variable ARTIFACT_SIGNING_ACCOUNT is set (Settings,
+      # Secrets and variables, Actions, Variables). The other settings it needs:
+      #   variables ARTIFACT_SIGNING_ENDPOINT, ARTIFACT_SIGNING_PROFILE, SIGNING_PUBLISHER
+      #   secrets   AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
+      SIGNING: ${{ vars.ARTIFACT_SIGNING_ACCOUNT != '' }}
+      # Microsoft's signing client for signtool, pinned by version and hash.
+      SIGN_CLIENT_VERSION: '1.0.151'
+      SIGN_CLIENT_SHA256: '35375a4bc4e1102da729fc3d8d9925f774c3baae6b8b7ff6398d948ca9ab0d8a'
 
     steps:
       - name: Checkout
@@ -131,56 +144,113 @@ jobs:
 
       # Signing is for SmartScreen and publisher trust: the app runs asInvoker with uiAccess
       # off, so nothing requires a signature to run. Unsigned builds still release, and the
-      # release notes have to say so.
-      - name: Sign executable
-        if: env.HAS_SIGNING_CERT == 'true'
+      # release notes have to say so. Signed ones go through installer/sign.ps1 only.
+      - name: Azure login (signing)
+        if: env.SIGNING == 'true'
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Prepare signing
+        if: env.SIGNING == 'true'
         shell: pwsh
         env:
-          PFX_BASE64: ${{ secrets.CODE_SIGN_PFX }}
-          PFX_PASS: ${{ secrets.CODE_SIGN_PFX_PASSWORD }}
+          SIGN_ENDPOINT: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          SIGN_ACCOUNT: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          SIGN_PROFILE: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
+          SIGN_PUBLISHER: ${{ vars.SIGNING_PUBLISHER }}
         run: |
+          foreach ($name in 'SIGN_ENDPOINT', 'SIGN_PROFILE', 'SIGN_PUBLISHER') {
+            if (-not [Environment]::GetEnvironmentVariable($name)) { Write-Error "Signing is on but the $name setting is empty."; exit 1 }
+          }
+
+          # The client needs signtool from Windows SDK 10.0.22621.755 or later (not 10.0.20348).
           $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
             Sort-Object { [version]$_.Directory.Parent.Name } | Select-Object -Last 1
-          if (-not $signtool) { Write-Error 'signtool.exe not found in any installed Windows SDK.'; exit 1 }
-          $pfxPath = Join-Path $env:RUNNER_TEMP 'swissolly-sign.pfx'
-          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:PFX_BASE64))
-          try {
-            & $signtool.FullName sign /f $pfxPath /p $env:PFX_PASS /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 "publish/${{ matrix.platform }}/SwissOlly.exe"
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          } finally {
-            Remove-Item $pfxPath -ErrorAction SilentlyContinue
+          if (-not $signtool -or [version]$signtool.Directory.Parent.Name -lt [version]'10.0.22621.0') {
+            Write-Error 'No signtool.exe from Windows SDK 10.0.22621 or later on this runner.'; exit 1
           }
+
+          $client = Join-Path $env:RUNNER_TEMP 'artifact-signing-client'
+          $package = "$client.zip"
+          Invoke-WebRequest "https://api.nuget.org/v3-flatcontainer/microsoft.artifactsigning.client/$env:SIGN_CLIENT_VERSION/microsoft.artifactsigning.client.$env:SIGN_CLIENT_VERSION.nupkg" -OutFile $package
+          $hash = (Get-FileHash $package -Algorithm SHA256).Hash
+          if ($hash -ne $env:SIGN_CLIENT_SHA256) { Write-Error "Signing client hash $hash doesn't match the pinned one."; exit 1 }
+          Expand-Archive $package -DestinationPath $client
+          $dlib = Join-Path $client 'bin\x64\Azure.CodeSigning.Dlib.dll'
+          if (-not (Test-Path $dlib)) { Write-Error "No $dlib in the signing client package."; exit 1 }
+
+          # Sign in only through the Azure CLI session azure/login made; skip the others.
+          $metadata = Join-Path $env:RUNNER_TEMP 'artifact-signing-metadata.json'
+          @{
+            Endpoint = $env:SIGN_ENDPOINT
+            CodeSigningAccountName = $env:SIGN_ACCOUNT
+            CertificateProfileName = $env:SIGN_PROFILE
+            CorrelationId = "$env:GITHUB_REPOSITORY run $env:GITHUB_RUN_ID"
+            ExcludeCredentials = @(
+              'EnvironmentCredential', 'WorkloadIdentityCredential', 'ManagedIdentityCredential',
+              'SharedTokenCacheCredential', 'VisualStudioCredential', 'VisualStudioCodeCredential',
+              'AzurePowerShellCredential', 'AzureDeveloperCliCredential', 'InteractiveBrowserCredential'
+            )
+          } | ConvertTo-Json | Set-Content $metadata -Encoding utf8
+
+          "SWISSOLLY_SIGNTOOL=$($signtool.FullName)" >> $env:GITHUB_ENV
+          "SWISSOLLY_SIGN_DLIB=$dlib" >> $env:GITHUB_ENV
+          "SWISSOLLY_SIGN_METADATA=$metadata" >> $env:GITHUB_ENV
+          "SWISSOLLY_PUBLISHER=$env:SIGN_PUBLISHER" >> $env:GITHUB_ENV
+
+      - name: Sign SwissOlly's own binaries
+        if: env.SIGNING == 'true'
+        shell: pwsh
+        run: |
+          # Only what this repo builds; the runtime and NuGet packages carry their makers' signatures.
+          $files = @(Get-ChildItem "publish/${{ matrix.platform }}" -File |
+            Where-Object { $_.Name -like 'SwissOlly*.exe' -or $_.Name -like 'SwissOlly*.dll' } |
+            ForEach-Object FullName)
+          if (-not ($files -like '*\SwissOlly.exe')) { Write-Error 'SwissOlly.exe is missing from the publish folder.'; exit 1 }
+          & ./installer/sign.ps1 @files
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # Pinned: the ISCC path below is Inno Setup 6's, and a version 7 package installs elsewhere.
       - name: Install Inno Setup
         # --allow-downgrade: the runner image may already carry a newer 6.x.
         run: choco install innosetup --version=6.7.1 --allow-downgrade -y --no-progress
 
+      # When signing, Inno Setup signs Setup and the uninstaller itself through installer/sign.ps1
+      # ($q and $f are Inno's quote and quoted-file-name placeholders, kept literal here).
       - name: Build installer
         shell: pwsh
         run: |
-          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DMyAppVersion=${{ needs.verify.outputs.number }}" "/DMyAppArch=${{ matrix.arch_flag }}" "/DMyPublishDir=..\publish\${{ matrix.platform }}" "/DMyOutputSuffix=-${{ matrix.platform }}" installer/swissolly-setup.iss
+          $iscc = @(
+            "/DMyAppVersion=${{ needs.verify.outputs.number }}"
+            "/DMyAppArch=${{ matrix.arch_flag }}"
+            "/DMyPublishDir=..\publish\${{ matrix.platform }}"
+            "/DMyOutputSuffix=-${{ matrix.platform }}"
+          )
+          if ($env:SIGNING -eq 'true') {
+            $script = Join-Path $env:GITHUB_WORKSPACE 'installer\sign.ps1'
+            $iscc += '/Sswissolly=pwsh -NoProfile -NonInteractive -File $q' + $script + '$q $f'
+            $iscc += '/DMySignTool=swissolly'
+          }
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" @iscc installer/swissolly-setup.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Sign installer
-        if: env.HAS_SIGNING_CERT == 'true'
+      - name: Record signature
         shell: pwsh
-        env:
-          PFX_BASE64: ${{ secrets.CODE_SIGN_PFX }}
-          PFX_PASS: ${{ secrets.CODE_SIGN_PFX_PASSWORD }}
         run: |
-          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
-            Sort-Object { [version]$_.Directory.Parent.Name } | Select-Object -Last 1
-          if (-not $signtool) { Write-Error 'signtool.exe not found in any installed Windows SDK.'; exit 1 }
-          $pfxPath = Join-Path $env:RUNNER_TEMP 'swissolly-sign.pfx'
-          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:PFX_BASE64))
-          try {
-            Get-ChildItem installer/Output/*.exe | ForEach-Object {
-              & $signtool.FullName sign /f $pfxPath /p $env:PFX_PASS /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $_.FullName
-              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem installer/Output/*.exe | ForEach-Object {
+            $signature = Get-AuthenticodeSignature -LiteralPath $_.FullName
+            $line = if ($signature.Status -eq 'Valid') {
+              "$($_.Name): signed by $($signature.SignerCertificate.GetNameInfo('SimpleName', $false))"
+            } else {
+              "$($_.Name): not signed ($($signature.Status))"
             }
-          } finally {
-            Remove-Item $pfxPath -ErrorAction SilentlyContinue
+            Write-Host $line
+            "- $line" >> $env:GITHUB_STEP_SUMMARY
+            # A signed release must not ship an unsigned installer by accident.
+            if ($env:SIGNING -eq 'true' -and $signature.Status -ne 'Valid') { exit 1 }
           }
 
       - name: Upload installer

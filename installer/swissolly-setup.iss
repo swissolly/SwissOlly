@@ -6,6 +6,9 @@
 ;   MyAppArch     - Architecture: "x64compatible" (default) or "arm64"
 ;   MyPublishDir  - Publish output directory (default: "..\publish\x64")
 ;   MyOutputSuffix - Suffix for the output filename (default: "-x64")
+;   MySignTool    - Optional. The name of a sign tool defined with ISCC's /S switch. When given,
+;                   Setup and the uninstaller are signed as they're built (release.yml does this).
+;                   Local builds leave it out and stay unsigned.
 ;
 ; Prerequisites:
 ;   1. Install Inno Setup: https://jrsoftware.org/isdl.php
@@ -50,7 +53,15 @@ DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 AllowNoIcons=yes
 OutputDir=Output
-OutputBaseFilename=SwissOllySetup-{#MyAppVersion}{#MyOutputSuffix}
+; No version in the name (SwissOllySetup-x64.exe), so
+; releases/latest/download/SwissOllySetup-x64.exe always gets the newest. The version is inside
+; the file (AppVersion, VersionInfoVersion), where Windows and winget read it.
+OutputBaseFilename=SwissOllySetup{#MyOutputSuffix}
+#ifdef MySignTool
+SignTool={#MySignTool}
+; Signs unins000.exe too. Without it, the uninstaller would be the one unsigned file installed.
+SignedUninstaller=yes
+#endif
 SetupIconFile=..\SwissOlly.App\Assets\SwissOlly.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 UninstallDisplayName={#MyAppName}
