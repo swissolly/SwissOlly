@@ -12,12 +12,17 @@ public sealed class CollectorServiceTests
         await using var service = new CollectorService(new CountingCollector(), store);
         var snapshots = 0;
         var states = new List<Exception?>();
-        var firstSnapshot = new TaskCompletionSource();
+        // Two snapshots while writes still fail, then recovery. Waiting for one and asserting two
+        // after recovery raced: recovery could be reported before the second snapshot's event
+        // (failed on a CI runner, 2026-11-18).
+        var twoSnapshotsWhileFailing = new TaskCompletionSource();
         var recovered = new TaskCompletionSource();
         service.SnapshotCollected += (_, _) =>
         {
-            Interlocked.Increment(ref snapshots);
-            firstSnapshot.TrySetResult();
+            if (Interlocked.Increment(ref snapshots) >= 2)
+            {
+                twoSnapshotsWhileFailing.TrySetResult();
+            }
         };
         service.HistoryWriteStateChanged += (_, error) =>
         {
@@ -33,7 +38,7 @@ public sealed class CollectorServiceTests
         };
 
         await service.StartAsync(new SwissOllyConfig { ScrapeIntervalSeconds = 1 }.Normalize(), CancellationToken.None);
-        await firstSnapshot.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await twoSnapshotsWhileFailing.Task.WaitAsync(TimeSpan.FromSeconds(15));
 
         store.FailWrites = false;
         await recovered.Task.WaitAsync(TimeSpan.FromSeconds(10));
