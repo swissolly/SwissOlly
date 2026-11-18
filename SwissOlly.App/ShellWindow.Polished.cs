@@ -1814,6 +1814,12 @@ public sealed partial class ShellWindow : Window
                     UpdateStatusText();
                 });
             };
+            controller.StatusResolved += msg =>
+                _ = _uiQueue.TryEnqueue(DispatcherQueuePriority.Low, () =>
+                {
+                    _viewModel.SetStatus(msg, StatusSeverity.Healthy, TimeSpan.FromSeconds(10));
+                    UpdateStatusText();
+                });
 
             HotkeyInterop.Install(shellHwnd, id => controller.OnWmHotkey(id));
 

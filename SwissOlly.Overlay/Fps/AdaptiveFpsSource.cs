@@ -1,20 +1,30 @@
-using SwissOlly.Overlay.Rendering;
+using System.Diagnostics;
+using SwissOlly.Core.Models;
 
 namespace SwissOlly.Overlay.Fps;
 
 /// <summary>
 /// Uses process-attributed present events for game FPS. It never substitutes compositor cadence,
 /// because that measures monitor refresh and can substantially overstate a game's frame rate.
+///
+/// A failed start is retried while the same game stays tracked (<see cref="FpsStartRetry"/>).
+/// 1.2.0 probed once per run and turned FPS off for good after any failure, which is the likely
+/// reason the owner saw no FPS in Overwatch or Battlefield 6 (2026-11-16).
+///
+/// Thread-safe: the overlay controller calls in from its poll timer and the UI thread, and the
+/// retry timer calls in from the thread pool. Events are raised under the lock; the controller's
+/// handlers never call back into this class.
 /// </summary>
 internal sealed class AdaptiveFpsSource : IFpsSource
 {
+    private readonly object _gate = new();
+    private readonly FpsStartRetry _retry = new(Stopwatch.Frequency);
     private EtwPresentFpsSource? _etw;
-    private IFpsSource? _active;
-    private bool _etwUsable;
-    private bool _probed;
-    private bool _unavailableReported;
-    private bool _errorRaisedThisStart;
-    private string _unavailableReason = "etw-unavailable";
+    private Timer? _retryTimer;
+    private uint _pid;
+    private int _generation;
+    private bool _orphansChecked;
+    private bool _disposed;
 
     public event Action<double>? FpsUpdated;
     public event Action<string>? ErrorOccurred;
@@ -22,95 +32,139 @@ internal sealed class AdaptiveFpsSource : IFpsSource
     /// <summary>Raised when the live source changes, so the UI can explain what it is showing.</summary>
     public event Action<FpsAccuracy>? AccuracyChanged;
 
-    public FpsAccuracy Accuracy => _active?.Accuracy ?? FpsAccuracy.Unavailable;
+    /// <summary>Raised when a start works after one or more failed tries for the same game.</summary>
+    public event Action? Recovered;
+
+    public FpsAccuracy Accuracy
+    {
+        get
+        {
+            lock (_gate)
+                return _etw is null ? FpsAccuracy.Unavailable : FpsAccuracy.Exact;
+        }
+    }
 
     public void StartTracking(uint pid)
     {
-        StopTracking();
-
-        if (!_probed)
+        lock (_gate)
         {
-            _probed = true;
-            _etwUsable = EtwPresentFpsSource.IsAvailable(out _unavailableReason);
-            OverlayLog.Write($"FPS source probe: ETW {(_etwUsable ? "available" : "unavailable")}");
-        }
+            if (_disposed) return;
 
-        _errorRaisedThisStart = false;
-        if (_etwUsable)
-        {
-            _etw = new EtwPresentFpsSource();
-            Attach(_etw);
-            _etw.StartTracking(pid);
+            StopLocked();
+            _pid = pid;
+            _generation++;
+            _retry.Reset();
 
-            if (_etw.IsRunning)
+            if (!_orphansChecked)
             {
-                _active = _etw;
-                _unavailableReported = false;
-                AccuracyChanged?.Invoke(FpsAccuracy.Exact);
-                return;
+                _orphansChecked = true;
+                EtwPresentFpsSource.StopOrphanedSessions();
             }
 
-            // Session creation failed after the probe said it should work. Do not substitute
-            // monitor refresh for a game's FPS; leave the reading unavailable instead.
-            Detach(_etw);
-            _etw.Dispose();
-            _etw = null;
-            _etwUsable = false;
-            _unavailableReason = "etw-unavailable";
+            TryStartLocked();
         }
-
-        if (!_errorRaisedThisStart && !_unavailableReported)
-        {
-            ErrorOccurred?.Invoke(_unavailableReason);
-        }
-
-        _unavailableReported = true;
-        AccuracyChanged?.Invoke(FpsAccuracy.Unavailable);
     }
 
     public void StopTracking()
     {
-        if (_active == null) return;
-
-        _active.StopTracking();
-        Detach(_active);
-
-        if (ReferenceEquals(_active, _etw))
+        lock (_gate)
         {
-            _etw?.Dispose();
-            _etw = null;
+            StopLocked();
+            _pid = 0;
+            _generation++;
+            _retry.Reset();
+        }
+    }
+
+    private void TryStartLocked()
+    {
+        var etw = new EtwPresentFpsSource();
+        string? failure = null;
+        void OnStartError(string reason) => failure ??= reason;
+
+        etw.ErrorOccurred += OnStartError;
+        etw.StartTracking(_pid);
+        etw.ErrorOccurred -= OnStartError;
+
+        if (etw.IsRunning)
+        {
+            etw.FpsUpdated += OnFps;
+            etw.ErrorOccurred += OnError;
+            _etw = etw;
+
+            bool recovered = _retry.IsFailing;
+            _retry.Reset();
+            AccuracyChanged?.Invoke(FpsAccuracy.Exact);
+            if (recovered)
+            {
+                FpsLog.Write($"FPS: started for pid={_pid} after failed tries");
+                FpsLog.Flush();
+                Recovered?.Invoke();
+            }
+
+            return;
         }
 
-        _active = null;
+        etw.Dispose();
+
+        // Never substitute monitor refresh for a game's FPS; leave it unavailable and try again.
+        var delay = _retry.OnFailure(Stopwatch.GetTimestamp());
+        failure ??= "etw-unavailable";
+        FpsLog.Write($"FPS: start for pid={_pid} failed ({failure}); next try in {delay.TotalSeconds:0} s");
+        FpsLog.Flush();
+
+        AccuracyChanged?.Invoke(FpsAccuracy.Unavailable);
+        ErrorOccurred?.Invoke(failure);
+
+        int generation = _generation;
+        _retryTimer?.Dispose();
+        _retryTimer = new Timer(_ => Retry(generation), null, delay, Timeout.InfiniteTimeSpan);
     }
 
-    private void Attach(IFpsSource src)
+    private void Retry(int generation)
     {
-        src.FpsUpdated += OnFps;
-        src.ErrorOccurred += OnError;
+        try
+        {
+            lock (_gate)
+            {
+                // Another game, a stop or a success since this was scheduled.
+                if (_disposed || generation != _generation || _pid == 0 || _etw is not null) return;
+                TryStartLocked();
+            }
+        }
+        catch (Exception ex)
+        {
+            // A thread-pool timer must not throw: it would end the process.
+            FpsLog.Write($"FPS: retry threw {ex.GetType().Name}: {ex.Message}");
+        }
     }
 
-    private void Detach(IFpsSource src)
+    private void StopLocked()
     {
-        src.FpsUpdated -= OnFps;
-        src.ErrorOccurred -= OnError;
+        _retryTimer?.Dispose();
+        _retryTimer = null;
+
+        if (_etw is null) return;
+
+        _etw.StopTracking();
+        _etw.FpsUpdated -= OnFps;
+        _etw.ErrorOccurred -= OnError;
+        _etw.Dispose();
+        _etw = null;
     }
 
     private void OnFps(double fps) => FpsUpdated?.Invoke(fps);
 
-    private void OnError(string reason)
-    {
-        _errorRaisedThisStart = true;
-        if (reason.StartsWith("etw-", StringComparison.Ordinal))
-        {
-            _unavailableReason = reason;
-        }
-        ErrorOccurred?.Invoke(reason);
-    }
+    private void OnError(string reason) => ErrorOccurred?.Invoke(reason);
 
     public void Dispose()
     {
-        StopTracking();
-        _etw?.Dispose();
+        lock (_gate)
+        {
+            _disposed = true;
+            StopLocked();
+            _pid = 0;
+            _generation++;
+        }
     }
 }

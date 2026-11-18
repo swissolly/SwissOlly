@@ -35,6 +35,9 @@ public sealed class OverlayController : IDisposable
 
     public event Action<string>? StatusMessage;
 
+    /// <summary>A problem reported through <see cref="StatusMessage"/> has gone; the text says so.</summary>
+    public event Action<string>? StatusResolved;
+
     /// <summary>
     /// Whether the reading counts the game's present calls, is a compositor-derived estimate,
     /// or is unavailable. Present calls are not correlated with frames confirmed displayed.
@@ -71,13 +74,20 @@ public sealed class OverlayController : IDisposable
             _lastFps = double.NaN;
             PushRender();
 
+            // Once until FPS works again: the source retries every few seconds, and each
+            // failed try reports here.
             if (msg.StartsWith("etw-", StringComparison.Ordinal) && !_fpsUnavailableReported)
             {
                 _fpsUnavailableReported = true;
-                StatusMessage?.Invoke(msg == "etw-access-denied"
-                    ? "FPS unavailable: sign out of Windows and back in so Performance Log Users access takes effect, then restart SwissOlly."
-                    : "FPS unavailable: SwissOlly could not read this process's Windows present events. Restart SwissOlly and check the overlay log.");
+                StatusMessage?.Invoke(FpsFailureText.For(msg, TraceRight.ProcessHasRight()));
             }
+        };
+
+        _fps.Recovered += () =>
+        {
+            if (!_fpsUnavailableReported) return;
+            _fpsUnavailableReported = false;
+            StatusResolved?.Invoke("FPS is reading again.");
         };
 
         _fps.AccuracyChanged += accuracy =>
@@ -171,7 +181,7 @@ public sealed class OverlayController : IDisposable
 
             if (change != OverlayVisibilityChange.None)
             {
-                OverlayLog.Write($"Foreground 0x{hwnd:X} → {change}");
+                FpsLog.Write($"Foreground 0x{hwnd:X} → {change}");
                 Apply(change, hwnd);
             }
         }
@@ -213,7 +223,7 @@ public sealed class OverlayController : IDisposable
             exeName = process.ProcessName;
         }
         catch { }
-        OverlayLog.Write($"Game detected pid={pid} exe={exeName} — showing");
+        FpsLog.Write($"Game detected pid={pid} exe={exeName}; showing the overlay");
         StartFps(pid);
         // Turned off, or hidden by a hotkey or another poll, while this one was starting up.
         if (!_config.Enabled || !_visibility.IsShown)

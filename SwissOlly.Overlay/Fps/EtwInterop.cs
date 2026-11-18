@@ -52,6 +52,10 @@ internal static class EtwInterop
     internal const uint ErrorSuccess = 0;
     internal const uint ErrorAccessDenied = 5;
     internal const uint ErrorAlreadyExists = 183;
+    internal const uint ErrorMoreData = 234;
+
+    // Windows allows 64 trace sessions at once, system-wide.
+    internal const int MaxTraceSessions = 64;
     internal const uint ErrorCtxClosePending = 7007;
 
     // OpenTrace returns this on failure (INVALID_PROCESSTRACE_HANDLE).
@@ -207,6 +211,13 @@ internal static class EtwInterop
 
     [DllImport("advapi32.dll", CharSet = CharSet.Unicode, EntryPoint = "ControlTraceW")]
     internal static extern uint ControlTrace(ulong sessionHandle, string? sessionName, IntPtr properties, uint controlCode);
+
+    /// <summary>
+    /// Fills one EVENT_TRACE_PROPERTIES buffer per running session; each buffer must have its
+    /// size and name offsets set, as for StartTrace.
+    /// </summary>
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, EntryPoint = "QueryAllTracesW")]
+    internal static extern uint QueryAllTraces(IntPtr[] propertyArray, uint propertyArrayCount, out uint loggerCount);
 
     [DllImport("advapi32.dll", EntryPoint = "EnableTraceEx2")]
     internal static extern uint EnableTraceEx2(

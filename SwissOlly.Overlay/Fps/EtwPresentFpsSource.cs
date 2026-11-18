@@ -1,6 +1,5 @@
 using System.Runtime.InteropServices;
 using SwissOlly.Core.Models;
-using SwissOlly.Overlay.Rendering;
 using static SwissOlly.Overlay.Fps.EtwInterop;
 
 namespace SwissOlly.Overlay.Fps;
@@ -27,7 +26,10 @@ namespace SwissOlly.Overlay.Fps;
 /// </summary>
 internal sealed class EtwPresentFpsSource : IFpsSource
 {
-    private const string SessionName = "SwissOllyFpsSession";
+    // Each process gets "SwissOllyFpsSession-<pid>". 1.2.0 used the bare prefix for every copy,
+    // so a second copy (a Debug build started at sign-in, say) stopped the first one's session
+    // when it cleaned up what it took for a stale one.
+    private const string SessionPrefix = "SwissOllyFpsSession";
     private const int EmitIntervalMs = 500;
 
     private readonly object _gate = new();
@@ -53,7 +55,7 @@ internal sealed class EtwPresentFpsSource : IFpsSource
     public FpsAccuracy Accuracy => FpsAccuracy.Exact;
 
     internal EtwPresentFpsSource()
-        : this(SessionName, runtimeEvents: true)
+        : this($"{SessionPrefix}-{Environment.ProcessId}", runtimeEvents: true)
     {
     }
 
@@ -71,46 +73,74 @@ internal sealed class EtwPresentFpsSource : IFpsSource
     /// <summary>True once a session is up and the consumer thread is running.</summary>
     internal bool IsRunning => _running;
 
-    /// <summary>Cheap permission probe: start and immediately tear down a session.</summary>
-    internal static bool IsAvailable(out string failureReason)
+    /// <summary>
+    /// Stops sessions left by SwissOlly processes that have gone (a crash leaves its session
+    /// running until reboot, and Windows allows 64 in all). Only "SwissOllyFpsSession-&lt;pid&gt;"
+    /// names whose process isn't a running SwissOlly; 1.2.0's unnumbered name is left alone,
+    /// since a running 1.2.0 copy may own it. Best effort: listing sessions needs the same right
+    /// as starting one.
+    /// </summary>
+    internal static void StopOrphanedSessions()
     {
-        failureReason = string.Empty;
-        IntPtr props = AllocProperties();
+        var buffers = new IntPtr[MaxTraceSessions];
         try
         {
-            uint rc = StartTrace(out ulong handle, SessionName, props);
-            if (rc == ErrorAlreadyExists)
+            for (int i = 0; i < buffers.Length; i++)
+                buffers[i] = AllocProperties();
+
+            uint rc = QueryAllTraces(buffers, (uint)buffers.Length, out uint count);
+            if (rc != ErrorSuccess && rc != ErrorMoreData)
             {
-                StopStaleSession();
-                rc = StartTrace(out handle, SessionName, props);
+                FpsLog.Write($"ETW: QueryAllTraces rc={rc}; orphaned sessions not checked");
+                return;
             }
 
-            if (rc != ErrorSuccess)
+            string ownPrefix = SessionPrefix + "-";
+            for (int i = 0; i < Math.Min(count, (uint)buffers.Length); i++)
             {
-                OverlayLog.Write($"ETW probe: StartTrace rc={rc}"
-                    + (rc == ErrorAccessDenied ? " (access denied — not in Performance Log Users)" : ""));
-                failureReason = rc == ErrorAccessDenied
-                    ? "etw-access-denied"
-                    : $"etw-probe-failed-{rc}";
-                return false;
-            }
+                var props = Marshal.PtrToStructure<EVENT_TRACE_PROPERTIES>(buffers[i]);
+                string? name = Marshal.PtrToStringUni(buffers[i] + (int)props.LoggerNameOffset);
+                if (name is null
+                    || !name.StartsWith(ownPrefix, StringComparison.Ordinal)
+                    || !int.TryParse(name.AsSpan(ownPrefix.Length), out int ownerPid)
+                    || ownerPid == Environment.ProcessId
+                    || IsRunningSwissOlly(ownerPid))
+                {
+                    continue;
+                }
 
-            ControlTrace(handle, SessionName, props, EventTraceControlStop);
-            return true;
+                StopStaleSession(name);
+                FpsLog.Write($"ETW: stopped orphaned session {name}");
+            }
         }
-        catch (DllNotFoundException)
+        catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException)
         {
-            failureReason = "etw-unavailable";
-            return false;
-        }
-        catch (EntryPointNotFoundException)
-        {
-            failureReason = "etw-unavailable";
-            return false;
+            FpsLog.Write($"ETW: can't list sessions ({ex.GetType().Name})");
         }
         finally
         {
-            Marshal.FreeHGlobal(props);
+            foreach (var buffer in buffers)
+            {
+                if (buffer != IntPtr.Zero)
+                    Marshal.FreeHGlobal(buffer);
+            }
+        }
+    }
+
+    private static bool IsRunningSwissOlly(int pid)
+    {
+        try
+        {
+            using var process = System.Diagnostics.Process.GetProcessById(pid);
+            return process.ProcessName.StartsWith("SwissOlly", StringComparison.OrdinalIgnoreCase);
+        }
+        catch (ArgumentException)
+        {
+            return false; // no such process
+        }
+        catch
+        {
+            return true; // can't tell: leave its session alone
         }
     }
 
@@ -121,14 +151,25 @@ internal sealed class EtwPresentFpsSource : IFpsSource
         _trackedPid = pid;
         _properties = AllocProperties();
 
-        uint rc = StartTrace(out _sessionHandle, _sessionName, _properties);
-        if (rc == ErrorAlreadyExists)
+        uint rc;
+        try
         {
-            // A previous SwissOlly process crashed without stopping its session. ETW sessions
-            // outlive the process that created them, so clean up and retry once.
-            OverlayLog.Write("ETW: stale session found — stopping and retrying");
-            StopStaleSession(_sessionName);
             rc = StartTrace(out _sessionHandle, _sessionName, _properties);
+            if (rc == ErrorAlreadyExists)
+            {
+                // Ours from an earlier start that didn't stop (or a crashed process with the
+                // same ID). ETW sessions outlive their process, so stop it and retry once.
+                FpsLog.Write($"ETW: session {_sessionName} already exists; stopping it and retrying");
+                StopStaleSession(_sessionName);
+                rc = StartTrace(out _sessionHandle, _sessionName, _properties);
+            }
+        }
+        catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException)
+        {
+            FpsLog.Write($"ETW: StartTrace unavailable ({ex.GetType().Name})");
+            Cleanup();
+            ErrorOccurred?.Invoke("etw-unavailable");
+            return;
         }
 
         if (rc != ErrorSuccess)
@@ -137,7 +178,7 @@ internal sealed class EtwPresentFpsSource : IFpsSource
             string why = rc == ErrorAccessDenied
                 ? "etw-access-denied"
                 : $"etw-start-failed-{rc}";
-            OverlayLog.Write($"ETW: StartTrace failed rc={rc}");
+            FpsLog.Write($"ETW: StartTrace {_sessionName} failed rc={rc}");
             ErrorOccurred?.Invoke(why);
             return;
         }
@@ -159,7 +200,8 @@ internal sealed class EtwPresentFpsSource : IFpsSource
         // The kernel logs far more than presents, so it is enabled for that one event ID only.
         uint e3 = EnableTraceForEventIds(_sessionHandle, ref DxgKernelProviderGuid, DxgKernelBaseKeyword,
             [(ushort)EventIdDxgKernelPresentInfo]);
-        OverlayLog.Write($"ETW: EnableTraceEx2 dxgi={e1} d3d9={e2} kernel={e3}");
+        FpsLog.Write($"ETW: EnableTraceEx2 dxgi={e1} d3d9={e2} kernel={e3}"
+            + (_runtimeEvents ? string.Empty : " (dxgi and d3d9 not asked for)"));
 
         if (e1 != ErrorSuccess && e2 != ErrorSuccess && e3 != ErrorSuccess)
         {
@@ -182,7 +224,7 @@ internal sealed class EtwPresentFpsSource : IFpsSource
         if (_traceHandle == InvalidProcessTraceHandle)
         {
             int err = Marshal.GetLastWin32Error();
-            OverlayLog.Write($"ETW: OpenTrace failed err={err}");
+            FpsLog.Write($"ETW: OpenTrace failed err={err}");
             Cleanup();
             ErrorOccurred?.Invoke($"etw-open-failed-{err}");
             return;
@@ -200,7 +242,7 @@ internal sealed class EtwPresentFpsSource : IFpsSource
         _consumer.Start();
         _emitTimer = new System.Threading.Timer(Emit, null, EmitIntervalMs, EmitIntervalMs);
 
-        OverlayLog.Write($"ETW: tracking pid={pid} — exact present-based FPS active");
+        FpsLog.Write($"ETW: tracking pid={pid} in {_sessionName}");
     }
 
     public void StopTracking()
@@ -222,7 +264,7 @@ internal sealed class EtwPresentFpsSource : IFpsSource
         {
             uint rc = CloseTrace(_traceHandle);
             if (rc != ErrorSuccess && rc != ErrorCtxClosePending)
-                OverlayLog.Write($"ETW: CloseTrace rc={rc}");
+                FpsLog.Write($"ETW: CloseTrace rc={rc}");
         }
 
         // If ProcessTrace has not returned, ETW may still invoke the callback. Dropping the
@@ -231,7 +273,7 @@ internal sealed class EtwPresentFpsSource : IFpsSource
         var consumerExited = _consumer?.Join(5000) ?? true;
         if (!consumerExited)
         {
-            OverlayLog.Write("ETW: consumer thread did not exit; keeping callback rooted");
+            FpsLog.Write("ETW: consumer thread did not exit; keeping callback rooted");
         }
 
         _consumer = null;
@@ -254,11 +296,11 @@ internal sealed class EtwPresentFpsSource : IFpsSource
             var handles = new[] { _traceHandle };
             uint rc = ProcessTrace(handles, 1, IntPtr.Zero, IntPtr.Zero);
             if (rc != ErrorSuccess && _running)
-                OverlayLog.Write($"ETW: ProcessTrace returned rc={rc}");
+                FpsLog.Write($"ETW: ProcessTrace returned rc={rc}");
         }
         catch (Exception ex)
         {
-            OverlayLog.Write($"ETW: ProcessTrace threw {ex.GetType().Name}: {ex.Message}");
+            FpsLog.Write($"ETW: ProcessTrace threw {ex.GetType().Name}: {ex.Message}");
         }
     }
 
@@ -316,12 +358,13 @@ internal sealed class EtwPresentFpsSource : IFpsSource
         {
             case PresentReadingKind.Stalled:
                 // Game is alive but not presenting - minimised, loading, or fully occluded.
+                FpsLog.Write($"ETW: pid={_trackedPid} stopped presenting");
                 ErrorOccurred?.Invoke("no-presents");
                 break;
             case PresentReadingKind.Rate:
                 if (sourceChanged)
                 {
-                    OverlayLog.Write(reading.Source == PresentSource.Kernel
+                    FpsLog.Write(reading.Source == PresentSource.Kernel
                         ? "ETW: no DXGI or D3D9 presents from this process; counting kernel presents"
                         : "ETW: counting DXGI/D3D9 presents");
                 }
@@ -357,7 +400,7 @@ internal sealed class EtwPresentFpsSource : IFpsSource
         // thunk ETW still holds; see StopTracking.
     }
 
-    private static void StopStaleSession(string sessionName = SessionName)
+    private static void StopStaleSession(string sessionName)
     {
         IntPtr props = AllocProperties();
         try { ControlTrace(0, sessionName, props, EventTraceControlStop); }

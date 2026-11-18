@@ -15,6 +15,8 @@
     <Compile Include="..\..\SwissOlly.Overlay\Fps\EtwInterop.cs" Link="EtwInterop.cs" />
     <Compile Include="..\..\SwissOlly.Overlay\Fps\EtwPresentFpsSource.cs" Link="EtwPresentFpsSource.cs" />
     <Compile Include="..\..\SwissOlly.Overlay\Fps\IFpsSource.cs" Link="IFpsSource.cs" />
+    <Compile Include="..\..\SwissOlly.Overlay\Fps\FpsLog.cs" Link="FpsLog.cs" />
+    <Compile Include="..\..\SwissOlly.Overlay\Fps\TraceRight.cs" Link="TraceRight.cs" />
     <Compile Include="..\..\SwissOlly.Overlay\Rendering\OverlayLog.cs" Link="OverlayLog.cs" />
   </ItemGroup>
 
