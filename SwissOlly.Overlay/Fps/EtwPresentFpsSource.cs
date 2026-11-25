@@ -46,6 +46,16 @@ internal sealed class EtwPresentFpsSource : IFpsSource
     private volatile uint _trackedPid;
     private volatile bool _running;
 
+    // For the one "no presents" log line: what arrived for the tracked process and for others.
+    // If others' presents arrive and the game's never do, ETW works and the game's are hidden
+    // (anti-cheat) or come from another process; if nothing arrives at all, the session is
+    // empty. Battlefield 6 reads "--" for AMD's and NVIDIA's overlays too (forum reports, 2026).
+    private const long NoPresentsReportAfterMs = 10_000;
+    private long _ownPresents;
+    private long _otherPresents;
+    private long _trackingStartedTick;
+    private bool _noPresentsReported;
+
     // Held in a field so the GC cannot collect the thunk while ETW holds the pointer.
     private EventRecordCallback? _callback;
 
@@ -237,6 +247,10 @@ internal sealed class EtwPresentFpsSource : IFpsSource
             _reportedSource = null;
         }
 
+        Interlocked.Exchange(ref _ownPresents, 0);
+        Interlocked.Exchange(ref _otherPresents, 0);
+        _trackingStartedTick = Environment.TickCount64;
+        _noPresentsReported = false;
         _running = true;
         _consumer = new Thread(ConsumeLoop) { IsBackground = true, Name = "SwissOllyEtwFps" };
         _consumer.Start();
@@ -307,7 +321,7 @@ internal sealed class EtwPresentFpsSource : IFpsSource
     private void OnEvent(ref EVENT_RECORD record)
     {
         uint tracked = _trackedPid;
-        if (tracked == 0 || record.EventHeader.ProcessId != tracked) return;
+        if (tracked == 0) return;
 
         int id = record.EventHeader.EventDescriptor.Id;
         Guid provider = record.EventHeader.ProviderId;
@@ -326,6 +340,14 @@ internal sealed class EtwPresentFpsSource : IFpsSource
             return;
         }
 
+        if (record.EventHeader.ProcessId != tracked)
+        {
+            Interlocked.Increment(ref _otherPresents);
+            return;
+        }
+
+        Interlocked.Increment(ref _ownPresents);
+
         // ClientContext = 1 on the session, so TimeStamp is a raw QPC value on the same
         // timebase as Stopwatch.GetTimestamp().
         long ts = record.EventHeader.TimeStamp;
@@ -336,6 +358,21 @@ internal sealed class EtwPresentFpsSource : IFpsSource
     private void Emit(object? state)
     {
         if (!_running) return;
+
+        // Emit is the only writer of _noPresentsReported, and timer callbacks for one source
+        // don't overlap at a 500 ms period, so no lock is needed for it.
+        if (!_noPresentsReported
+            && Environment.TickCount64 - _trackingStartedTick >= NoPresentsReportAfterMs
+            && Interlocked.Read(ref _ownPresents) == 0)
+        {
+            _noPresentsReported = true;
+            long others = Interlocked.Read(ref _otherPresents);
+            FpsLog.Write($"ETW: no presents from pid={_trackedPid} in {NoPresentsReportAfterMs / 1000} s; "
+                + (others > 0
+                    ? $"{others} from other processes, so tracing works and this game's presents are missing (another process presents for it, or they're hidden)"
+                    : "none from any process either, so the session receives nothing"));
+            FpsLog.Flush();
+        }
 
         PresentReading reading;
         var sourceChanged = false;
