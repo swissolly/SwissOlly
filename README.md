@@ -100,8 +100,12 @@ SwissOlly always draws with its own palettes; it does not follow Windows contras
 
 Installers at [Releases](https://github.com/swissolly/SwissOlly/releases), with SHA-256 checksums in `SHA256SUMS.txt`:
 
-- `SwissOllySetup-<version>-x64.exe` — Intel/AMD 64-bit
-- `SwissOllySetup-<version>-ARM64.exe` — ARM64
+- `SwissOllySetup-x64.exe` — Intel/AMD 64-bit
+- `SwissOllySetup-ARM64.exe` — ARM64
+
+The version is inside the file, not in its name, so
+`https://github.com/swissolly/SwissOlly/releases/latest/download/SwissOllySetup-x64.exe` always
+gets the newest. Releases up to 1.2.0 were named `SwissOllySetup-<version>-<arch>.exe`.
 
 The installers are self-contained: .NET and the Windows App SDK runtime are included, so nothing else needs installing.
 

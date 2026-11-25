@@ -394,8 +394,13 @@ internal sealed class EtwPresentFpsSource : IFpsSource
         switch (reading.Kind)
         {
             case PresentReadingKind.Stalled:
-                // Game is alive but not presenting - minimised, loading, or fully occluded.
-                FpsLog.Write($"ETW: pid={_trackedPid} stopped presenting");
+                // Game is alive but not presenting - minimised, loading, or fully occluded. A
+                // process that never presented gets the 10-second line above instead.
+                if (Interlocked.Read(ref _ownPresents) > 0)
+                {
+                    FpsLog.Write($"ETW: pid={_trackedPid} stopped presenting");
+                }
+
                 ErrorOccurred?.Invoke("no-presents");
                 break;
             case PresentReadingKind.Rate:

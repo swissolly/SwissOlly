@@ -56,10 +56,20 @@ internal static class FpsLog
                     snapshot = [.. Lines];
                 }
 
-                var version = System.Reflection.Assembly.GetEntryAssembly()?.GetName().Version;
+                // The same words as Settings' About card and its "Copy version info".
+                var entry = System.Reflection.Assembly.GetEntryAssembly();
+                var informational = entry?
+                    .GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false)
+                    .OfType<System.Reflection.AssemblyInformationalVersionAttribute>()
+                    .FirstOrDefault()?.InformationalVersion;
+                var diagnostics = AppVersionInfo.Diagnostics(
+                    AppVersionInfo.Number(informational, entry?.GetName().Version),
+                    AppVersionInfo.Commit(informational),
+                    AppVersionInfo.ArchitectureName(System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture),
+                    AppVersionInfo.WindowsName(Environment.OSVersion.Version));
                 string[] header =
                 [
-                    $"SwissOlly {version?.ToString(3) ?? "?"}, Windows {Environment.OSVersion.Version}, process {Environment.ProcessId}",
+                    $"{diagnostics}, process {Environment.ProcessId}",
                     $"Trace right in this sign-in: {(TraceRight.ProcessHasRight() ? "yes" : "no")}",
                     string.Empty,
                 ];

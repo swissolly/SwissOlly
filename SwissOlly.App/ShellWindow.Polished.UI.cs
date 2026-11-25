@@ -457,6 +457,8 @@ public sealed partial class ShellWindow
                 BuildOverlayEditorCard(wide: settingsColumns >= 2),
                 CreateSettingsSectionHeader("Startup and closing", "Applies as soon as you choose"),
                 BuildWindowBehaviorCard(wide: settingsColumns >= 2),
+                CreateSettingsSectionHeader("About", "Links open in your browser"),
+                BuildAboutCard(),
             },
         };
 
@@ -1057,6 +1059,92 @@ public sealed partial class ShellWindow
             () => _viewModel.LaunchOnStartup ? "Starts with Windows" : "Starts when you open it",
             () => _viewModel.MinimizeToTray ? "Closing keeps it running in the tray" : "Closing exits SwissOlly",
             body);
+    }
+
+    // ── About card ─────────────────────────────────────────────────────────
+
+    // Worked out once: none of it changes while the app runs.
+    private static readonly string s_versionNumber = AppVersionInfo.Number(
+        typeof(ShellWindow).Assembly
+            .GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false)
+            .OfType<System.Reflection.AssemblyInformationalVersionAttribute>()
+            .FirstOrDefault()?.InformationalVersion,
+        typeof(ShellWindow).Assembly.GetName().Version);
+
+    private static readonly string? s_versionCommit = AppVersionInfo.Commit(
+        typeof(ShellWindow).Assembly
+            .GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false)
+            .OfType<System.Reflection.AssemblyInformationalVersionAttribute>()
+            .FirstOrDefault()?.InformationalVersion);
+
+    private static readonly string s_architecture =
+        AppVersionInfo.ArchitectureName(System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture);
+
+    private static readonly string s_windowsName = AppVersionInfo.WindowsName(Environment.OSVersion.Version);
+
+    /// <summary>
+    /// Which SwissOlly this is, for bug reports and for knowing whether an update applies.
+    /// The links open in the browser, so the app itself still makes no network connections.
+    /// </summary>
+    private Border BuildAboutCard()
+    {
+        var copyChip = CreateActionChip("Copy version info", (_, _) => CopyVersionInfo());
+        var notesChip = CreateActionChip("Release notes", (_, _) => OpenInBrowser(AppVersionInfo.ReleaseNotesUrl(s_versionNumber)));
+        var bugChip = CreateActionChip("Report a bug", (_, _) => OpenInBrowser(AppVersionInfo.BugReportUrl(s_versionNumber, s_architecture, s_windowsName)));
+        var sourceChip = CreateActionChip("Source and license", (_, _) => OpenInBrowser(AppVersionInfo.RepositoryUrl));
+        AutomationProperties.SetName(notesChip, $"Release notes for SwissOlly {s_versionNumber}, opens in your browser");
+        AutomationProperties.SetName(bugChip, "Report a bug on GitHub, opens in your browser");
+        AutomationProperties.SetName(sourceChip, "Source code and license on GitHub, opens in your browser");
+
+        var body = new StackPanel
+        {
+            Spacing = 8,
+            Children =
+            {
+                CreateChipWrapRow(copyChip, notesChip, bugChip, sourceChip),
+                CreateMutedText("Report a bug fills in the version and Windows build for you. SwissOlly itself makes no network connections.", 12),
+            },
+        };
+
+        return CreateControlEditorCard(
+            "about",
+            "ABOUT",
+            () => $"SwissOlly {s_versionNumber}",
+            () => $"{s_architecture} · {s_windowsName}" + (s_versionCommit is null ? string.Empty : $" · commit {s_versionCommit}"),
+            body);
+    }
+
+    private void CopyVersionInfo()
+    {
+        try
+        {
+            var package = new DataPackage();
+            package.SetText(AppVersionInfo.Diagnostics(s_versionNumber, s_versionCommit, s_architecture, s_windowsName));
+            Clipboard.SetContent(package);
+            // Keeps the text on the clipboard after SwissOlly closes.
+            Clipboard.Flush();
+            _viewModel.SetStatus("Version info copied", StatusSeverity.Healthy, TimeSpan.FromSeconds(4));
+        }
+        catch (Exception ex)
+        {
+            // The clipboard can be held open by another app for a moment.
+            _viewModel.SetStatus($"Couldn't copy: {ex.Message}", StatusSeverity.Issue, TimeSpan.FromSeconds(6));
+        }
+
+        UpdateStatusText();
+    }
+
+    private void OpenInBrowser(string url)
+    {
+        try
+        {
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(url) { UseShellExecute = true })?.Dispose();
+        }
+        catch (Exception ex)
+        {
+            _viewModel.SetStatus($"Couldn't open the browser: {ex.Message}", StatusSeverity.Issue, TimeSpan.FromSeconds(6));
+            UpdateStatusText();
+        }
     }
 
     // ── Overlay card ───────────────────────────────────────────────────────

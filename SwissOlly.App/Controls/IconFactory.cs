@@ -85,6 +85,7 @@ internal static class IconFactory
             "temperature" => "\uE9CA", // Thermometer
             "system" => "\uF182", // ScreenTime
             "overlay" => "", // Game
+            "about" => "\uE946", // Info: the About card's version and links
             _ => "\uF182",
         };
     }
